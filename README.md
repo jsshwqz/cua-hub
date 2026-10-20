@@ -120,8 +120,15 @@ curl -s -X POST http://127.0.0.1:8765/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-HTTP 模式没有鉴权，默认只允许绑定回环地址；确需对外暴露时设置
-`CUA_HUB_ALLOW_REMOTE=1`，并自行加防火墙/反向代理鉴权。
+HTTP 模式默认只允许绑定回环地址。设置 `CUA_HUB_MCP_TOKEN` 后，所有 `/mcp`
+请求必须带 `Authorization: Bearer <token>`：
+
+```bash
+CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
+```
+
+确需绑定非回环地址时，必须设置 token；`CUA_HUB_ALLOW_REMOTE=1` 仅用于你自己
+已经在前面加了鉴权代理的场景。
 
 本地协议冒烟测试：`node scripts/mcp_smoke.mjs`。
 
@@ -140,6 +147,15 @@ HTTP 模式没有鉴权，默认只允许绑定回环地址；确需对外暴露
 | `CUA_HUB_OPENAI_BASE_URL` | 默认取 `OPENROUTER_BASE_URL`，否则 `https://api.openai.com/v1` |
 | `CUA_HUB_MODEL` | Anthropic 默认 `claude-sonnet-4-5`；OpenAI 默认取 `OPENROUTER_MODEL` 或 `gpt-4o-mini` |
 | `CUA_HUB_YES` | 设为 1 跳过危险动作确认 |
+| `CUA_HUB_MCP_TOKEN` | HTTP 模式的 Bearer token；设置后强制鉴权 |
+| `CUA_HUB_ALLOW_REMOTE` | 允许无 token 绑定非回环地址（仅限已有前置鉴权） |
+
+## CI
+
+GitHub Actions 配置在 [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml)
+（Windows + Ubuntu 双平台：fmt / clippy / test / release build）。当前 GitHub
+凭据没有 `workflow` 权限，无法直接写入 `.github/workflows/`；授权后把它复制
+到 `.github/workflows/ci.yml` 即可启用。
 
 ## 架构
 

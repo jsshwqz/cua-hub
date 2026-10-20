@@ -229,10 +229,10 @@ single JSON-RPC object and replies `application/json` (notifications get
 `202 Accepted`); `GET /health` returns `ok` for probes. This is the JSON mode of
 streamable HTTP, not SSE.
 
-There is no authentication, so non-loopback binds are refused unless
-`CUA_HUB_ALLOW_REMOTE=1` is set. If this is ever exposed beyond localhost it
-needs a reverse proxy with auth, because every tool here can control the
-machine.
+`CUA_HUB_MCP_TOKEN` enables a single bearer-token check on `/mcp` (`/health`
+stays open). Non-loopback binds are refused unless a token is set, or
+`CUA_HUB_ALLOW_REMOTE=1` acknowledges that an authenticating proxy sits in
+front. Without one, every tool here can control the machine.
 
 ## Safety
 

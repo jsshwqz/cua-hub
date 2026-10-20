@@ -103,20 +103,41 @@ pub async fn serve_http(bind: &str) -> Result<()> {
     // desktop. Require an explicit opt-in for non-loopback addresses.
     let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
     let local = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
-    if !local && std::env::var("CUA_HUB_ALLOW_REMOTE").as_deref() != Ok("1") {
+    let token = std::env::var("CUA_HUB_MCP_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    if !local && token.is_none() && std::env::var("CUA_HUB_ALLOW_REMOTE").as_deref() != Ok("1") {
         anyhow::bail!(
-            "refusing to bind MCP HTTP on {host}: no authentication. Set CUA_HUB_ALLOW_REMOTE=1 to override"
+            "refusing to bind MCP HTTP on {host} without CUA_HUB_MCP_TOKEN; set CUA_HUB_ALLOW_REMOTE=1 only if you front it with your own auth"
         );
     }
 
     use axum::{
-        http::StatusCode,
+        extract::State,
+        http::{HeaderMap, StatusCode},
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
 
-    async fn rpc(Json(request): Json<Value>) -> axum::response::Response {
+    async fn rpc(
+        State(token): State<Option<String>>,
+        headers: HeaderMap,
+        Json(request): Json<Value>,
+    ) -> axum::response::Response {
+        if let Some(expected) = token {
+            let presented = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if presented != format!("Bearer {expected}") {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "missing or invalid bearer token" })),
+                )
+                    .into_response();
+            }
+        }
         match handle_request(request).await {
             Some(response) => (StatusCode::OK, Json(response)).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
@@ -125,7 +146,8 @@ pub async fn serve_http(bind: &str) -> Result<()> {
 
     let app = Router::new()
         .route("/mcp", post(rpc))
-        .route("/health", get(|| async { "ok" }));
+        .route("/health", get(|| async { "ok" }))
+        .with_state(token);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|e| anyhow::anyhow!("bind {bind}: {e}"))?;
