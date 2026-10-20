@@ -289,7 +289,7 @@ async fn execute_step(
                 model: opts.model.clone(),
                 headed: opts.headed,
                 start_url: None,
-                run_dir: Some(step_dir.clone()),
+                run_dir: Some(step_dir.to_path_buf()),
                 screenshot_quality: 70,
             })
             .await?;
@@ -316,7 +316,7 @@ async fn execute_step(
                 provider: runner::ProviderArg::Auto,
                 model: opts.model.clone(),
                 max_edge: 1568,
-                run_dir: Some(step_dir.clone()),
+                run_dir: Some(step_dir.to_path_buf()),
                 settle_ms: 600,
                 ui_tree: false,
                 browser_headed: opts.headed,
