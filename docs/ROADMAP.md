@@ -14,9 +14,12 @@
 
 ## Phase 2 — Multi-engine
 
-- [ ] `cua-engine-access`: Windows UIA and Linux AT-SPI2 tree reading
-- [ ] `cua-engine-code`: generated PowerShell/bash with allow-list execution
-- [ ] OpenAI computer-use provider; local UI-TARS via Ollama
+- [x] `cua-engine-code`: LLM-generated PowerShell/sh with risk-gated execution
+- [x] `cua-engine-access`: Windows UIA snapshot (cached, depth-bounded)
+- [x] Hybrid context: `--ui-tree` adds the tree to vision prompts
+- [ ] `cua-engine-access`: invoke/click controls by name, not just snapshot
+- [ ] Linux AT-SPI2 tree and input
+- [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health
 - [ ] Engine fallback on repeated failure
 

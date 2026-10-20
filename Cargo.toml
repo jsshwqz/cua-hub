@@ -4,6 +4,8 @@ members = [
     "crates/cua-core",
     "crates/cua-io",
     "crates/cua-engine-vision",
+    "crates/cua-engine-code",
+    "crates/cua-engine-access",
     "crates/cua-router",
     "crates/cua-cli",
 ]

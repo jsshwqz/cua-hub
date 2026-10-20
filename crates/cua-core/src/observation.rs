@@ -27,6 +27,18 @@ impl Observation {
         }
     }
 
+    /// Placeholder for engines that do not consume the screen.
+    pub fn empty() -> Self {
+        Self {
+            image: Vec::new(),
+            media_type: "image/jpeg".into(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            ui_tree: None,
+        }
+    }
+
     pub fn base64(&self) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(&self.image)

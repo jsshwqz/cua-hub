@@ -58,6 +58,14 @@ impl Router for RuleRouter {
             "命令行",
             "脚本",
             "script",
+            "磁盘空间",
+            "剩余空间",
+            "内存占用",
+            "进程列表",
+            "系统信息",
+            "环境变量",
+            "disk space",
+            "memory usage",
         ];
         // Browser-only work benefits from DOM access.
         let browser_hints = [
@@ -106,6 +114,12 @@ mod tests {
     #[test]
     fn shell_task_routes_to_code() {
         let d = RuleRouter::new().route("用 powershell 查看磁盘空间");
+        assert_eq!(d.kind, EngineKind::Code);
+    }
+
+    #[test]
+    fn system_info_routes_to_code() {
+        let d = RuleRouter::new().route("查看 C 盘剩余空间");
         assert_eq!(d.kind, EngineKind::Code);
     }
 

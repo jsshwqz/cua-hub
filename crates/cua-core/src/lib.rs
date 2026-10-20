@@ -11,7 +11,7 @@ pub mod action;
 pub mod error;
 pub mod observation;
 
-pub use action::{Action, MouseButton, Point, Risk};
+pub use action::{Action, MouseButton, Point, Risk, ShellKind};
 pub use error::{Error, Result};
 pub use observation::Observation;
 

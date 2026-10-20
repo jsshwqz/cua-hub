@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use cua_core::{Action, Engine, EngineKind, Risk, StepRecord};
+use cua_engine_code::CodeEngine;
 use cua_engine_vision::{AnthropicConfig, OpenAiConfig, OpenAiVisionEngine, VisionEngine};
 use cua_router::{Router, RuleRouter};
 use tracing::{info, warn};
@@ -43,6 +44,17 @@ enum Command {
     },
     /// Send a key chord, e.g. "ctrl+esc" or "Return".
     Key { combo: String },
+    /// Print the Windows accessibility tree of the desktop.
+    Tree {
+        #[arg(long, default_value_t = 150)]
+        max_nodes: usize,
+        /// How deep to descend in the tree.
+        #[arg(long, default_value_t = 5)]
+        depth: usize,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a natural-language task on this machine.
     Run {
         /// What to do, in natural language.
@@ -74,6 +86,9 @@ enum Command {
         /// Milliseconds to wait after a mutating action before the next screenshot.
         #[arg(long, default_value_t = 600)]
         settle_ms: u64,
+        /// Include a shallow accessibility tree alongside each screenshot.
+        #[arg(long)]
+        ui_tree: bool,
     },
 }
 
@@ -146,6 +161,19 @@ fn main() -> Result<()> {
             println!("sent key {combo}");
             Ok(())
         }
+        Command::Tree {
+            max_nodes,
+            depth,
+            json,
+        } => {
+            let snapshot = cua_engine_access::snapshot(max_nodes, depth)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                print!("{}", snapshot.to_text());
+            }
+            Ok(())
+        }
         Command::Run {
             task,
             max_steps,
@@ -157,6 +185,7 @@ fn main() -> Result<()> {
             max_edge,
             run_dir,
             settle_ms,
+            ui_tree,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(run_task(RunOptions {
@@ -170,6 +199,7 @@ fn main() -> Result<()> {
                 max_edge,
                 run_dir,
                 settle_ms,
+                ui_tree,
             }))
         }
     }
@@ -253,6 +283,7 @@ struct RunOptions {
     max_edge: u32,
     run_dir: Option<PathBuf>,
     settle_ms: u64,
+    ui_tree: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -273,10 +304,10 @@ async fn run_task(opts: RunOptions) -> Result<()> {
         reason = %decision.reason,
         "routing task"
     );
-    if decision.kind != EngineKind::Vision {
+    if matches!(decision.kind, EngineKind::Access | EngineKind::Browser) {
         warn!(
             requested = decision.kind.as_str(),
-            "this engine is not implemented in phase 1; falling back to vision"
+            "engine not implemented yet; falling back to vision"
         );
     }
 
@@ -297,21 +328,28 @@ async fn run_task(opts: RunOptions) -> Result<()> {
         p => p,
     };
 
-    let mut engine: Box<dyn Engine> = match provider {
-        ProviderArg::Anthropic => {
-            let mut config = AnthropicConfig::from_env()?;
-            if let Some(m) = opts.model.clone() {
-                config.model = m;
+    let mut engine: Box<dyn Engine> = if decision.kind == EngineKind::Code {
+        let config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
+        println!("provider: llm-code model={}", config.model);
+        Box::new(CodeEngine::new(config))
+    } else {
+        match provider {
+            ProviderArg::Anthropic => {
+                let mut config = AnthropicConfig::from_env()?;
+                if let Some(m) = opts.model.clone() {
+                    config.model = m;
+                }
+                println!("provider: anthropic model={}", config.model);
+                Box::new(VisionEngine::new(config))
             }
-            println!("provider: anthropic model={}", config.model);
-            Box::new(VisionEngine::new(config))
-        }
-        ProviderArg::Openai | ProviderArg::Auto => {
-            let config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
-            println!("provider: openai-compatible model={}", config.model);
-            Box::new(OpenAiVisionEngine::new(config))
+            ProviderArg::Openai | ProviderArg::Auto => {
+                let config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
+                println!("provider: openai-compatible model={}", config.model);
+                Box::new(OpenAiVisionEngine::new(config))
+            }
         }
     };
+    let vision_engine = engine.kind() == EngineKind::Vision;
 
     if opts.dry_run {
         println!("[dry-run] max_steps={}", opts.max_steps);
@@ -325,12 +363,29 @@ async fn run_task(opts: RunOptions) -> Result<()> {
     let mut outcome = Outcome::StepLimit;
 
     for index in 0..opts.max_steps {
-        let frame = cua_io::observe(opts.max_edge, 80)?;
-        let shot_path = run_dir.join(format!("step-{index:02}.png"));
-        std::fs::write(&shot_path, &frame.png)?;
+        let frame = if vision_engine {
+            let frame = cua_io::observe(opts.max_edge, 80)?;
+            let shot_path = run_dir.join(format!("step-{index:02}.png"));
+            std::fs::write(&shot_path, &frame.png)?;
+            Some(frame)
+        } else {
+            None
+        };
+        let mut observation = frame
+            .as_ref()
+            .map(|f| f.observation.clone())
+            .unwrap_or_else(cua_core::Observation::empty);
+        if opts.ui_tree && vision_engine {
+            // Depth 1 keeps the per-step COM cost under a second; deeper trees
+            // are available through `cua-hub tree` for debugging.
+            match cua_engine_access::snapshot(60, 1) {
+                Ok(snap) => observation.ui_tree = Some(snap.to_text()),
+                Err(e) => tracing::warn!(error = %e, "ui tree snapshot failed"),
+            }
+        }
 
         let action = engine
-            .next_action(&opts.task, &frame.observation, &history)
+            .next_action(&opts.task, &observation, &history)
             .await
             .with_context(|| format!("engine failed at step {index}"))?;
 
@@ -379,9 +434,20 @@ async fn run_task(opts: RunOptions) -> Result<()> {
             break;
         }
 
+        if let Action::RunCommand { command, shell } = &action {
+            match cua_io::run_command(command, *shell).await {
+                Ok(out) => record.note = Some(out.to_note()),
+                Err(e) => record.note = Some(format!("error: {e}")),
+            }
+            write_record(&mut log_file, &record)?;
+            engine.on_action_result(&record).await;
+            history.push(record);
+            continue;
+        }
+
         let result = tokio::task::spawn_blocking({
             let action = action.clone();
-            let scale = frame.input_scale;
+            let scale = frame.as_ref().map(|f| f.input_scale).unwrap_or(1.0);
             move || cua_io::apply(&action, scale)
         })
         .await
@@ -476,6 +542,10 @@ fn describe(action: &Action) -> String {
             format!("scroll ({dx}, {dy}) at ({}, {})", at.x, at.y)
         }
         Action::Wait { ms } => format!("wait {ms}ms"),
+        Action::RunCommand { command, shell } => {
+            let preview: String = command.chars().take(120).collect();
+            format!("run [{shell:?}] {preview}")
+        }
         Action::Done { summary } => format!("done: {summary}"),
         Action::Fail { reason } => format!("fail: {reason}"),
     }

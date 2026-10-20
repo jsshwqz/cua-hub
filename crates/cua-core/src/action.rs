@@ -22,6 +22,18 @@ pub enum MouseButton {
     Middle,
 }
 
+/// Interpreter used for [`Action::RunCommand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellKind {
+    /// PowerShell on Windows, `/bin/sh` elsewhere.
+    #[default]
+    Auto,
+    PowerShell,
+    Bash,
+    Cmd,
+}
+
 /// An engine-agnostic operation on the machine.
 ///
 /// Engines return these; the runner executes them through `cua-io`.
@@ -61,6 +73,12 @@ pub enum Action {
     },
     /// Pause for `ms` milliseconds.
     Wait { ms: u64 },
+    /// Run a shell command and feed its output back to the engine.
+    RunCommand {
+        command: String,
+        #[serde(default)]
+        shell: ShellKind,
+    },
     /// Task completed successfully.
     Done { summary: String },
     /// Task cannot continue.
@@ -82,6 +100,32 @@ impl Action {
             Action::Screenshot | Action::Move { .. } | Action::Wait { .. } => Risk::Safe,
             Action::Done { .. } | Action::Fail { .. } => Risk::None,
             Action::Click { .. } | Action::Scroll { .. } => Risk::Low,
+            Action::RunCommand { command, .. } => {
+                const BLOCKED: &[&str] = &[
+                    "rm -rf /",
+                    "rm -rf ~",
+                    "mkfs",
+                    "format ",
+                    "diskpart",
+                    "del /f /s",
+                    "del /s /q c:",
+                    "remove-item -recurse c:\\",
+                    "clear-disk",
+                    "initialize-disk",
+                    "shutdown",
+                    "reboot",
+                    "stop-computer",
+                    "drop database",
+                    "bcdedit",
+                    "reg delete hklm",
+                ];
+                let c = command.to_ascii_lowercase();
+                if BLOCKED.iter().any(|b| c.contains(b)) {
+                    Risk::High
+                } else {
+                    Risk::Medium
+                }
+            }
             Action::Type { text, .. } => {
                 let t = text.to_ascii_lowercase();
                 const DANGEROUS: &[&str] = &[

@@ -67,8 +67,12 @@ pub fn apply(action: &Action, scale: f32) -> Result<()> {
                 enigo.scroll(*dx, Axis::Horizontal).map_err(input_err)?;
             }
         }
-        // Non-mutating actions are handled by the runner.
-        Action::Screenshot | Action::Wait { .. } | Action::Done { .. } | Action::Fail { .. } => {}
+        // Non-input actions are handled by the runner.
+        Action::Screenshot
+        | Action::Wait { .. }
+        | Action::Done { .. }
+        | Action::Fail { .. }
+        | Action::RunCommand { .. } => {}
     }
     Ok(())
 }

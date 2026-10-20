@@ -180,12 +180,19 @@ impl Engine for OpenAiVisionEngine {
             ));
         }
 
+        let tree = observation
+            .ui_tree
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| format!("\nAccessibility tree (partial, indentation = depth):\n{t}"))
+            .unwrap_or_default();
         let user_text = format!(
-            "TASK: {task}\n\nScreen: {}x{} pixels.\nRecent steps:\n{}\n\
+            "TASK: {task}\n\nScreen: {}x{} pixels.\nRecent steps:\n{}{}\n\
              Decide the single next action. Reply with JSON only.",
             observation.width,
             observation.height,
-            if trail.is_empty() { "(none)\n" } else { &trail }
+            if trail.is_empty() { "(none)\n" } else { &trail },
+            tree
         );
 
         let body = json!({
@@ -392,6 +399,7 @@ fn describe(action: &Action) -> String {
         Action::Key { combo } => format!("key {combo}"),
         Action::Scroll { dy, .. } => format!("scroll dy={dy}"),
         Action::Wait { ms } => format!("wait {ms}ms"),
+        Action::RunCommand { command, .. } => format!("run {command}"),
         Action::Screenshot => "screenshot".into(),
         Action::Done { summary } => format!("done {summary}"),
         Action::Fail { reason } => format!("fail {reason}"),

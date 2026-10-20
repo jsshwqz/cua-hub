@@ -58,6 +58,24 @@ Only one tool call per turn is executed. Extra calls in the same assistant
 message are acknowledged as `skipped` so the transcript stays valid for the
 next request.
 
+## Code engine
+
+`cua-engine-code` asks the model for one command per turn and returns
+`Action::RunCommand`. The runner executes it with a 120s timeout, feeds
+`exit code + stdout + stderr` back as the step note, and stops on
+`{"done":true}`. Every command is rated `Medium` risk by default; a deny-list
+(`rm -rf /`, `format`, `diskpart`, `shutdown`, `bcdedit`, registry deletion, …)
+raises it to `High`, which requires `--yes` or an interactive confirmation.
+
+## Accessibility snapshot
+
+Windows UIA exposes properties through cross-process COM calls. Reading five
+properties per node with `CurrentX()` took ~36s for 40 nodes. The implementation
+now builds one `IUIAutomationCacheRequest` (name, control type, automation id,
+rect, offscreen) and uses `GetCachedChildren`, cutting the same walk to ~0.7s at
+depth 1. Cost grows with depth, so per-step hybrid context uses depth 1 and
+`cua-hub tree` exposes deeper walks for debugging (depth 5 ≈ 4s).
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

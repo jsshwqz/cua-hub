@@ -10,5 +10,9 @@ repository.workspace = true
 cua-core = { path = "../cua-core" }
 image.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 enigo = "0.6"
 xcap = "0.9"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

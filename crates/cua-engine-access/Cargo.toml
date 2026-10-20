@@ -1,0 +1,18 @@
+[package]
+name = "cua-engine-access"
+description = "OS accessibility-tree snapshots for cua-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cua-core = { path = "../cua-core" }
+serde.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+] }

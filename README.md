@@ -9,7 +9,19 @@ Rust 多引擎 Computer Use Agent 编排平台。
 
 ## 状态
 
-Phase 1 — 视觉引擎 MVP 已跑通（Windows 真机验证：截图 → 模型决策 → 点击/按键 → 复核截图）。
+Phase 2 进行中，Windows 真机验证：
+
+- **视觉引擎**：截图 → 模型决策 → 点击/按键 → 复核截图（含 125% DPI 坐标换算）
+- **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
+- **无障碍树**：Windows UIA 快照，`--ui-tree` 可与截图一起作为混合上下文
+
+## 引擎
+
+| 引擎 | 触发方式 | 适合 |
+|------|----------|------|
+| Vision | 默认 / `--engine vision` | 未知 GUI、跨应用操作 |
+| Code | 任务含"命令/脚本/磁盘空间/进程列表…"或 `--engine code` | 确定性数据获取、批处理 |
+| Access | 计划中（当前提供快照） | 精确控件操作 |
 
 ## 快速开始
 
@@ -25,6 +37,10 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export OPENROUTER_API_KEY=sk-or-...
 ./target/release/cua-hub run "打开开始菜单" --yes \
   --model "minimax/minimax-m3.1-flash:free"
+
+# 命令类任务自动走代码引擎
+./target/release/cua-hub run "查看 C 盘剩余空间" --yes \
+  --model "minimax/minimax-m3.1-flash:free"
 ```
 
 ## 命令
@@ -35,9 +51,11 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub capture out.png` | 截取主屏 |
 | `cua-hub click X Y` | 按物理坐标点击（调试/脚本用） |
 | `cua-hub key "ctrl+esc"` | 发送按键组合 |
+| `cua-hub tree --depth 2` | 打印 Windows 无障碍树（调试/混合上下文） |
 | `cua-hub run "<task>"` | 执行任务（默认视觉引擎） |
 | `cua-hub run "<task>" --dry-run` | 只规划一步，不操作机器 |
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
+| `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
 
 ## 每次运行的产物
 

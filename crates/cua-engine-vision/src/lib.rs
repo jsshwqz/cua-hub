@@ -120,25 +120,27 @@ impl AnthropicProvider {
     pub async fn next(&mut self, task: &str, obs: &Observation) -> Result<Action> {
         if !self.started {
             self.display = (obs.width, obs.height);
-            self.messages.push(json!({
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": format!("TASK: {task}") },
-                    image_block(obs)
-                ]
-            }));
+            let mut content = vec![json!({ "type": "text", "text": format!("TASK: {task}") })];
+            if let Some(block) = tree_block(obs) {
+                content.push(block);
+            }
+            content.push(image_block(obs));
+            self.messages
+                .push(json!({ "role": "user", "content": content }));
             self.started = true;
         } else if let Some((tool_use_id, _)) = self.pending.pop_front() {
             // Attach the screenshot and any execution note to the tool result,
             // and acknowledge any tool uses we deliberately skipped.
             let note = self.pending_note.take().unwrap_or_else(|| "done".into());
+            let mut result_content = vec![json!({ "type": "text", "text": note })];
+            if let Some(block) = tree_block(obs) {
+                result_content.push(block);
+            }
+            result_content.push(image_block(obs));
             let mut blocks = vec![json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": [
-                    { "type": "text", "text": note },
-                    image_block(obs)
-                ]
+                "content": result_content
             })];
             for id in self.skipped.drain(..) {
                 blocks.push(json!({
@@ -307,6 +309,18 @@ impl AnthropicProvider {
             last_err.unwrap_or_else(|| "provider call failed".into()),
         ))
     }
+}
+
+fn tree_block(obs: &Observation) -> Option<Value> {
+    obs.ui_tree
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| {
+            json!({
+                "type": "text",
+                "text": format!("Accessibility tree (partial, indentation = depth):\n{t}")
+            })
+        })
 }
 
 fn image_block(obs: &Observation) -> Value {
