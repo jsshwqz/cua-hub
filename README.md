@@ -52,6 +52,8 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub click X Y` | 按物理坐标点击（调试/脚本用） |
 | `cua-hub key "ctrl+esc"` | 发送按键组合 |
 | `cua-hub tree --depth 2` | 打印 Windows 无障碍树（调试/混合上下文） |
+| `cua-hub find "开始"` | 按无障碍名称查找控件并输出矩形 |
+| `cua-hub invoke "开始"` | 按名称找到控件并点击其中心 |
 | `cua-hub run "<task>"` | 执行任务（默认视觉引擎） |
 | `cua-hub run "<task>" --dry-run` | 只规划一步，不操作机器 |
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |

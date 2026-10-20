@@ -65,6 +65,12 @@ pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     imp::snapshot(max_nodes, max_depth)
 }
 
+/// Find the first control whose name matches `name` (exact match wins over
+/// substring), returning its rectangle so the caller can click its center.
+pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
+    imp::find(name, max_nodes, max_depth)
+}
+
 /// Map a UIA control-type id to a short readable name.
 #[allow(dead_code)]
 fn control_type_name(id: u32) -> &'static str {
@@ -122,6 +128,84 @@ mod imp {
     use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomationElement};
 
     pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
+        let mut nodes = Vec::new();
+        let (truncated, _) = walk(max_nodes, max_depth, |node| {
+            nodes.push(node.clone());
+            false
+        })?;
+        Ok(UiSnapshot { nodes, truncated })
+    }
+
+    pub fn find(name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
+        use windows::core::BSTR;
+        use windows::Win32::System::Variant::VARIANT;
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomation, TreeScope_Subtree, UIA_ControlTypePropertyId, UIA_NamePropertyId,
+        };
+
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
+        let root = unsafe { automation.GetRootElement() }
+            .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
+        let name_cond = unsafe {
+            automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(BSTR::from(name)))
+        }
+        .map_err(|e| Error::Capture(format!("UIA condition: {e}")))?;
+
+        // Prefer actionable controls: the Start menu and its button share a
+        // name, but only the button (control type 50000) is clickable chrome.
+        let mut node = None;
+        for type_id in [50000i32, 50011, 50007] {
+            let type_cond = unsafe {
+                automation
+                    .CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(type_id))
+            };
+            let Ok(type_cond) = type_cond else { continue };
+            let Ok(combined) = (unsafe { automation.CreateAndCondition(&name_cond, &type_cond) })
+            else {
+                continue;
+            };
+            if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &combined) } {
+                node = Some(element_to_node(&el));
+                break;
+            }
+        }
+
+        if node.is_none() {
+            if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &name_cond) } {
+                node = Some(element_to_node(&el));
+            }
+        }
+        Ok(node.filter(|n| n.rect.2 > 0 && n.rect.3 > 0))
+    }
+
+    fn element_to_node(el: &IUIAutomationElement) -> UiNode {
+        UiNode {
+            depth: 0,
+            control_type: unsafe { el.CurrentControlType() }
+                .map(|id| control_type_name(id.0 as u32))
+                .unwrap_or("Unknown")
+                .to_string(),
+            name: unsafe { el.CurrentName() }
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            automation_id: unsafe { el.CurrentAutomationId() }
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            rect: unsafe { el.CurrentBoundingRectangle() }
+                .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+                .unwrap_or((0, 0, 0, 0)),
+        }
+    }
+
+    /// Depth-first walk in document order. `visit` returns true to stop early.
+    fn walk(
+        max_nodes: usize,
+        max_depth: usize,
+        mut visit: impl FnMut(&UiNode) -> bool,
+    ) -> Result<(bool, bool)> {
         // RPC_E_CHANGED_MODE is fine: COM is already initialised differently.
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 
@@ -153,12 +237,12 @@ mod imp {
         let root = unsafe { automation.GetRootElementBuildCache(&cache) }
             .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
 
-        let mut nodes = Vec::new();
+        let mut visited = 0usize;
         let mut truncated = false;
         let mut stack: Vec<(IUIAutomationElement, usize)> = vec![(root, 0)];
 
         while let Some((element, depth)) = stack.pop() {
-            if nodes.len() >= max_nodes {
+            if visited >= max_nodes {
                 truncated = true;
                 break;
             }
@@ -170,52 +254,58 @@ mod imp {
             let offscreen = unsafe { element.CachedIsOffscreen() }
                 .map(|b| b.as_bool())
                 .unwrap_or(false);
-            if !offscreen {
-                let name = unsafe { element.CachedName() }
-                    .map(|b| b.to_string())
-                    .unwrap_or_default();
-                let control_type = unsafe { element.CachedControlType() }
-                    .map(|id| control_type_name(id.0 as u32))
-                    .unwrap_or("Unknown")
-                    .to_string();
-                let automation_id = unsafe { element.CachedAutomationId() }
-                    .map(|b| b.to_string())
-                    .unwrap_or_default();
-                let rect = unsafe { element.CachedBoundingRectangle() }
-                    .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
-                    .unwrap_or((0, 0, 0, 0));
+            if offscreen {
+                continue;
+            }
 
-                // Skip anonymous chrome to keep the tree readable.
-                if !(name.is_empty() && automation_id.is_empty() && rect.2 == 0) {
-                    nodes.push(UiNode {
-                        depth,
-                        control_type,
-                        name,
-                        automation_id,
-                        rect,
-                    });
+            let name = unsafe { element.CachedName() }
+                .map(|b| b.to_string())
+                .unwrap_or_default();
+            let control_type = unsafe { element.CachedControlType() }
+                .map(|id| control_type_name(id.0 as u32))
+                .unwrap_or("Unknown")
+                .to_string();
+            let automation_id = unsafe { element.CachedAutomationId() }
+                .map(|b| b.to_string())
+                .unwrap_or_default();
+            let rect = unsafe { element.CachedBoundingRectangle() }
+                .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+                .unwrap_or((0, 0, 0, 0));
+
+            // Skip anonymous chrome to keep the tree readable.
+            if !(name.is_empty() && automation_id.is_empty() && rect.2 == 0) {
+                visited += 1;
+                let node = UiNode {
+                    depth,
+                    control_type,
+                    name,
+                    automation_id,
+                    rect,
+                };
+                if visit(&node) {
+                    return Ok((truncated, true));
                 }
+            }
 
-                if let Ok(array) = unsafe { element.GetCachedChildren() } {
-                    let len = unsafe { array.Length() }.unwrap_or(0).max(0) as usize;
-                    let mut children = Vec::new();
-                    for i in 0..len {
-                        if let Ok(child) = unsafe { array.GetElement(i as i32) } {
-                            children.push(child);
-                        }
-                        if children.len() >= max_nodes {
-                            truncated = true;
-                            break;
-                        }
+            if let Ok(array) = unsafe { element.GetCachedChildren() } {
+                let len = unsafe { array.Length() }.unwrap_or(0).max(0) as usize;
+                let mut children = Vec::new();
+                for i in 0..len {
+                    if let Ok(child) = unsafe { array.GetElement(i as i32) } {
+                        children.push(child);
                     }
-                    for child in children.into_iter().rev() {
-                        stack.push((child, depth + 1));
+                    if children.len() >= max_nodes {
+                        truncated = true;
+                        break;
                     }
+                }
+                for child in children.into_iter().rev() {
+                    stack.push((child, depth + 1));
                 }
             }
         }
 
-        Ok(UiSnapshot { nodes, truncated })
+        Ok((truncated, false))
     }
 }
 
@@ -227,6 +317,12 @@ mod imp {
     pub fn snapshot(_max_nodes: usize, _max_depth: usize) -> Result<UiSnapshot> {
         Err(Error::Capture(
             "accessibility snapshot is only implemented on Windows so far".into(),
+        ))
+    }
+
+    pub fn find(_name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
+        Err(Error::Capture(
+            "accessibility lookup is only implemented on Windows so far".into(),
         ))
     }
 }

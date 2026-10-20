@@ -164,6 +164,7 @@ fn parse_key(name: &str) -> Option<Key> {
         "left" | "arrowleft" => Key::LeftArrow,
         "right" | "arrowright" => Key::RightArrow,
         "capslock" => Key::CapsLock,
+        "meta" | "win" | "super" | "cmd" => Key::Meta,
         "f1" => Key::F1,
         "f2" => Key::F2,
         "f3" => Key::F3,

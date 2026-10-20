@@ -17,7 +17,7 @@
 - [x] `cua-engine-code`: LLM-generated PowerShell/sh with risk-gated execution
 - [x] `cua-engine-access`: Windows UIA snapshot (cached, depth-bounded)
 - [x] Hybrid context: `--ui-tree` adds the tree to vision prompts
-- [ ] `cua-engine-access`: invoke/click controls by name, not just snapshot
+- [x] `cua-engine-access`: find/invoke controls by accessible name
 - [ ] Linux AT-SPI2 tree and input
 - [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health

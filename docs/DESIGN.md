@@ -31,6 +31,18 @@ becomes logical (22, 843), which opens the Start menu.
 The DPI factor comes from `xcap`'s monitor `scale_factor()`. Linux/X11 normally
 reports 1.0 and input coordinates are physical, so the factor is 1.0 there.
 
+UIA rectangles are a fourth case: because this process is not per-monitor
+DPI-aware, Windows virtualizes them to **logical** pixels (taskbar at
+`y=824` on a 1920x1080 @125% screen). That is exactly the space enigo accepts,
+so `cua-hub invoke` passes the rectangle center through unscaled. Scaling it
+again sent clicks into the open Start menu instead of the Start button — the
+kind of bug that only a visual check catches.
+
+Control lookup uses a server-side `FindFirst` with a combined condition
+(`Name == X AND ControlType == Button/MenuItem/ListItem`) instead of walking the
+tree. Preferring actionable control types matters: with the Start menu open,
+both the menu (`List`) and the button (`Button`) are named "开始".
+
 ## Providers
 
 Two vision backends ship today:

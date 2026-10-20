@@ -44,6 +44,22 @@ enum Command {
     },
     /// Send a key chord, e.g. "ctrl+esc" or "Return".
     Key { combo: String },
+    /// Find a control by accessible name and print its rectangle.
+    Find {
+        name: String,
+        #[arg(long, default_value_t = 300)]
+        max_nodes: usize,
+        #[arg(long, default_value_t = 6)]
+        depth: usize,
+    },
+    /// Find a control by name and click its center.
+    Invoke {
+        name: String,
+        #[arg(long, default_value_t = 300)]
+        max_nodes: usize,
+        #[arg(long, default_value_t = 6)]
+        depth: usize,
+    },
     /// Print the Windows accessibility tree of the desktop.
     Tree {
         #[arg(long, default_value_t = 150)]
@@ -159,6 +175,49 @@ fn main() -> Result<()> {
             };
             cua_io::apply(&action, 1.0)?;
             println!("sent key {combo}");
+            Ok(())
+        }
+        Command::Find {
+            name,
+            max_nodes,
+            depth,
+        } => match cua_engine_access::find(&name, max_nodes, depth)? {
+            Some(node) => {
+                let (x, y, w, h) = node.rect;
+                println!(
+                    "{} \"{}\" at ({x},{y},{w},{h}) center=({},{})",
+                    node.control_type,
+                    node.name,
+                    x + w / 2,
+                    y + h / 2
+                );
+                Ok(())
+            }
+            None => bail!("no control matching {name:?}"),
+        },
+        Command::Invoke {
+            name,
+            max_nodes,
+            depth,
+        } => {
+            let node = cua_engine_access::find(&name, max_nodes, depth)?
+                .ok_or_else(|| anyhow::anyhow!("no control matching {name:?}"))?;
+            let (x, y, w, h) = node.rect;
+            let action = Action::Click {
+                at: cua_core::Point::new(x + w / 2, y + h / 2),
+                button: cua_core::MouseButton::Left,
+                double: false,
+            };
+            // UIA reports DPI-virtualized (logical) rectangles, which is the
+            // same space enigo accepts on Windows: no scaling needed.
+            cua_io::apply(&action, 1.0)?;
+            println!(
+                "clicked {} \"{}\" at ({},{})",
+                node.control_type,
+                node.name,
+                x + w / 2,
+                y + h / 2
+            );
             Ok(())
         }
         Command::Tree {
