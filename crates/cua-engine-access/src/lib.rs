@@ -4,6 +4,8 @@
 //! control tree that can be given to a model as context (hybrid grounding) or
 //! printed for debugging. Invoking controls by name comes next.
 
+pub mod atspi;
+
 use cua_core::Result;
 use serde::{Deserialize, Serialize};
 
@@ -62,19 +64,71 @@ fn truncate(s: &str, max: usize) -> String {
 /// Depth 2 is cheap enough for per-step model context; deeper walks can take
 /// seconds on busy desktops.
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
-    imp::snapshot(max_nodes, max_depth)
+    #[cfg(windows)]
+    {
+        imp::snapshot(max_nodes, max_depth)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::snapshot(max_nodes, max_depth)
+    }
 }
 
 /// Find the first control whose name matches `name` (exact match wins over
 /// substring), returning its rectangle so the caller can click its center.
 pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
-    imp::find(name, max_nodes, max_depth)
+    #[cfg(windows)]
+    {
+        imp::find(name, max_nodes, max_depth)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::find(name, max_nodes, max_depth)
+    }
 }
 
-/// Map a UIA control-type id to a short readable name.
-#[allow(dead_code)]
+/// Map a control-type id to a short readable name. UIA uses ids in the 50000
+/// range; AT-SPI roles are small integers (see `AtspiRole`).
 fn control_type_name(id: u32) -> &'static str {
     match id {
+        // AT-SPI roles
+        0 => "Invalid",
+        4 => "Alert",
+        7 => "CheckBox",
+        11 => "ComboBox",
+        16 => "Dialog",
+        23 => "Frame",
+        24 => "GlassPane",
+        29 => "Label",
+        31 => "List",
+        32 => "ListItem",
+        33 => "Menu",
+        34 => "MenuBar",
+        35 => "MenuItem",
+        37 => "PageTab",
+        39 => "Panel",
+        42 => "PopupMenu",
+        43 => "Button",
+        44 => "ProgressBar",
+        45 => "RadioButton",
+        49 => "ScrollPane",
+        50 => "Separator",
+        51 => "Slider",
+        54 => "StatusBar",
+        55 => "Table",
+        56 => "TableCell",
+        61 => "Text",
+        62 => "ToggleButton",
+        63 => "ToolBar",
+        65 => "ToolTip",
+        66 => "Tree",
+        67 => "TreeTable",
+        69 => "Window",
+        75 => "Application",
+        79 => "Entry",
+        80 => "Paragraph",
+        81 => "Ruler",
+        // UIA control types
         50000 => "Button",
         50001 => "Calendar",
         50002 => "CheckBox",
@@ -306,23 +360,5 @@ mod imp {
         }
 
         Ok((truncated, false))
-    }
-}
-
-#[cfg(not(windows))]
-mod imp {
-    use super::UiSnapshot;
-    use cua_core::{Error, Result};
-
-    pub fn snapshot(_max_nodes: usize, _max_depth: usize) -> Result<UiSnapshot> {
-        Err(Error::Capture(
-            "accessibility snapshot is only implemented on Windows so far".into(),
-        ))
-    }
-
-    pub fn find(_name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
-        Err(Error::Capture(
-            "accessibility lookup is only implemented on Windows so far".into(),
-        ))
     }
 }

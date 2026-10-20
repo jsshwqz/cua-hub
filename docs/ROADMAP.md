@@ -18,7 +18,8 @@
 - [x] `cua-engine-access`: Windows UIA snapshot (cached, depth-bounded)
 - [x] Hybrid context: `--ui-tree` adds the tree to vision prompts
 - [x] `cua-engine-access`: find/invoke controls by accessible name
-- [ ] Linux AT-SPI2 tree and input
+- [x] Linux AT-SPI2 tree + find (verified in WSL with a GTK3 window)
+- [ ] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
 - [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health
 - [ ] Engine fallback on repeated failure

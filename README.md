@@ -13,7 +13,8 @@ Phase 2 进行中，Windows 真机验证：
 
 - **视觉引擎**：截图 → 模型决策 → 点击/按键 → 复核截图（含 125% DPI 坐标换算）
 - **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
-- **无障碍树**：Windows UIA 快照，`--ui-tree` 可与截图一起作为混合上下文
+- **无障碍树**：Windows UIA 与 Linux AT-SPI2 快照 + 按名查找（Linux 在 WSL/GTK3 真机验证）
+- **混合上下文**：`--ui-tree` 把浅层无障碍树与截图一起喂给视觉模型
 - **浏览器引擎**：自动拉起 Chrome/Edge（隔离临时 profile），CDP 驱动 navigate/click/type/eval，已真机跑通
 - **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步
 - **失败恢复**：同引擎带错误重试（自动加预算），仍失败则重新规划并换引擎，两条路径均已真机验证
@@ -69,7 +70,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub capture out.png` | 截取主屏 |
 | `cua-hub click X Y` | 按物理坐标点击（调试/脚本用） |
 | `cua-hub key "ctrl+esc"` | 发送按键组合 |
-| `cua-hub tree --depth 2` | 打印 Windows 无障碍树（调试/混合上下文） |
+| `cua-hub tree --depth 2` | 打印无障碍树（Windows UIA / Linux AT-SPI） |
 | `cua-hub find "开始"` | 按无障碍名称查找控件并输出矩形 |
 | `cua-hub invoke "开始"` | 按名称找到控件并点击其中心 |
 | `cua-hub run "<task>"` | 执行任务（默认视觉引擎） |

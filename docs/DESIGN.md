@@ -38,6 +38,48 @@ so `cua-hub invoke` passes the rectangle center through unscaled. Scaling it
 again sent clicks into the open Start menu instead of the Start button — the
 kind of bug that only a visual check catches.
 
+### Linux (AT-SPI2)
+
+The Linux backend in `cua-engine-access::atspi` speaks D-Bus directly through
+`zbus` (no C headers or `libatspi-dev` needed):
+
+1. Open the session bus and call `org.a11y.Bus.GetAddress`.
+2. Connect to that accessibility bus and read the registry root at
+   `/org/a11y/atspi/accessible/root`; its children are applications.
+3. Each child is a `(bus_name, object_path)` pair, so one `Proxy` per node is
+   created with that destination.
+
+Two protocol details cost real debugging time:
+
+* **Role is a method, not a property.** `GetRole()` / `GetRoleName()` are
+  D-Bus methods; reading it as a property returns `UnknownProperty`, which
+  silently mapped every node to role 0 ("Invalid").
+* **The GTK bridge must be enabled.** In WSL, the `org.a11y.Status` schema is
+  absent; setting `org.gnome.desktop.interface toolkit-accessibility=true` and
+  exporting `GTK_A11Y=atspi` makes GTK3 register with the registry. Without it
+  the registry root has no children.
+
+Verified in WSL Ubuntu 24.04 with a 420x180 GTK3 window:
+
+```
+Application "-"
+  Frame "CUA AT-SPI Demo"
+    Panel
+      Button "Close"
+      Label "CUA AT-SPI Demo"
+    Text
+      Button "Click Me"
+```
+
+`find("Click Me")` returns the button rect and center. Reproduce with
+`dbus-run-session -- bash scripts/a11y_smoke.sh <atspi_tree-binary>`.
+
+Limitations: no action invocation yet (click-by-center works through enigo);
+D-Bus calls currently have no per-call timeout; the full CLI has only been
+built on Windows, so Linux CI should cover it next.
+
+### Windows
+
 Control lookup uses a server-side `FindFirst` with a combined condition
 (`Name == X AND ControlType == Button/MenuItem/ListItem`) instead of walking the
 tree. Preferring actionable control types matters: with the Start menu open,
