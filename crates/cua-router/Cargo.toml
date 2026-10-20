@@ -1,0 +1,11 @@
+[package]
+name = "cua-router"
+description = "Rule-based task routing for cua-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cua-core = { path = "../cua-core" }
+serde.workspace = true

@@ -1,0 +1,402 @@
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
+use cua_core::{Action, Engine, EngineKind, Risk, StepRecord};
+use cua_engine_vision::{AnthropicConfig, VisionEngine};
+use cua_router::{Router, RuleRouter};
+use tracing::{info, warn};
+
+#[derive(Parser)]
+#[command(
+    name = "cua-hub",
+    version,
+    about = "Multi-engine computer use agent",
+    long_about = "Drive a desktop through a vision model, with dry-run previews and a per-run audit log."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check display capture, input injection and model configuration.
+    Doctor,
+    /// Capture the primary display to a PNG file.
+    Capture {
+        #[arg(default_value = "capture.png")]
+        output: PathBuf,
+    },
+    /// Run a natural-language task on this machine.
+    Run {
+        /// What to do, in natural language.
+        task: String,
+        /// Hard limit on agent steps.
+        #[arg(long, default_value_t = 30)]
+        max_steps: u32,
+        /// Skip confirmation for medium/high risk actions.
+        #[arg(long, env = "CUA_HUB_YES")]
+        yes: bool,
+        /// Plan one step only; never touches the machine.
+        #[arg(long)]
+        dry_run: bool,
+        /// Force an engine instead of auto-routing.
+        #[arg(long, value_enum)]
+        engine: Option<EngineArg>,
+        /// Override the vision model name.
+        #[arg(long, env = "CUA_HUB_MODEL")]
+        model: Option<String>,
+        /// Longest screenshot edge sent to the model.
+        #[arg(long, default_value_t = 1568)]
+        max_edge: u32,
+        /// Directory for screenshots and the JSONL step log.
+        #[arg(long)]
+        run_dir: Option<PathBuf>,
+        /// Milliseconds to wait after a mutating action before the next screenshot.
+        #[arg(long, default_value_t = 600)]
+        settle_ms: u64,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum EngineArg {
+    Vision,
+    Access,
+    Browser,
+    Code,
+}
+
+impl From<EngineArg> for EngineKind {
+    fn from(v: EngineArg) -> Self {
+        match v {
+            EngineArg::Vision => EngineKind::Vision,
+            EngineArg::Access => EngineKind::Access,
+            EngineArg::Browser => EngineKind::Browser,
+            EngineArg::Code => EngineKind::Code,
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "cua_hub=info,warn".into()),
+        )
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Doctor => doctor(),
+        Command::Capture { output } => capture(&output),
+        Command::Run {
+            task,
+            max_steps,
+            yes,
+            dry_run,
+            engine,
+            model,
+            max_edge,
+            run_dir,
+            settle_ms,
+        } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(run_task(RunOptions {
+                task,
+                max_steps,
+                yes,
+                dry_run,
+                engine: engine.map(Into::into),
+                model,
+                max_edge,
+                run_dir,
+                settle_ms,
+            }))
+        }
+    }
+}
+
+fn doctor() -> Result<()> {
+    println!("cua-hub {}", env!("CARGO_PKG_VERSION"));
+    println!("os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+
+    match cua_io::capture_primary() {
+        Ok(c) => println!(
+            "display: {}x{} @ ({},{}) scale {:.2} -- OK",
+            c.width, c.height, c.origin.0, c.origin.1, c.scale_factor
+        ),
+        Err(e) => println!("display: FAILED ({e})"),
+    }
+
+    match cua_io::cursor_position() {
+        Ok((x, y)) => println!("input: pointer at ({x},{y}) -- OK"),
+        Err(e) => println!("input: FAILED ({e})"),
+    }
+
+    match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => {
+            let masked = if k.len() > 8 {
+                format!("{}...{}", &k[..4], &k[k.len() - 4..])
+            } else {
+                "****".into()
+            };
+            println!("api: ANTHROPIC_API_KEY set ({masked})");
+        }
+        _ => println!("api: ANTHROPIC_API_KEY missing -- vision engine unavailable"),
+    }
+
+    let model = std::env::var("CUA_HUB_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".into());
+    println!("model: {model}");
+
+    let decision = RuleRouter::new().route("打开记事本输入 hello");
+    println!(
+        "router: sample task -> {} ({})",
+        decision.kind.as_str(),
+        decision.reason
+    );
+    Ok(())
+}
+
+fn capture(output: &Path) -> Result<()> {
+    let c = cua_io::capture_primary().context("capture failed")?;
+    let png = cua_io::encode_png(&c.image)?;
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(output, png)?;
+    println!("saved {} ({}x{})", output.display(), c.width, c.height);
+    Ok(())
+}
+
+struct RunOptions {
+    task: String,
+    max_steps: u32,
+    yes: bool,
+    dry_run: bool,
+    engine: Option<EngineKind>,
+    model: Option<String>,
+    max_edge: u32,
+    run_dir: Option<PathBuf>,
+    settle_ms: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Completed(String),
+    Failed(String),
+    StepLimit,
+    DryRun(Action),
+}
+
+async fn run_task(opts: RunOptions) -> Result<()> {
+    let decision = match opts.engine {
+        Some(kind) => RuleRouter::forced(kind).route(&opts.task),
+        None => RuleRouter::new().route(&opts.task),
+    };
+    info!(
+        engine = decision.kind.as_str(),
+        reason = %decision.reason,
+        "routing task"
+    );
+    if decision.kind != EngineKind::Vision {
+        warn!(
+            requested = decision.kind.as_str(),
+            "this engine is not implemented in phase 1; falling back to vision"
+        );
+    }
+
+    let mut config = AnthropicConfig::from_env()?;
+    if let Some(m) = opts.model {
+        config.model = m;
+    }
+    if opts.dry_run {
+        println!(
+            "[dry-run] model={} max_steps={}",
+            config.model, opts.max_steps
+        );
+    }
+
+    let run_dir = opts.run_dir.unwrap_or_else(default_run_dir);
+    std::fs::create_dir_all(&run_dir)?;
+    let log_path = run_dir.join("steps.jsonl");
+    let mut log_file = std::fs::File::create(&log_path)?;
+
+    let mut engine = VisionEngine::new(config);
+    let mut history: Vec<StepRecord> = Vec::new();
+    let mut outcome = Outcome::StepLimit;
+
+    for index in 0..opts.max_steps {
+        let frame = cua_io::observe(opts.max_edge, 80)?;
+        let shot_path = run_dir.join(format!("step-{index:02}.png"));
+        std::fs::write(&shot_path, &frame.png)?;
+
+        let action = engine
+            .next_action(&opts.task, &frame.observation, &history)
+            .await
+            .with_context(|| format!("engine failed at step {index}"))?;
+
+        let mut record = StepRecord::new(index, action.clone());
+        println!(
+            "[{index:02}] {} {}",
+            action.risk().as_str(),
+            describe(&action)
+        );
+
+        match action {
+            Action::Done { summary } => {
+                record.note = Some(format!("completed: {summary}"));
+                write_record(&mut log_file, &record)?;
+                outcome = Outcome::Completed(summary);
+                break;
+            }
+            Action::Fail { reason } => {
+                record.note = Some(format!("failed: {reason}"));
+                write_record(&mut log_file, &record)?;
+                outcome = Outcome::Failed(reason);
+                break;
+            }
+            Action::Wait { ms } => {
+                write_record(&mut log_file, &record)?;
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                continue;
+            }
+            Action::Screenshot => {
+                write_record(&mut log_file, &record)?;
+                continue;
+            }
+            _ => {}
+        }
+
+        if opts.dry_run {
+            write_record(&mut log_file, &record)?;
+            outcome = Outcome::DryRun(action);
+            break;
+        }
+
+        if !confirm(&action, opts.yes)? {
+            record.note = Some("skipped: user declined".into());
+            write_record(&mut log_file, &record)?;
+            outcome = Outcome::Failed("action declined by user".into());
+            break;
+        }
+
+        let result = tokio::task::spawn_blocking({
+            let action = action.clone();
+            let scale = frame.scale;
+            move || cua_io::apply(&action, scale)
+        })
+        .await
+        .context("input task panicked")?;
+
+        match result {
+            Ok(()) => record.note = Some("executed".into()),
+            Err(e) => record.note = Some(format!("error: {e}")),
+        }
+        write_record(&mut log_file, &record)?;
+        engine.on_action_result(&record).await;
+        history.push(record);
+
+        tokio::time::sleep(Duration::from_millis(opts.settle_ms)).await;
+    }
+
+    let summary = match &outcome {
+        Outcome::Completed(s) => format!("completed: {s}"),
+        Outcome::Failed(s) => format!("failed: {s}"),
+        Outcome::StepLimit => format!("stopped after {} steps", opts.max_steps),
+        Outcome::DryRun(a) => format!("dry-run planned: {}", describe(a)),
+    };
+    std::fs::write(
+        run_dir.join("outcome.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "task": opts.task,
+            "outcome": summary,
+            "steps": history.len(),
+        }))?,
+    )?;
+    println!("\n{summary}");
+    println!("artifacts: {}", run_dir.display());
+
+    match outcome {
+        Outcome::Completed(_) | Outcome::DryRun(_) => Ok(()),
+        Outcome::Failed(reason) => bail!("{reason}"),
+        Outcome::StepLimit => bail!("step limit reached"),
+    }
+}
+
+fn confirm(action: &Action, yes: bool) -> Result<bool> {
+    if action.risk() < Risk::Medium || yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "{} risk action requires --yes in non-interactive mode",
+            action.risk().as_str()
+        );
+    }
+    print!(
+        "about to run a {} risk action: {}\nconfirm? [y/N] ",
+        action.risk().as_str(),
+        describe(action)
+    );
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn write_record(file: &mut std::fs::File, record: &StepRecord) -> Result<()> {
+    let line = serde_json::to_string(record)?;
+    writeln!(file, "{line}")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn describe(action: &Action) -> String {
+    match action {
+        Action::Screenshot => "screenshot".into(),
+        Action::Click { at, button, double } => format!(
+            "{}{}click at ({}, {})",
+            if *double { "double " } else { "" },
+            button_name(*button),
+            at.x,
+            at.y
+        ),
+        Action::Move { to } => format!("move to ({}, {})", to.x, to.y),
+        Action::Drag { from, to } => {
+            format!("drag ({}, {}) -> ({}, {})", from.x, from.y, to.x, to.y)
+        }
+        Action::Type { text, .. } => {
+            let preview: String = text.chars().take(60).collect();
+            format!("type {:?}", preview)
+        }
+        Action::Key { combo } => format!("key {combo}"),
+        Action::Scroll { at, dx, dy } => {
+            format!("scroll ({dx}, {dy}) at ({}, {})", at.x, at.y)
+        }
+        Action::Wait { ms } => format!("wait {ms}ms"),
+        Action::Done { summary } => format!("done: {summary}"),
+        Action::Fail { reason } => format!("fail: {reason}"),
+    }
+}
+
+fn button_name(b: cua_core::MouseButton) -> &'static str {
+    match b {
+        cua_core::MouseButton::Left => "left ",
+        cua_core::MouseButton::Right => "right ",
+        cua_core::MouseButton::Middle => "middle ",
+    }
+}
+
+fn default_run_dir() -> PathBuf {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    PathBuf::from(".runs").join(stamp.to_string())
+}
