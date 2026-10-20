@@ -51,6 +51,10 @@ pub struct StepRecord {
     /// Free-form note: engine reasoning, execution outcome, error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Model->input multiplier used when the action ran, so replays land on the
+    /// same pixels even if the screen or screenshot budget changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_scale: Option<f32>,
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -60,6 +64,7 @@ impl StepRecord {
             index,
             action,
             note: None,
+            input_scale: None,
             at: chrono::Utc::now(),
         }
     }

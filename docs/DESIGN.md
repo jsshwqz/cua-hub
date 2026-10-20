@@ -154,6 +154,24 @@ selectors and page evaluation do not map onto mouse coordinates. The router
 dispatches URL tasks to this engine and maps its outcome back into the shared
 `RunReport`.
 
+## Replay
+
+Every run already writes `steps.jsonl`. `cua-hub runs` summarises them and
+`cua-hub replay <dir>` re-executes the recorded actions in order:
+
+* each `StepRecord` now stores `input_scale` (model→input multiplier), so a
+  replay lands on the same pixels even if `--max-edge` or DPI changes later
+  (older runs without the field fall back to 1.0);
+* `Wait` sleeps, `Done`/`Fail`/`Screenshot` are skipped, and every mutating
+  action goes through the same risk gate as a live run (`--yes`,
+  `--allow-high`);
+* `RunCommand` is re-executed with its recorded shell and its output printed;
+* `--dry-run` prints the sequence without touching the machine.
+
+Vision recordings remain screen-layout dependent: replaying clicks is only
+meaningful on a desktop in the same state. The browser engine's own
+`browser-step-*.jpg`/`steps.jsonl` are not replayed by this command yet.
+
 ## Cross-engine orchestration
 
 `cua-hub orchestrate` turns one goal into an ordered plan, executes each step on

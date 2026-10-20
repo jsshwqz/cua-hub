@@ -304,6 +304,36 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Err(e) => tool_err(e),
             }
         }
+        "list_runs" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let root = args["root"].as_str().unwrap_or(".runs");
+            match crate::replay::list_runs(std::path::Path::new(root), limit) {
+                Ok(runs) => tool_ok(json!(runs)),
+                Err(e) => tool_err(e),
+            }
+        }
+        "replay_run" => {
+            let dir = match required_str(args, "dir") {
+                Ok(d) => d,
+                Err(e) => return e,
+            };
+            let opts = crate::replay::ReplayOptions {
+                dir: std::path::PathBuf::from(dir),
+                dry_run: args["dry_run"].as_bool().unwrap_or(false),
+                yes: args["yes"].as_bool().unwrap_or(false),
+                allow_high: args["allow_high"].as_bool().unwrap_or(false),
+                max_steps: args["max_steps"].as_u64().map(|n| n as u32),
+            };
+            match crate::replay::replay(opts).await {
+                Ok(report) => tool_ok(json!({
+                    "summary": report.summary(),
+                    "executed": report.executed,
+                    "skipped": report.skipped,
+                    "dry_run": report.dry_run,
+                })),
+                Err(e) => tool_err(e),
+            }
+        }
         "capture_screen" => match cua_io::observe(1280, 75) {
             Ok(frame) => {
                 use base64::Engine as _;
@@ -467,6 +497,32 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "list_runs",
+            "description": "List recent recorded runs (newest first) with task, outcome and step count.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "default": 20 },
+                    "root": { "type": "string", "default": ".runs" }
+                }
+            }
+        },
+        {
+            "name": "replay_run",
+            "description": "Replay a recorded steps.jsonl. Medium-risk actions need `yes`; destructive ones need `allow_high`. Use `dry_run` to preview.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dir": { "type": "string", "description": "Run directory containing steps.jsonl" },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "yes": { "type": "boolean", "default": false },
+                    "allow_high": { "type": "boolean", "default": false },
+                    "max_steps": { "type": "integer" }
+                },
+                "required": ["dir"]
+            }
+        },
+        {
             "name": "capture_screen",
             "description": "Capture the primary display and return a JPEG image content block plus its dimensions.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -571,6 +627,8 @@ mod tests {
         assert!(names.contains(&"orchestrate".to_string()));
         assert!(names.contains(&"browser_task".to_string()));
         assert!(names.contains(&"capture_screen".to_string()));
+        assert!(names.contains(&"list_runs".to_string()));
+        assert!(names.contains(&"replay_run".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
     }
 }

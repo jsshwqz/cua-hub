@@ -38,6 +38,6 @@
 ## Phase 4 — Product
 
 - [ ] HTTP API + web console with live screen
-- [ ] Recording and replay
+- [x] Run history and deterministic replay (`runs` / `replay`, MCP tools)
 - [ ] Fine-tune pipeline for a local model (replace API calls for hot paths)
 - [ ] SDK for Rust, Python, TypeScript

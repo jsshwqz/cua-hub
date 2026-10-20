@@ -247,6 +247,7 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
                 Ok(out) => record.note = Some(out.to_note()),
                 Err(e) => record.note = Some(format!("error: {e}")),
             }
+            record.input_scale = frame.as_ref().map(|f| f.input_scale);
             write_record(&mut log_file, &record)?;
             engine.on_action_result(&record).await;
             history.push(record);
@@ -261,6 +262,7 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
         .await
         .context("input task panicked")?;
 
+        record.input_scale = frame.as_ref().map(|f| f.input_scale);
         match result {
             Ok(()) => record.note = Some("executed".into()),
             Err(e) => record.note = Some(format!("error: {e}")),
@@ -331,7 +333,7 @@ fn build_engine(
     }
 }
 
-fn confirm(action: &Action, yes: bool, allow_high: bool) -> Result<bool> {
+pub fn confirm(action: &Action, yes: bool, allow_high: bool) -> Result<bool> {
     let risk = action.risk();
     if risk == Risk::High && !allow_high {
         bail!(

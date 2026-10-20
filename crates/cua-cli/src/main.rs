@@ -1,5 +1,6 @@
 mod mcp;
 mod orchestrator;
+mod replay;
 mod runner;
 
 use std::path::{Path, PathBuf};
@@ -160,6 +161,34 @@ enum Command {
         allow_high: bool,
         #[arg(long)]
         run_dir: Option<PathBuf>,
+    },
+    /// List recent runs under .runs (newest first).
+    Runs {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Directory that holds run folders.
+        #[arg(long, default_value = ".runs")]
+        root: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay a recorded run (steps.jsonl) step by step.
+    Replay {
+        /// Run directory, e.g. .runs/20261020-120000
+        dir: PathBuf,
+        /// Print the plan without touching the machine.
+        #[arg(long)]
+        dry_run: bool,
+        /// Allow medium-risk actions without prompting.
+        #[arg(long, env = "CUA_HUB_YES")]
+        yes: bool,
+        /// Permit destructive commands.
+        #[arg(long)]
+        allow_high: bool,
+        /// Replay only records with index < N.
+        #[arg(long)]
+        max_steps: Option<u32>,
     },
     /// Speak MCP over stdio (or HTTP with --http) so other agents can drive
     /// this machine.
@@ -362,6 +391,44 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Runs { limit, root, json } => {
+            let runs = replay::list_runs(&root, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+            } else if runs.is_empty() {
+                println!("no runs under {}", root.display());
+            } else {
+                for r in runs {
+                    println!(
+                        "{}  {:>3} steps  {:<40}  {}",
+                        r.modified,
+                        r.steps,
+                        truncate(&r.task, 40),
+                        r.outcome
+                    );
+                    println!("    {}", r.dir.display());
+                }
+            }
+            Ok(())
+        }
+        Command::Replay {
+            dir,
+            dry_run,
+            yes,
+            allow_high,
+            max_steps,
+        } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(replay::replay(replay::ReplayOptions {
+                dir,
+                dry_run,
+                yes,
+                allow_high,
+                max_steps,
+            }))?;
+            println!("{}", report.summary());
+            Ok(())
+        }
         Command::Serve { http } => {
             let runtime = tokio::runtime::Runtime::new()?;
             match http {
@@ -425,6 +492,13 @@ fn doctor() -> Result<()> {
         decision.reason
     );
     Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
 fn capture(output: &Path) -> Result<()> {

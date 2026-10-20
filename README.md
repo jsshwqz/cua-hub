@@ -79,6 +79,8 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
 | `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless） |
 | `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划；`--retries/--max-replans` 控制恢复） |
+| `cua-hub runs` | 列出 `.runs` 下的历史运行（任务、结果、步数） |
+| `cua-hub replay <run_dir>` | 按 `steps.jsonl` 逐步重放（`--dry-run` 预览） |
 | `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
 
 ## MCP 接入
@@ -104,6 +106,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `run_task` | 自然语言任务（视觉/代码/浏览器引擎），返回摘要与产物路径 |
 | `browser_task` | 在隔离 Chromium 里执行网页任务（CDP） |
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |
+| `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
 | `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |
