@@ -1,4 +1,5 @@
 mod mcp;
+mod orchestrator;
 mod runner;
 
 use std::path::{Path, PathBuf};
@@ -130,6 +131,29 @@ enum Command {
         /// Optional page to open before the loop starts.
         #[arg(long)]
         start_url: Option<String>,
+    },
+    /// Plan a task across browser/code/vision engines and execute the steps.
+    Orchestrate {
+        /// Goal in natural language.
+        task: String,
+        /// Print the plan only.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = 6)]
+        max_plan_steps: usize,
+        /// Step budget for each engine sub-run.
+        #[arg(long, default_value_t = 10)]
+        max_steps: u32,
+        #[arg(long, env = "CUA_HUB_MODEL")]
+        model: Option<String>,
+        /// Show the browser window if a browser step runs.
+        #[arg(long)]
+        headed: bool,
+        /// Permit destructive commands planned by the model.
+        #[arg(long)]
+        allow_high: bool,
+        #[arg(long)]
+        run_dir: Option<PathBuf>,
     },
     /// Speak MCP over stdio so other agents can drive this machine.
     Serve,
@@ -292,6 +316,34 @@ fn main() -> Result<()> {
             ))?;
             if !report.outcome.is_success() {
                 bail!("{}", report.outcome.summary(report.steps));
+            }
+            Ok(())
+        }
+        Command::Orchestrate {
+            task,
+            dry_run,
+            max_plan_steps,
+            max_steps,
+            model,
+            headed,
+            allow_high,
+            run_dir,
+        } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(orchestrator::run(orchestrator::OrchestrateOptions {
+                task,
+                dry_run,
+                max_plan_steps,
+                max_steps_per_engine: max_steps,
+                model,
+                headed,
+                yes: true,
+                allow_high,
+                run_dir,
+            }))?;
+            println!("{}", report.summary());
+            if !report.success {
+                bail!("orchestration failed");
             }
             Ok(())
         }

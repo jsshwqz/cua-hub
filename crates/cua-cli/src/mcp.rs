@@ -176,6 +176,35 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Err(e) => tool_err(e),
             }
         }
+        "orchestrate" => {
+            let task = match required_str(args, "task") {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let opts = crate::orchestrator::OrchestrateOptions {
+                task,
+                dry_run: args["dry_run"].as_bool().unwrap_or(false),
+                max_plan_steps: args["max_plan_steps"].as_u64().unwrap_or(6) as usize,
+                max_steps_per_engine: args["max_steps"].as_u64().unwrap_or(10) as u32,
+                model: args["model"].as_str().map(str::to_string),
+                headed: args["headed"].as_bool().unwrap_or(false),
+                yes: true,
+                allow_high: args["allow_high"].as_bool().unwrap_or(false),
+                run_dir: None,
+            };
+            match crate::orchestrator::run(opts).await {
+                Ok(report) => {
+                    let payload = json!({
+                        "summary": report.summary(),
+                        "success": report.success,
+                        "steps": report.results.len(),
+                        "artifacts": report.run_dir.to_string_lossy(),
+                    });
+                    tool_ok(json!([{ "type": "text", "text": payload.to_string() }]))
+                }
+                Err(e) => tool_err(e),
+            }
+        }
         "browser_task" => {
             let task = match required_str(args, "task") {
                 Ok(t) => t,
@@ -332,6 +361,23 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "orchestrate",
+            "description": "Plan a goal across engines (browser/code/vision), pass outputs between steps, and execute. Use for tasks that combine web reading with desktop or shell work. `dry_run` returns the plan only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "max_plan_steps": { "type": "integer", "default": 6 },
+                    "max_steps": { "type": "integer", "default": 10, "description": "Budget per engine sub-run" },
+                    "model": { "type": "string" },
+                    "headed": { "type": "boolean", "default": false },
+                    "allow_high": { "type": "boolean", "default": false }
+                },
+                "required": ["task"]
+            }
+        },
+        {
             "name": "browser_task",
             "description": "Drive a headless Chromium browser through a natural-language task using CDP (navigate, click, type, eval). Runs in an isolated temporary profile. Requires an OpenAI-compatible model key.",
             "inputSchema": {
@@ -435,6 +481,7 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         assert!(names.contains(&"run_task".to_string()));
+        assert!(names.contains(&"orchestrate".to_string()));
         assert!(names.contains(&"browser_task".to_string()));
         assert!(names.contains(&"capture_screen".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));

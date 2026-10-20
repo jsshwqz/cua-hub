@@ -112,6 +112,34 @@ selectors and page evaluation do not map onto mouse coordinates. The router
 dispatches URL tasks to this engine and maps its outcome back into the shared
 `RunReport`.
 
+## Cross-engine orchestration
+
+`cua-hub orchestrate` turns one goal into an ordered plan, executes each step on
+its own engine, and passes outputs forward:
+
+```json
+{"steps": [
+  {"engine": "browser", "goal": "open example.com and read document.title", "save_as": "title"},
+  {"engine": "code",    "goal": "Write-Output \"{{title}}\""}
+]}
+```
+
+* The planner is an OpenAI-compatible model call with a strict JSON schema;
+  plans are capped at `--max-plan-steps` (default 6).
+* `save_as` stores the step's cleaned summary; later goals substitute
+  `{{name}}`. Substitution is plain string replacement, so a failed step that
+  skipped `save_as` leaves a visible placeholder instead of silently guessing.
+* Each step runs with `--max-steps` (default 10) on its own engine: browser via
+  the CDP loop, vision/code through the desktop runner (access maps to vision
+  until control invocation lands).
+* Execution stops at the first failed step. Per-step artifacts live under
+  `.runs/orchestrate-*/step-N-engine/`, with `plan.json` and `results.json` at
+  the top level.
+* `--dry-run` prints the plan and touches nothing.
+
+This is sequential hand-off, not a general planner: no re-planning, no parallel
+steps, and no verification step unless the planner writes one.
+
 ## MCP server
 
 `cua-hub serve` speaks newline-delimited JSON-RPC 2.0 on stdio. Three

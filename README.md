@@ -15,6 +15,7 @@ Phase 2 进行中，Windows 真机验证：
 - **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
 - **无障碍树**：Windows UIA 快照，`--ui-tree` 可与截图一起作为混合上下文
 - **浏览器引擎**：自动拉起 Chrome/Edge（隔离临时 profile），CDP 驱动 navigate/click/type/eval，已真机跑通
+- **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步，已真机跑通
 - **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
 
 ## 引擎
@@ -52,6 +53,11 @@ export OPENROUTER_API_KEY=sk-or-...
 # 也可以显式进入浏览器模式并指定起始页
 ./target/release/cua-hub browser "点击 More information 并告诉我新标题" \
   --start-url https://example.com --headed
+
+# 跨引擎：浏览器取数据，代码/桌面使用数据
+./target/release/cua-hub orchestrate \
+  "打开 https://example.com 读取页面标题，然后用命令打印出这个标题" \
+  --model "minimax/minimax-m3.1-flash:free"
 ```
 
 ## 命令
@@ -70,6 +76,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
 | `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
 | `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless） |
+| `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划） |
 | `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
 
 ## MCP 接入
@@ -94,6 +101,7 @@ export OPENROUTER_API_KEY=sk-or-...
 |------|------|
 | `run_task` | 自然语言任务（视觉/代码/浏览器引擎），返回摘要与产物路径 |
 | `browser_task` | 在隔离 Chromium 里执行网页任务（CDP） |
+| `orchestrate` | 跨引擎计划与执行，步骤间传值 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
 | `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |

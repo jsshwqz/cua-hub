@@ -573,6 +573,8 @@ dependencies = [
  "cua-engine-vision",
  "cua-io",
  "cua-router",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
