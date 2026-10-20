@@ -281,39 +281,6 @@ async fn call_tool(name: &str, args: &Value) -> Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn responses_carry_envelope() {
-        let r = success_response(json!(7), json!({"ok": true}));
-        assert_eq!(r["jsonrpc"], "2.0");
-        assert_eq!(r["id"], 7);
-        assert_eq!(r["result"]["ok"], true);
-    }
-
-    #[test]
-    fn tool_errors_are_results_not_protocol_errors() {
-        let e = tool_err("boom");
-        assert_eq!(e["isError"], true);
-        assert_eq!(e["content"][0]["type"], "text");
-    }
-
-    #[test]
-    fn tool_list_includes_run_task_and_capture() {
-        let names: Vec<String> = tool_defs()
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains(&"run_task".to_string()));
-        assert!(names.contains(&"capture_screen".to_string()));
-        assert!(names.contains(&"invoke_control".to_string()));
-    }
-}
-
 fn tool_defs() -> Value {
     json!([
         {
@@ -393,4 +360,37 @@ fn tool_defs() -> Value {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_carry_envelope() {
+        let r = success_response(json!(7), json!({"ok": true}));
+        assert_eq!(r["jsonrpc"], "2.0");
+        assert_eq!(r["id"], 7);
+        assert_eq!(r["result"]["ok"], true);
+    }
+
+    #[test]
+    fn tool_errors_are_results_not_protocol_errors() {
+        let e = tool_err("boom");
+        assert_eq!(e["isError"], true);
+        assert_eq!(e["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn tool_list_includes_run_task_and_capture() {
+        let names: Vec<String> = tool_defs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"run_task".to_string()));
+        assert!(names.contains(&"capture_screen".to_string()));
+        assert!(names.contains(&"invoke_control".to_string()));
+    }
 }
