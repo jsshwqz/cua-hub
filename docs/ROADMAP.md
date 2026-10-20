@@ -28,7 +28,8 @@
 - [ ] `cua-engine-browser` over CDP with DOM + screenshot hybrid
 - [ ] Cross-engine plans (vision discovers, code fixes, browser verifies)
 - [ ] Persistent task state, resume after crash
-- [ ] MCP server exposing `run_task` / `capture` to other agents
+- [x] MCP server over stdio exposing run_task / capture / tree / find / invoke
+- [ ] MCP over HTTP and hosted elicitation for high-risk actions
 
 ## Phase 4 — Product
 

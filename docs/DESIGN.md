@@ -88,6 +88,27 @@ rect, offscreen) and uses `GetCachedChildren`, cutting the same walk to ~0.7s at
 depth 1. Cost grows with depth, so per-step hybrid context uses depth 1 and
 `cua-hub tree` exposes deeper walks for debugging (depth 5 ≈ 4s).
 
+## MCP server
+
+`cua-hub serve` speaks newline-delimited JSON-RPC 2.0 on stdio. Three
+non-obvious constraints shaped the implementation:
+
+1. **stdout is protocol only.** Every human-facing message (routing, provider,
+   step log, summary) goes to stderr. A stray `println!` corrupts the stream.
+2. **stdin is read on a dedicated blocking thread.** With `tokio::io::stdin()`
+   on Windows, a message arriving after the first read while the pipe stayed
+   open never woke the task: requests 1-2 were answered, request 3 hung until
+   the client closed stdin. A `std::thread` reading `std::io::stdin().lines()`
+   into an mpsc channel is reliable.
+3. **Every response needs the envelope.** `tools/call` originally returned the
+   tool result object (`{"content":…}`) without `jsonrpc`/`id`/`result`, so
+   well-behaved clients ignored it and timed out. The server now wraps tool
+   results in a normal JSON-RPC response; tool failures use `isError: true`
+   inside the result, not a protocol error.
+
+High-risk actions are never enabled by `run_task`'s default `yes`; they need
+`allow_high: true`, mirroring the CLI's `--allow-high` flag.
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

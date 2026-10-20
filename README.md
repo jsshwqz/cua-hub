@@ -14,6 +14,7 @@ Phase 2 进行中，Windows 真机验证：
 - **视觉引擎**：截图 → 模型决策 → 点击/按键 → 复核截图（含 125% DPI 坐标换算）
 - **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
 - **无障碍树**：Windows UIA 快照，`--ui-tree` 可与截图一起作为混合上下文
+- **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
 
 ## 引擎
 
@@ -58,6 +59,35 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub run "<task>" --dry-run` | 只规划一步，不操作机器 |
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
 | `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
+| `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
+
+## MCP 接入
+
+任何支持 MCP 的客户端（Claude Desktop、Cursor、Qoder 等）都可以这样挂载：
+
+```json
+{
+  "mcpServers": {
+    "cua-hub": {
+      "command": "C:\\\\path\\\\to\\\\cua-hub.exe",
+      "args": ["serve"],
+      "env": { "OPENROUTER_API_KEY": "sk-or-..." }
+    }
+  }
+}
+```
+
+暴露的工具：
+
+| 工具 | 作用 |
+|------|------|
+| `run_task` | 自然语言任务（视觉/代码引擎），返回摘要与产物路径 |
+| `capture_screen` | 返回主屏 JPEG + 尺寸 |
+| `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
+| `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |
+| `click` / `key` | 按物理坐标点击、发送按键组合 |
+
+本地协议冒烟测试：`node scripts/mcp_smoke.mjs`。
 
 ## 每次运行的产物
 
