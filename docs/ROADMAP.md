@@ -32,7 +32,8 @@
 - [x] Failure recovery: same-engine retry with budget headroom, then re-plan
 - [ ] Persistent task state, resume after crash
 - [x] MCP server over stdio exposing run_task / capture / tree / find / invoke
-- [ ] MCP over HTTP and hosted elicitation for high-risk actions
+- [x] MCP over HTTP (loopback-only by default)
+- [ ] Hosted elicitation/confirmation for high-risk actions
 
 ## Phase 4 — Product
 

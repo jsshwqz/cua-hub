@@ -161,8 +161,13 @@ enum Command {
         #[arg(long)]
         run_dir: Option<PathBuf>,
     },
-    /// Speak MCP over stdio so other agents can drive this machine.
-    Serve,
+    /// Speak MCP over stdio (or HTTP with --http) so other agents can drive
+    /// this machine.
+    Serve {
+        /// Bind an HTTP endpoint instead of stdio, e.g. 127.0.0.1:8765.
+        #[arg(long)]
+        http: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -357,9 +362,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Serve => {
+        Command::Serve { http } => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(mcp::serve())
+            match http {
+                Some(bind) => runtime.block_on(mcp::serve_http(&bind)),
+                None => runtime.block_on(mcp::serve()),
+            }
         }
     }
 }

@@ -221,6 +221,19 @@ non-obvious constraints shaped the implementation:
 High-risk actions are never enabled by `run_task`'s default `yes`; they need
 `allow_high: true`, mirroring the CLI's `--allow-high` flag.
 
+### HTTP transport
+
+`serve --http 127.0.0.1:8765` reuses the same `handle_request` function as
+stdio, so tool behaviour cannot drift between transports. `POST /mcp` accepts a
+single JSON-RPC object and replies `application/json` (notifications get
+`202 Accepted`); `GET /health` returns `ok` for probes. This is the JSON mode of
+streamable HTTP, not SSE.
+
+There is no authentication, so non-loopback binds are refused unless
+`CUA_HUB_ALLOW_REMOTE=1` is set. If this is ever exposed beyond localhost it
+needs a reverse proxy with auth, because every tool here can control the
+machine.
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

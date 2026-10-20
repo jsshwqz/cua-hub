@@ -19,6 +19,7 @@ cua-engine-access = { path = "../cua-engine-access" }
 cua-engine-browser = { path = "../cua-engine-browser" }
 cua-router = { path = "../cua-router" }
 anyhow.workspace = true
+axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true

@@ -109,6 +109,20 @@ export OPENROUTER_API_KEY=sk-or-...
 | `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |
 | `click` / `key` | 按物理坐标点击、发送按键组合 |
 
+远程/容器内调用可以走 HTTP（streamable POST）：
+
+```bash
+./target/release/cua-hub serve --http 127.0.0.1:8765
+
+curl -s http://127.0.0.1:8765/health
+curl -s -X POST http://127.0.0.1:8765/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+HTTP 模式没有鉴权，默认只允许绑定回环地址；确需对外暴露时设置
+`CUA_HUB_ALLOW_REMOTE=1`，并自行加防火墙/反向代理鉴权。
+
 本地协议冒烟测试：`node scripts/mcp_smoke.mjs`。
 
 ## 每次运行的产物

@@ -1,4 +1,6 @@
-//! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
+//! Minimal MCP server: newline-delimited JSON-RPC 2.0 over stdio, plus a
+//! streamable-HTTP style POST endpoint (`/mcp`) for remote or containerised
+//! clients.
 //!
 //! Exposes the machine as tools so other agents can drive it: run a task,
 //! capture the screen, read the accessibility tree, find/invoke controls, and
@@ -48,44 +50,89 @@ pub async fn serve() -> Result<()> {
             }
         };
 
-        // Notifications carry no id and expect no response.
-        let Some(id) = request.get("id").cloned() else {
-            continue;
-        };
-        let method = request["method"].as_str().unwrap_or_default();
-        tracing::debug!(method, "mcp request");
-
-        let response = match method {
-            "initialize" => success_response(
-                id,
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": {
-                        "name": "cua-hub",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "instructions": "Tools to see and control this Windows desktop. Prefer accessibility_tree + invoke_control for precise work; use run_task for natural-language goals."
-                }),
-            ),
-            "ping" => success_response(id, json!({})),
-            "tools/list" => success_response(id, json!({ "tools": tool_defs() })),
-            "tools/call" => {
-                let params = &request["params"];
-                let tool = params["name"].as_str().unwrap_or_default();
-                tracing::debug!(tool, "tool call");
-                let result = call_tool(tool, &params["arguments"]).await;
-                success_response(id.clone(), result)
-            }
-            "shutdown" => {
+        if request["method"].as_str() == Some("shutdown") {
+            if let Some(id) = request.get("id").cloned() {
                 write_msg(&success_response(id, json!({})))?;
-                break;
             }
-            other => error_response(id, -32601, &format!("method not found: {other}")),
-        };
+            break;
+        }
 
-        write_msg(&response)?;
+        if let Some(response) = handle_request(request).await {
+            write_msg(&response)?;
+        }
     }
+    Ok(())
+}
+
+/// Handle one JSON-RPC request. Returns `None` for notifications.
+pub async fn handle_request(request: Value) -> Option<Value> {
+    // Notifications carry no id and expect no response.
+    let id = request.get("id").cloned()?;
+    let method = request["method"].as_str().unwrap_or_default();
+    tracing::debug!(method, "mcp request");
+
+    Some(match method {
+        "initialize" => success_response(
+            id,
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "cua-hub",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "instructions": "Tools to see and control this desktop. Prefer accessibility_tree + invoke_control for precise work; use run_task for natural-language goals."
+            }),
+        ),
+        "ping" => success_response(id, json!({})),
+        "tools/list" => success_response(id, json!({ "tools": tool_defs() })),
+        "tools/call" => {
+            let params = &request["params"];
+            let tool = params["name"].as_str().unwrap_or_default();
+            tracing::debug!(tool, "tool call");
+            let result = call_tool(tool, &params["arguments"]).await;
+            success_response(id, result)
+        }
+        other => error_response(id, -32601, &format!("method not found: {other}")),
+    })
+}
+
+/// Serve MCP over HTTP: POST JSON-RPC to `/mcp`, `GET /health` for probes.
+pub async fn serve_http(bind: &str) -> Result<()> {
+    // There is no authentication: a remote bind would let anyone drive this
+    // desktop. Require an explicit opt-in for non-loopback addresses.
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+    let local = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
+    if !local && std::env::var("CUA_HUB_ALLOW_REMOTE").as_deref() != Ok("1") {
+        anyhow::bail!(
+            "refusing to bind MCP HTTP on {host}: no authentication. Set CUA_HUB_ALLOW_REMOTE=1 to override"
+        );
+    }
+
+    use axum::{
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+
+    async fn rpc(Json(request): Json<Value>) -> axum::response::Response {
+        match handle_request(request).await {
+            Some(response) => (StatusCode::OK, Json(response)).into_response(),
+            None => StatusCode::ACCEPTED.into_response(),
+        }
+    }
+
+    let app = Router::new()
+        .route("/mcp", post(rpc))
+        .route("/health", get(|| async { "ok" }));
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind {bind}: {e}"))?;
+    eprintln!("MCP HTTP listening on http://{bind}/mcp");
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("http server: {e}"))?;
     Ok(())
 }
 
@@ -474,6 +521,20 @@ mod tests {
         let e = tool_err("boom");
         assert_eq!(e["isError"], true);
         assert_eq!(e["content"][0]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_server_info() {
+        let req = json!({"jsonrpc": "2.0", "id": 9, "method": "initialize", "params": {}});
+        let resp = handle_request(req).await.unwrap();
+        assert_eq!(resp["id"], 9);
+        assert_eq!(resp["result"]["serverInfo"]["name"], "cua-hub");
+    }
+
+    #[tokio::test]
+    async fn notifications_get_no_response() {
+        let req = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert!(handle_request(req).await.is_none());
     }
 
     #[test]
