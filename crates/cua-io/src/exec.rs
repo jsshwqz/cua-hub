@@ -138,8 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_nonzero_exit() {
-        let cmd = if cfg!(windows) { "exit 3" } else { "exit 3" };
-        let out = run_command(cmd, ShellKind::Auto).await.unwrap();
+        let out = run_command("exit 3", ShellKind::Auto).await.unwrap();
         assert!(!out.success());
         assert_eq!(out.code, Some(3));
     }
