@@ -1,8 +1,16 @@
-//! X11 截屏：GetImage 取根窗口 ZPixmap，按 visual 的 RGB mask 解码为 RGBA。
-//! 只支持 bits_per_pixel=32 的 24/32 位色深（Xvfb 与主流桌面默认即此）。
+//! 截屏：按平台分发。
+//! - Linux：x11rb 直连 X11，GetImage 取根窗口 ZPixmap 后按 visual 的 RGB mask
+//!   解码为 RGBA（只支持 bits_per_pixel=32 的 24/32 位色深，Xvfb 与主流桌面默认即此）
+//! - Windows：xcap 取主显示器画面
 
-use anyhow::{bail, Context, Result};
+use anyhow::Context;
+use anyhow::Result;
+
+#[cfg(target_os = "linux")]
+use anyhow::bail;
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder};
 
 pub struct CapturedImage {
@@ -12,6 +20,7 @@ pub struct CapturedImage {
     pub rgba: Vec<u8>,
 }
 
+#[cfg(target_os = "linux")]
 pub fn capture_root() -> Result<CapturedImage> {
     let (conn, screen_num) = x11rb::connect(None).context("connect to X server (DISPLAY set?)")?;
     let setup = conn.setup().clone();
@@ -76,6 +85,7 @@ pub fn capture_root() -> Result<CapturedImage> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn unmask(px: u32, mask: u32) -> u8 {
     if mask == 0 {
         return 0;
@@ -93,4 +103,20 @@ pub fn capture_to_png(path: &std::path::Path) -> Result<(u32, u32)> {
         .context("build RGBA image buffer")?;
     buf.save(path).context("save PNG")?;
     Ok((img.width, img.height))
+}
+
+#[cfg(windows)]
+pub fn capture_root() -> Result<CapturedImage> {
+    let monitors = xcap::Monitor::all().context("list monitors")?;
+    let primary = monitors
+        .into_iter()
+        .find(|m| m.is_primary())
+        .context("primary monitor not found")?;
+    let img = primary.capture_image().context("capture primary monitor")?;
+    let (width, height) = (img.width(), img.height());
+    Ok(CapturedImage {
+        width,
+        height,
+        rgba: img.into_raw(),
+    })
 }

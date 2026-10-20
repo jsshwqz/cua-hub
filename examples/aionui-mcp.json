@@ -1,0 +1,1 @@
+{"mcpServers":{"cua":{"args":["--mode","autonomous","--allow-launch","--audit","C:\\cua-mcp\\audit.jsonl","--shots","C:\\cua-mcp\\screenshots"],"command":"C:\\cua-mcp\\cua-mcp.exe","env":{}}}}

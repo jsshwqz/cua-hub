@@ -1,0 +1,57 @@
+name: Release cua-mcp (Windows)
+
+# 在 muse-v* 标签推送时自动编译 Windows 版 cua-mcp 并发布到 Release；
+# 也可在 Actions 页手动触发（只产出 artifact，不发 Release）。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["muse-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build cua-mcp (release, static CRT)
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release -p cua-mcp --target x86_64-pc-windows-msvc
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/cua-mcp.exe dist/
+          Copy-Item examples/aionui-mcp.json dist/
+          Copy-Item docs/MCP.md dist/
+          Compress-Archive -Path dist/* -DestinationPath cua-mcp-windows-x64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cua-mcp-windows-x64
+          path: cua-mcp-windows-x64.zip
+
+      - name: Publish GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: cua-mcp-windows-x64.zip
+          body: |
+            cua-mcp 预览版（Windows x64）：标准 MCP 协议的 Computer Use 执行端。
+
+            用法：解压到 C:\cua-mcp，把包内 aionui-mcp.json 的内容粘进
+            AionUI 的 MCP 设置即可；其他 MCP 客户端（Claude Code / Qoder /
+            Cursor）同样可用，配置格式见 docs/MCP.md。
+
+            本包由 GitHub Actions 在 windows-latest 上自动构建。

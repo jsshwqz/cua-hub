@@ -4,15 +4,21 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "执行核心：截屏（x11rb）/ 键鼠注入（enigo）/ 安全围栏 / 审计日志"
+description = "执行核心：截屏（Linux x11rb / Windows xcap）/ 键鼠注入（enigo）/ 安全围栏 / 审计日志"
 
 [dependencies]
 cua-types = { path = "../cua-types" }
-enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
-x11rb = "0.13"
+enigo = { version = "0.2", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
+x11rb = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+xcap = "0.0.14"
