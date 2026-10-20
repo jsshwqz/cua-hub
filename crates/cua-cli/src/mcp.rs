@@ -407,17 +407,84 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) else {
                 return tool_err("click requires integer x and y (physical pixels)");
             };
+            let button = if args["middle"].as_bool().unwrap_or(false) {
+                cua_core::MouseButton::Middle
+            } else if args["right"].as_bool().unwrap_or(false) {
+                cua_core::MouseButton::Right
+            } else {
+                cua_core::MouseButton::Left
+            };
             let action = Action::Click {
                 at: Point::new(x as i32, y as i32),
-                button: if args["right"].as_bool().unwrap_or(false) {
-                    cua_core::MouseButton::Right
-                } else {
-                    cua_core::MouseButton::Left
-                },
+                button,
                 double: args["double"].as_bool().unwrap_or(false),
             };
             match cua_io::apply(&action, 1.0 / cua_io::dpi_scale()) {
                 Ok(()) => tool_ok(format!("clicked ({x},{y})")),
+                Err(e) => tool_err(e),
+            }
+        }
+        "type_text" => {
+            let text = match required_str(args, "text") {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let action = Action::Type {
+                text: text.clone(),
+                interval_ms: args["interval_ms"].as_u64().unwrap_or(6),
+            };
+            match cua_io::apply(&action, 1.0) {
+                Ok(()) => tool_ok(format!("typed {} chars", text.chars().count())),
+                Err(e) => tool_err(e),
+            }
+        }
+        "scroll" => {
+            let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) else {
+                return tool_err("scroll requires integer x and y (physical pixels)");
+            };
+            let dy = args["dy"].as_i64().unwrap_or(0) as i32;
+            let dx = args["dx"].as_i64().unwrap_or(0) as i32;
+            if dy == 0 && dx == 0 {
+                return tool_err("scroll requires a non-zero dy or dx");
+            }
+            let action = Action::Scroll {
+                at: Point::new(x as i32, y as i32),
+                dx,
+                dy,
+            };
+            match cua_io::apply(&action, 1.0 / cua_io::dpi_scale()) {
+                Ok(()) => tool_ok(format!("scrolled dx={dx} dy={dy} at ({x},{y})")),
+                Err(e) => tool_err(e),
+            }
+        }
+        "move" => {
+            let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) else {
+                return tool_err("move requires integer x and y (physical pixels)");
+            };
+            let action = Action::Move {
+                to: Point::new(x as i32, y as i32),
+            };
+            match cua_io::apply(&action, 1.0 / cua_io::dpi_scale()) {
+                Ok(()) => tool_ok(format!("moved to ({x},{y})")),
+                Err(e) => tool_err(e),
+            }
+        }
+        "drag" => {
+            let coords = (
+                args["x"].as_i64(),
+                args["y"].as_i64(),
+                args["x2"].as_i64(),
+                args["y2"].as_i64(),
+            );
+            let (Some(x), Some(y), Some(x2), Some(y2)) = coords else {
+                return tool_err("drag requires integer x, y, x2, y2 (physical pixels)");
+            };
+            let action = Action::Drag {
+                from: Point::new(x as i32, y as i32),
+                to: Point::new(x2 as i32, y2 as i32),
+            };
+            match cua_io::apply(&action, 1.0 / cua_io::dpi_scale()) {
+                Ok(()) => tool_ok(format!("dragged ({x},{y}) -> ({x2},{y2})")),
                 Err(e) => tool_err(e),
             }
         }
@@ -565,9 +632,59 @@ fn tool_defs() -> Value {
                     "x": { "type": "integer" },
                     "y": { "type": "integer" },
                     "right": { "type": "boolean", "default": false },
+                    "middle": { "type": "boolean", "default": false },
                     "double": { "type": "boolean", "default": false }
                 },
                 "required": ["x", "y"]
+            }
+        },
+        {
+            "name": "type_text",
+            "description": "Type arbitrary Unicode text into the focused window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "interval_ms": { "type": "integer", "default": 6 }
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "scroll",
+            "description": "Scroll the wheel at physical coordinates. Positive dy scrolls down, positive dx scrolls right.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "dx": { "type": "integer", "default": 0 },
+                    "dy": { "type": "integer", "default": 0 }
+                },
+                "required": ["x", "y"]
+            }
+        },
+        {
+            "name": "move",
+            "description": "Move the pointer to physical coordinates without clicking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "x": { "type": "integer" }, "y": { "type": "integer" } },
+                "required": ["x", "y"]
+            }
+        },
+        {
+            "name": "drag",
+            "description": "Left-button drag from (x,y) to (x2,y2) in physical pixels.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "x2": { "type": "integer" },
+                    "y2": { "type": "integer" }
+                },
+                "required": ["x", "y", "x2", "y2"]
             }
         },
         {
@@ -629,6 +746,9 @@ mod tests {
         assert!(names.contains(&"capture_screen".to_string()));
         assert!(names.contains(&"list_runs".to_string()));
         assert!(names.contains(&"replay_run".to_string()));
+        assert!(names.contains(&"type_text".to_string()));
+        assert!(names.contains(&"scroll".to_string()));
+        assert!(names.contains(&"drag".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
     }
 }

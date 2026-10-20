@@ -110,7 +110,10 @@ export OPENROUTER_API_KEY=sk-or-...
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
 | `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |
-| `click` / `key` | 按物理坐标点击、发送按键组合 |
+| `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽 |
+| `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
+| `type_text` | 向焦点窗口输入任意 Unicode 文本 |
+| `key` | 发送按键组合（PageUp/PageDown/方向键/系统快捷键等） |
 
 远程/容器内调用可以走 HTTP（streamable POST）：
 
@@ -157,8 +160,15 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 
 GitHub Actions 配置在 [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml)
 （Windows + Ubuntu 双平台：fmt / clippy / test / release build）。当前 GitHub
-凭据没有 `workflow` 权限，无法直接写入 `.github/workflows/`；授权后把它复制
-到 `.github/workflows/ci.yml` 即可启用。
+凭据没有 `workflow` 权限，无法直接写入 `.github/workflows/`。启用步骤：
+
+```bash
+unset GITHUB_TOKEN          # 否则 gh 会拒绝 refresh
+gh auth refresh -h github.com -s workflow
+mkdir -p .github/workflows
+cp ci/github-actions-ci.yml .github/workflows/ci.yml
+git add .github && git commit -m "ci: enable workflow" && git push
+```
 
 ## 架构
 
