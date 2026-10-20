@@ -78,11 +78,23 @@ computer-use-agent/
 - 安全围栏：命令 allowlist、高危动作人工确认、dry-run 模式、全量审计日志
 - 验收：在 XFCE 桌面上完成"打开浏览器→访问指定页→截图"无人值守闭环
 
-### Phase 2 — 大脑抽象 + 首批 provider（2~3 周）
-- 定义 `Brain` trait：`observe(screenshot) → plan → Vec<Action>`
-- 先接：Anthropic Computer Use API → OpenAI CUA → Gemini（按 API 可用性排序）
+### Phase 2 — 大脑接入（2026-10-20 用户拍板：MCP 优先，不等 API key）
+
+**2a. MCP server（已完成，2026-10-20）**
+- 新增 `crates/cua-mcp`：把 runtime 包装成 MCP server（stdio/JSON-RPC），
+  10 个工具（screenshot/click/type_text/key_press/launch_app …），
+  全部经 guard 围栏 + 审计；默认 supervised 从严，autonomous 需显式开启，
+  launch_app 还需 `--allow-launch`
+- 大脑直接用现成 agent 的模型（Claude Code / Qoder / Cursor），不需任何 API key
+- 验收：`scripts/mcp_smoke.py` 真实 MCP 客户端全流程通过
+  （握手/工具列表/真 PNG 截图/开 xterm 并真实执行命令落盘）；
+  用法见 `docs/MCP.md`
+
+**2b. 独立 API provider（后置，可选）**
+- `Brain` trait 已定义（Phase 0）；需要无人值守独立运行时再接：
+  Anthropic Computer Use API → OpenAI CUA → Gemini（按 API 可用性排序）
 - UI-TARS provider 写成 stub（接口对齐，等 GPU 机器）
-- 验收：同一任务（"在表格里填 5 行数据"）可切换 2 个 provider 跑通
+- 验收：同一任务可切换 2 个 provider 跑通
 
 ### Phase 3 — 编排与 Web UI（2 周）
 - 多步任务、失败重试、检查点续跑、任务队列
@@ -116,7 +128,7 @@ computer-use-agent/
 
 1. **确认开工**（本规划 → 回复即可）
 2. **仓库位置**：默认建 GitHub 私有仓 `computer-use-agent`（用已连的 GitHub）；如有别的要求请说
-3. **API key**：Phase 2 开始前，你去各家官网开 key，走 Secure Vault 给我（我不经手明文）
+3. **API key**：MCP 路线（Phase 2a）不需要；仅 Phase 2b 启用独立 provider 时才需要你去各家开 key、走 Secure Vault 给我（我不经手明文）
 4. **最终验收**：每个 Phase 结束你看一次演示，点"过"或提修改
 
 其余编译、调试、写文档、跑评测，全部在云端完成，不打扰你。

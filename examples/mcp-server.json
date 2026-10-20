@@ -1,0 +1,1 @@
+{"mcpServers":{"cua":{"args":["--mode","autonomous","--allow-launch","--audit","/tmp/cua-mcp-audit.jsonl","--shots","/tmp/cua-mcp-screenshots"],"command":"/home/hatch/workspace/computer-use-integration/target/release/cua-mcp","env":{"DISPLAY":":0"}}}}
