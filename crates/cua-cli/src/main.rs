@@ -144,6 +144,12 @@ enum Command {
         /// Step budget for each engine sub-run.
         #[arg(long, default_value_t = 10)]
         max_steps: u32,
+        /// Extra attempts per step with the failure fed back.
+        #[arg(long, default_value_t = 1)]
+        retries: u32,
+        /// How many times a failed step may trigger a new plan.
+        #[arg(long, default_value_t = 1)]
+        max_replans: usize,
         #[arg(long, env = "CUA_HUB_MODEL")]
         model: Option<String>,
         /// Show the browser window if a browser step runs.
@@ -324,6 +330,8 @@ fn main() -> Result<()> {
             dry_run,
             max_plan_steps,
             max_steps,
+            retries,
+            max_replans,
             model,
             headed,
             allow_high,
@@ -335,6 +343,8 @@ fn main() -> Result<()> {
                 dry_run,
                 max_plan_steps,
                 max_steps_per_engine: max_steps,
+                retries_per_step: retries,
+                max_replans,
                 model,
                 headed,
                 yes: true,

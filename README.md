@@ -15,7 +15,8 @@ Phase 2 进行中，Windows 真机验证：
 - **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
 - **无障碍树**：Windows UIA 快照，`--ui-tree` 可与截图一起作为混合上下文
 - **浏览器引擎**：自动拉起 Chrome/Edge（隔离临时 profile），CDP 驱动 navigate/click/type/eval，已真机跑通
-- **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步，已真机跑通
+- **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步
+- **失败恢复**：同引擎带错误重试（自动加预算），仍失败则重新规划并换引擎，两条路径均已真机验证
 - **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
 
 ## 引擎
@@ -76,7 +77,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
 | `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
 | `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless） |
-| `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划） |
+| `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划；`--retries/--max-replans` 控制恢复） |
 | `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
 
 ## MCP 接入

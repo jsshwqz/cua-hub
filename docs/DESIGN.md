@@ -137,8 +137,26 @@ its own engine, and passes outputs forward:
   the top level.
 * `--dry-run` prints the plan and touches nothing.
 
-This is sequential hand-off, not a general planner: no re-planning, no parallel
-steps, and no verification step unless the planner writes one.
+Failure recovery is layered:
+
+1. **Retry** (`--retries`, default 1): rerun the same engine with the failure
+   appended to the goal (`Previous attempt failed with: …`). Retries get
+   `+3` steps of budget headroom, because a starved run usually failed before
+   it could report `done`.
+2. **Re-plan** (`--max-replans`, default 1): send the original task, previous
+   plan, completed results, failed step and available variables to the planner
+   and ask for a plan covering only the remaining work, explicitly telling it
+   to change approach/engine. Re-planned steps get `+2` budget headroom.
+   Revisions are stored as `plan-revN.json`.
+3. Engine/provider errors count as failed attempts rather than aborting the
+   whole run, so they flow through the same recovery path.
+
+This is still sequential hand-off: no parallel steps, no verification step
+unless the planner writes one, and variable substitution remains plain text.
+
+Both paths were verified on hardware: with a 1-step budget the browser step
+fails, a retry with headroom finishes it; with retries disabled, the re-plan
+switches to `Invoke-WebRequest` in PowerShell and still returns the title.
 
 ## MCP server
 

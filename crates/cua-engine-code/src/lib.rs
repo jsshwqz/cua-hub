@@ -37,7 +37,7 @@ impl CodeEngine {
         );
         let body = json!({
             "model": self.config.model,
-            "max_tokens": 800,
+            "max_tokens": 1200,
             "temperature": 0,
             "messages": messages,
         });
@@ -64,11 +64,12 @@ impl CodeEngine {
                                 return Ok(s.to_string());
                             }
                         }
+                        // Reasoning models may spend the whole budget thinking
+                        // and leave `content` null; the JSON action is often
+                        // embedded in `reasoning`. Let the parser decide.
                         if let Some(reasoning) = message["reasoning"].as_str() {
-                            if reasoning.contains("\"command\"")
-                                || reasoning.contains("\"done\"")
-                                || reasoning.contains("\"fail\"")
-                            {
+                            if !reasoning.trim().is_empty() {
+                                tracing::warn!("code model returned reasoning only; extracting");
                                 return Ok(reasoning.to_string());
                             }
                         }

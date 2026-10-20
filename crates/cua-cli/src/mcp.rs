@@ -186,6 +186,8 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 dry_run: args["dry_run"].as_bool().unwrap_or(false),
                 max_plan_steps: args["max_plan_steps"].as_u64().unwrap_or(6) as usize,
                 max_steps_per_engine: args["max_steps"].as_u64().unwrap_or(10) as u32,
+                retries_per_step: args["retries"].as_u64().unwrap_or(1) as u32,
+                max_replans: args["max_replans"].as_u64().unwrap_or(1) as usize,
                 model: args["model"].as_str().map(str::to_string),
                 headed: args["headed"].as_bool().unwrap_or(false),
                 yes: true,
@@ -370,6 +372,8 @@ fn tool_defs() -> Value {
                     "dry_run": { "type": "boolean", "default": false },
                     "max_plan_steps": { "type": "integer", "default": 6 },
                     "max_steps": { "type": "integer", "default": 10, "description": "Budget per engine sub-run" },
+                    "retries": { "type": "integer", "default": 1, "description": "Extra attempts per failed step" },
+                    "max_replans": { "type": "integer", "default": 1, "description": "Re-plan attempts after repeated failure" },
                     "model": { "type": "string" },
                     "headed": { "type": "boolean", "default": false },
                     "allow_high": { "type": "boolean", "default": false }

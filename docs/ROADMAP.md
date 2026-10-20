@@ -28,7 +28,7 @@
 - [x] `cua-engine-browser` over CDP (navigate/click/type/eval, isolated profile)
 - [x] Router delegates URL tasks to the browser engine
 - [x] Cross-engine plans (planner → browser/code/vision, `{{var}}` hand-off)
-- [ ] Re-planning after a failed step (retry with an alternative engine)
+- [x] Failure recovery: same-engine retry with budget headroom, then re-plan
 - [ ] Persistent task state, resume after crash
 - [x] MCP server over stdio exposing run_task / capture / tree / find / invoke
 - [ ] MCP over HTTP and hosted elicitation for high-risk actions

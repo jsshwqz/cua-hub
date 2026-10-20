@@ -1,8 +1,9 @@
 //! Cross-engine orchestration: plan a task into ordered browser/code/vision
-//! steps, pass outputs forward with `{{name}}`, and report per-step results.
+//! steps, pass outputs forward with `{{name}}`, and recover from failures with
+//! a bounded retry and re-plan.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -27,6 +28,9 @@ pub struct StepExecResult {
     pub goal: String,
     pub summary: String,
     pub success: bool,
+    pub attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<PathBuf>,
 }
@@ -37,6 +41,10 @@ pub struct OrchestrateOptions {
     pub dry_run: bool,
     pub max_plan_steps: usize,
     pub max_steps_per_engine: u32,
+    /// Extra attempts per step with the failure fed back.
+    pub retries_per_step: u32,
+    /// How many times a failed step may trigger a new plan.
+    pub max_replans: usize,
     pub model: Option<String>,
     pub headed: bool,
     pub yes: bool,
@@ -51,6 +59,8 @@ impl Default for OrchestrateOptions {
             dry_run: false,
             max_plan_steps: 6,
             max_steps_per_engine: 10,
+            retries_per_step: 1,
+            max_replans: 1,
             model: None,
             headed: false,
             yes: true,
@@ -67,38 +77,27 @@ pub struct OrchestrateReport {
     pub success: bool,
     pub run_dir: PathBuf,
     pub dry_run: bool,
+    pub replans_used: usize,
 }
 
 impl OrchestrateReport {
     pub fn summary(&self) -> String {
         if self.dry_run {
-            let lines: Vec<String> = self
-                .plan
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    format!(
-                        "{}. [{}] {}{}",
-                        i + 1,
-                        s.engine.as_str(),
-                        s.goal,
-                        s.save_as
-                            .as_ref()
-                            .map(|v| format!(" (save as {v})"))
-                            .unwrap_or_default()
-                    )
-                })
-                .collect();
-            return format!("dry-run plan:\n{}", lines.join("\n"));
+            return format!("dry-run plan:\n{}", render_plan(&self.plan));
         }
         let mut out = String::new();
         for (i, r) in self.results.iter().enumerate() {
             out.push_str(&format!(
-                "{}. [{}] {} -> {}\n",
+                "{}. [{}] {} -> {}{}\n",
                 i + 1,
                 r.engine.as_str(),
                 r.goal,
-                r.summary
+                r.summary,
+                if r.attempts > 1 {
+                    format!(" ({} attempts)", r.attempts)
+                } else {
+                    String::new()
+                }
             ));
         }
         if let Some(last) = self.results.last() {
@@ -116,15 +115,13 @@ pub async fn run(opts: OrchestrateOptions) -> Result<OrchestrateReport> {
         .build()
         .unwrap_or_default();
 
-    let plan = plan(&http, &config, &opts.task, opts.max_plan_steps).await?;
+    let mut plan = plan(&http, &config, &opts.task, opts.max_plan_steps).await?;
     let run_dir = opts.run_dir.clone().unwrap_or_else(default_run_dir);
     std::fs::create_dir_all(&run_dir)?;
     std::fs::write(run_dir.join("plan.json"), serde_json::to_vec_pretty(&plan)?)?;
 
     eprintln!("plan ({} steps):", plan.len());
-    for (i, s) in plan.iter().enumerate() {
-        eprintln!("  {}. [{}] {}", i + 1, s.engine.as_str(), s.goal);
-    }
+    eprintln!("{}", render_plan(&plan));
 
     if opts.dry_run {
         return Ok(OrchestrateReport {
@@ -133,14 +130,27 @@ pub async fn run(opts: OrchestrateOptions) -> Result<OrchestrateReport> {
             success: true,
             run_dir,
             dry_run: true,
+            replans_used: 0,
         });
     }
 
     let mut vars: HashMap<String, String> = HashMap::new();
-    let mut results = Vec::new();
-    let mut success = true;
+    let mut results: Vec<StepExecResult> = Vec::new();
+    let mut replans_used = 0usize;
+    let mut terminal_failure = false;
+    let mut step_counter = 0usize;
+    let mut index = 0usize;
+    let mut iterations = 0usize;
 
-    for (index, step) in plan.iter().enumerate() {
+    while index < plan.len() {
+        iterations += 1;
+        if iterations > 40 {
+            terminal_failure = true;
+            eprintln!("orchestrator iteration cap reached");
+            break;
+        }
+
+        let step = plan[index].clone();
         let goal = apply_vars(&step.goal, &vars);
         eprintln!(
             "\n=== step {}/{} [{}] {}",
@@ -149,90 +159,173 @@ pub async fn run(opts: OrchestrateOptions) -> Result<OrchestrateReport> {
             step.engine.as_str(),
             goal
         );
-        let step_dir = run_dir.join(format!("step-{}-{}", index + 1, step.engine.as_str()));
 
-        let (summary, ok, artifacts) = match step.engine {
-            EngineKind::Browser => {
-                let report = cua_engine_browser::run_task(cua_engine_browser::BrowserRunOptions {
-                    task: goal.clone(),
-                    max_steps: opts.max_steps_per_engine,
-                    dry_run: false,
-                    model: opts.model.clone(),
-                    headed: opts.headed,
-                    start_url: None,
-                    run_dir: Some(step_dir.clone()),
-                    screenshot_quality: 70,
-                })
-                .await?;
-                let ok = report.outcome.is_success();
-                (
-                    report.outcome.summary(report.steps),
-                    ok,
-                    Some(report.run_dir),
+        let mut attempt = 0u32;
+        let mut last_error = String::new();
+        let mut success = false;
+        let mut summary = String::new();
+        let mut artifacts = None;
+
+        while attempt <= opts.retries_per_step {
+            attempt += 1;
+            step_counter += 1;
+            let attempt_goal = if attempt == 1 {
+                goal.clone()
+            } else {
+                format!(
+                    "{goal}\n\nPrevious attempt failed with: {last_error}\nUse a different approach and verify the result."
                 )
-            }
-            EngineKind::Vision | EngineKind::Code | EngineKind::Access => {
-                let kind = if step.engine == EngineKind::Access {
-                    EngineKind::Vision
-                } else {
-                    step.engine
+            };
+            let step_dir = run_dir.join(format!(
+                "step-{step_counter:02}-{}-a{attempt}",
+                step.engine.as_str()
+            ));
+            // Retries and re-planned steps get a little headroom: a failed
+            // attempt usually ran into the budget before it could report done.
+            let budget = opts.max_steps_per_engine
+                + (attempt.saturating_sub(1)) * 3
+                + (replans_used as u32) * 2;
+            // A provider/engine error is a failed attempt, not an aborted run:
+            // feed it into the retry/re-plan path instead of bubbling up.
+            let (s, ok, dir) =
+                match execute_step(step.engine, &attempt_goal, budget, &opts, &step_dir).await {
+                    Ok(v) => v,
+                    Err(e) => (format!("error: {e}"), false, Some(step_dir.clone())),
                 };
-                let report = runner::run_task(RunOptions {
-                    task: goal.clone(),
-                    max_steps: opts.max_steps_per_engine,
-                    yes: opts.yes,
-                    allow_high: opts.allow_high,
-                    dry_run: false,
-                    engine: Some(kind),
-                    provider: runner::ProviderArg::Auto,
-                    model: opts.model.clone(),
-                    max_edge: 1568,
-                    run_dir: Some(step_dir.clone()),
-                    settle_ms: 600,
-                    ui_tree: false,
-                    browser_headed: opts.headed,
-                })
-                .await?;
-                let ok = report.is_success();
-                (report.summary(), ok, Some(report.run_dir.clone()))
+            summary = clean_summary(&s);
+            artifacts = dir;
+            success = ok;
+            if ok {
+                break;
             }
-        };
-
-        let summary = clean_summary(&summary);
-        if let Some(name) = &step.save_as {
-            vars.insert(name.clone(), summary.clone());
+            last_error = summary.clone();
+            if attempt <= opts.retries_per_step {
+                eprintln!("attempt {attempt} failed: {last_error}; retrying");
+            }
         }
+
         results.push(StepExecResult {
             engine: step.engine,
-            goal,
+            goal: goal.clone(),
             summary: summary.clone(),
-            success: ok,
+            success,
+            attempts: attempt,
+            note: if success {
+                None
+            } else {
+                Some(last_error.clone())
+            },
             artifacts,
         });
 
-        if !ok {
-            success = false;
-            eprintln!("step failed, stopping");
+        if success {
+            if let Some(name) = &step.save_as {
+                vars.insert(name.clone(), summary);
+            }
+            index += 1;
+            continue;
+        }
+
+        if replans_used >= opts.max_replans {
+            terminal_failure = true;
+            eprintln!("step failed and no re-plans left");
             break;
         }
+
+        replans_used += 1;
+        let new_plan = replan(
+            &http,
+            &config,
+            &opts.task,
+            &plan,
+            &results,
+            &vars,
+            opts.max_plan_steps,
+        )
+        .await?;
+        eprintln!("\n--- re-plan {replans_used}: {} steps", new_plan.len());
+        eprintln!("{}", render_plan(&new_plan));
+        std::fs::write(
+            run_dir.join(format!("plan-rev{replans_used}.json")),
+            serde_json::to_vec_pretty(&new_plan)?,
+        )?;
+        plan = new_plan;
+        index = 0;
     }
 
     let report = OrchestrateReport {
-        success,
+        success: !terminal_failure,
         plan,
         results,
         run_dir: run_dir.clone(),
         dry_run: false,
+        replans_used,
     };
     std::fs::write(
         run_dir.join("results.json"),
         serde_json::to_vec_pretty(&json!({
             "success": report.success,
+            "replans_used": report.replans_used,
             "steps": report.results,
         }))?,
     )?;
     eprintln!("\nartifacts: {}", run_dir.display());
     Ok(report)
+}
+
+async fn execute_step(
+    kind: EngineKind,
+    goal: &str,
+    budget: u32,
+    opts: &OrchestrateOptions,
+    step_dir: &Path,
+) -> Result<(String, bool, Option<PathBuf>)> {
+    match kind {
+        EngineKind::Browser => {
+            let report = cua_engine_browser::run_task(cua_engine_browser::BrowserRunOptions {
+                task: goal.to_string(),
+                max_steps: budget,
+                dry_run: false,
+                model: opts.model.clone(),
+                headed: opts.headed,
+                start_url: None,
+                run_dir: Some(step_dir.clone()),
+                screenshot_quality: 70,
+            })
+            .await?;
+            let ok = report.outcome.is_success();
+            Ok((
+                report.outcome.summary(report.steps),
+                ok,
+                Some(report.run_dir),
+            ))
+        }
+        EngineKind::Vision | EngineKind::Code | EngineKind::Access => {
+            let kind = if kind == EngineKind::Access {
+                EngineKind::Vision
+            } else {
+                kind
+            };
+            let report = runner::run_task(RunOptions {
+                task: goal.to_string(),
+                max_steps: budget,
+                yes: opts.yes,
+                allow_high: opts.allow_high,
+                dry_run: false,
+                engine: Some(kind),
+                provider: runner::ProviderArg::Auto,
+                model: opts.model.clone(),
+                max_edge: 1568,
+                run_dir: Some(step_dir.clone()),
+                settle_ms: 600,
+                ui_tree: false,
+                browser_headed: opts.headed,
+            })
+            .await?;
+            let ok = report.is_success();
+            Ok((report.summary(), ok, Some(report.run_dir.clone())))
+        }
+    }
 }
 
 /// Replace `{{name}}` placeholders with step outputs.
@@ -254,19 +347,38 @@ fn clean_summary(s: &str) -> String {
     s.trim().to_string()
 }
 
-async fn plan(
+fn render_plan(plan: &[PlanStep]) -> String {
+    plan.iter()
+        .enumerate()
+        .map(|(i, s)| {
+            format!(
+                "{}. [{}] {}{}",
+                i + 1,
+                s.engine.as_str(),
+                s.goal,
+                s.save_as
+                    .as_ref()
+                    .map(|v| format!(" (save as {v})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn chat(
     http: &reqwest::Client,
     config: &OpenAiConfig,
-    task: &str,
-    max_plan_steps: usize,
-) -> Result<Vec<PlanStep>> {
+    system: &str,
+    user: &str,
+) -> Result<String> {
     let body = json!({
         "model": config.model,
         "max_tokens": 900,
         "temperature": 0,
         "messages": [
-            { "role": "system", "content": planner_prompt(max_plan_steps) },
-            { "role": "user", "content": format!("TASK: {task}\nOS: {}", std::env::consts::OS) }
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
         ]
     });
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
@@ -287,15 +399,15 @@ async fn plan(
                     let value: Value = serde_json::from_str(&text)?;
                     let message = &value["choices"][0]["message"];
                     let content = message["content"].as_str().unwrap_or_default();
-                    if content.trim().is_empty() {
-                        if let Some(reasoning) = message["reasoning"].as_str() {
-                            if reasoning.contains("\"steps\"") {
-                                return parse_plan(reasoning, max_plan_steps);
-                            }
-                        }
-                        bail!("planner returned empty content");
+                    if !content.trim().is_empty() {
+                        return Ok(content.to_string());
                     }
-                    return parse_plan(content, max_plan_steps);
+                    if let Some(reasoning) = message["reasoning"].as_str() {
+                        if reasoning.contains("\"steps\"") {
+                            return Ok(reasoning.to_string());
+                        }
+                    }
+                    bail!("planner returned empty content");
                 }
                 last_err = format!(
                     "HTTP {status}: {}",
@@ -315,6 +427,58 @@ async fn plan(
         tokio::time::sleep(Duration::from_millis(700 * 2u64.pow(attempt))).await;
     }
     bail!("{last_err}")
+}
+
+async fn plan(
+    http: &reqwest::Client,
+    config: &OpenAiConfig,
+    task: &str,
+    max_plan_steps: usize,
+) -> Result<Vec<PlanStep>> {
+    let user = format!("TASK: {task}\nOS: {}", std::env::consts::OS);
+    let content = chat(http, config, &planner_prompt(max_plan_steps), &user).await?;
+    parse_plan(&content, max_plan_steps)
+}
+
+async fn replan(
+    http: &reqwest::Client,
+    config: &OpenAiConfig,
+    task: &str,
+    previous: &[PlanStep],
+    results: &[StepExecResult],
+    vars: &HashMap<String, String>,
+    max_plan_steps: usize,
+) -> Result<Vec<PlanStep>> {
+    let mut completed = String::new();
+    let mut failed = String::new();
+    for r in results {
+        let line = format!("[{}] {} -> {}\n", r.engine.as_str(), r.goal, r.summary);
+        if r.success {
+            completed.push_str(&line);
+        } else {
+            failed.push_str(&line);
+        }
+    }
+    let vars_text = if vars.is_empty() {
+        "(none)".to_string()
+    } else {
+        vars.iter()
+            .map(|(k, v)| format!("{k} = {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let user = format!(
+        "ORIGINAL TASK: {task}\n\nPREVIOUS PLAN:\n{}\n\nCOMPLETED STEPS:\n{}\nFAILED STEPS:\n{}\nAVAILABLE VARIABLES:\n{}\n\n\
+         Produce a NEW plan for the REMAINING work only. Do not repeat completed steps. \
+         Use a different approach or engine for the failed part. \
+         Keep results needed later via save_as and {{name}} references. JSON only.",
+        render_plan(previous),
+        if completed.is_empty() { "(none)\n" } else { &completed },
+        if failed.is_empty() { "(none)\n" } else { &failed },
+        vars_text
+    );
+    let content = chat(http, config, &planner_prompt(max_plan_steps), &user).await?;
+    parse_plan(&content, max_plan_steps)
 }
 
 fn planner_prompt(max_steps: usize) -> String {
@@ -484,5 +648,18 @@ mod tests {
     #[test]
     fn clean_summary_strips_prefix() {
         assert_eq!(clean_summary("completed: 42 GB free"), "42 GB free");
+    }
+
+    #[test]
+    fn renders_plan_with_save_as() {
+        let plan = vec![PlanStep {
+            engine: EngineKind::Browser,
+            goal: "read title".into(),
+            save_as: Some("title".into()),
+        }];
+        assert_eq!(
+            render_plan(&plan),
+            "1. [browser] read title (save as title)"
+        );
     }
 }
