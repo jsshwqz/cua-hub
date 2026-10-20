@@ -18,6 +18,7 @@
     config:
       serverName: cua
       transport: stdio
+      toolCallTimeoutMs: 120000
       command: 'C:\cua-mcp\cua-mcp.exe'
       args:
         - '--mode'

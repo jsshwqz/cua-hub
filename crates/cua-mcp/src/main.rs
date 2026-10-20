@@ -260,7 +260,9 @@ fn build_action(name: &str, args: &Value) -> Result<Action, String> {
                 .get("ms")
                 .and_then(|v| v.as_u64())
                 .ok_or("tool wait: missing integer argument 'ms'")?;
-            Action::Wait { ms }
+            // 客户端单次 tool call 有超时（DSH 默认 60s），单次等待封顶 50s，
+            // 需要更久就分多次调用。
+            Action::Wait { ms: ms.min(50_000) }
         }
         "launch_app" => {
             let program = args
@@ -349,7 +351,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "wait",
-            "description": "Wait for the given number of milliseconds (e.g. for a window to open).",
+            "description": "Wait for the given number of milliseconds (e.g. for a window to open). Capped at 50000 ms per call (client tool-call timeouts); call repeatedly for longer waits.",
             "inputSchema": obj(json!({ "ms": { "type": "integer", "minimum": 0 } }), json!(["ms"]))
         },
         {

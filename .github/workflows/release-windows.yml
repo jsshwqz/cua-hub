@@ -32,7 +32,9 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/cua-mcp.exe dist/
           Copy-Item examples/aionui-mcp.json dist/
+          Copy-Item examples/dsh-cordis.patch.yml dist/
           Copy-Item docs/MCP.md dist/
+          Copy-Item docs/DSH.md dist/
           Compress-Archive -Path dist/* -DestinationPath cua-mcp-windows-x64.zip
 
       - name: Upload artifact
@@ -50,8 +52,9 @@ jobs:
           body: |
             cua-mcp 预览版（Windows x64）：标准 MCP 协议的 Computer Use 执行端。
 
-            用法：解压到 C:\cua-mcp，把包内 aionui-mcp.json 的内容粘进
-            AionUI 的 MCP 设置即可；其他 MCP 客户端（Claude Code / Qoder /
-            Cursor）同样可用，配置格式见 docs/MCP.md。
+            用法：解压到 C:\cua-mcp。AionUI 把包内 aionui-mcp.json 粘进
+            MCP 设置；DeepSeek Harness (dsh) 按包内 DSH.md 把
+            dsh-cordis.patch.yml 并入 ~/.dsh 的 cordis patch；
+            其他 MCP 客户端（Claude Code / Qoder / Cursor）见 docs/MCP.md。
 
             本包由 GitHub Actions 在 windows-latest 上自动构建。
