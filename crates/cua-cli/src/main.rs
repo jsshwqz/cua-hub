@@ -106,6 +106,30 @@ enum Command {
         /// Include a shallow accessibility tree alongside each screenshot.
         #[arg(long)]
         ui_tree: bool,
+        /// Show the browser window for browser-routed tasks.
+        #[arg(long)]
+        browser_headed: bool,
+    },
+    /// Drive a headless (or visible) Chromium through a natural-language task.
+    Browser {
+        /// What to do, in natural language.
+        task: String,
+        #[arg(long, default_value_t = 15)]
+        max_steps: u32,
+        /// Plan one step without acting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Show the browser window.
+        #[arg(long)]
+        headed: bool,
+        /// Override the model name.
+        #[arg(long, env = "CUA_HUB_MODEL")]
+        model: Option<String>,
+        #[arg(long)]
+        run_dir: Option<PathBuf>,
+        /// Optional page to open before the loop starts.
+        #[arg(long)]
+        start_url: Option<String>,
     },
     /// Speak MCP over stdio so other agents can drive this machine.
     Serve,
@@ -221,6 +245,7 @@ fn main() -> Result<()> {
             run_dir,
             settle_ms,
             ui_tree,
+            browser_headed,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
             let report = runtime.block_on(runner::run_task(RunOptions {
@@ -236,9 +261,37 @@ fn main() -> Result<()> {
                 run_dir,
                 settle_ms,
                 ui_tree,
+                browser_headed,
             }))?;
             if !report.is_success() {
                 bail!("{}", report.summary());
+            }
+            Ok(())
+        }
+        Command::Browser {
+            task,
+            max_steps,
+            dry_run,
+            headed,
+            model,
+            run_dir,
+            start_url,
+        } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(cua_engine_browser::run_task(
+                cua_engine_browser::BrowserRunOptions {
+                    task,
+                    max_steps,
+                    dry_run,
+                    model,
+                    headed,
+                    start_url,
+                    run_dir,
+                    screenshot_quality: 70,
+                },
+            ))?;
+            if !report.outcome.is_success() {
+                bail!("{}", report.outcome.summary(report.steps));
             }
             Ok(())
         }

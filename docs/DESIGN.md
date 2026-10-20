@@ -88,6 +88,30 @@ rect, offscreen) and uses `GetCachedChildren`, cutting the same walk to ~0.7s at
 depth 1. Cost grows with depth, so per-step hybrid context uses depth 1 and
 `cua-hub tree` exposes deeper walks for debugging (depth 5 ≈ 4s).
 
+## Browser engine
+
+`cua-hub browser` (and `run` for URL-shaped tasks) launches a Chromium browser
+with `--remote-debugging-port`, a temporary `--user-data-dir`, and headless mode
+unless `--headed` is given. It then talks CDP directly over WebSocket:
+
+* requests are matched by numeric id; events are ignored, pings answered;
+  each command has a 30s timeout
+* navigation polls `document.readyState` until `complete` (20s budget)
+* actions are `navigate`, `click` (CSS selector or `text=Visible label`),
+  `type`, `press`, `eval`, `wait`, `done`, `fail`
+* screenshots via `Page.captureScreenshot` are archived per step and sent to
+  the model together with URL, title and 2.5k chars of visible text
+
+Security: `eval` executes model-generated JavaScript. The temporary profile has
+no user cookies or saved logins, and the prompt forbids submitting forms,
+purchasing, or logging in unless asked — but that is a policy, not a sandbox.
+Treat the browser engine as executing untrusted code on the model's behalf.
+
+Browser actions live in their own enum rather than `cua_core::Action`: DOM
+selectors and page evaluation do not map onto mouse coordinates. The router
+dispatches URL tasks to this engine and maps its outcome back into the shared
+`RunReport`.
+
 ## MCP server
 
 `cua-hub serve` speaks newline-delimited JSON-RPC 2.0 on stdio. Three

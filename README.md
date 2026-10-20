@@ -14,6 +14,7 @@ Phase 2 进行中，Windows 真机验证：
 - **视觉引擎**：截图 → 模型决策 → 点击/按键 → 复核截图（含 125% DPI 坐标换算）
 - **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
 - **无障碍树**：Windows UIA 快照，`--ui-tree` 可与截图一起作为混合上下文
+- **浏览器引擎**：自动拉起 Chrome/Edge（隔离临时 profile），CDP 驱动 navigate/click/type/eval，已真机跑通
 - **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
 
 ## 引擎
@@ -22,6 +23,7 @@ Phase 2 进行中，Windows 真机验证：
 |------|----------|------|
 | Vision | 默认 / `--engine vision` | 未知 GUI、跨应用操作 |
 | Code | 任务含"命令/脚本/磁盘空间/进程列表…"或 `--engine code` | 确定性数据获取、批处理 |
+| Browser | 任务含 URL / "浏览器/网页"，或 `cua-hub browser` | 网页读取、点击、表单填写 |
 | Access | 计划中（当前提供快照） | 精确控件操作 |
 
 ## 快速开始
@@ -42,6 +44,14 @@ export OPENROUTER_API_KEY=sk-or-...
 # 命令类任务自动走代码引擎
 ./target/release/cua-hub run "查看 C 盘剩余空间" --yes \
   --model "minimax/minimax-m3.1-flash:free"
+
+# 含 URL 的任务自动走浏览器引擎（headless，隔离 profile）
+./target/release/cua-hub run "打开 https://example.com 并告诉我页面标题" \
+  --model "minimax/minimax-m3.1-flash:free"
+
+# 也可以显式进入浏览器模式并指定起始页
+./target/release/cua-hub browser "点击 More information 并告诉我新标题" \
+  --start-url https://example.com --headed
 ```
 
 ## 命令
@@ -59,6 +69,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub run "<task>" --dry-run` | 只规划一步，不操作机器 |
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
 | `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
+| `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless） |
 | `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
 
 ## MCP 接入
@@ -81,7 +92,8 @@ export OPENROUTER_API_KEY=sk-or-...
 
 | 工具 | 作用 |
 |------|------|
-| `run_task` | 自然语言任务（视觉/代码引擎），返回摘要与产物路径 |
+| `run_task` | 自然语言任务（视觉/代码/浏览器引擎），返回摘要与产物路径 |
+| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP） |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
 | `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |

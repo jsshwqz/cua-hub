@@ -25,7 +25,8 @@
 
 ## Phase 3 — Browser and orchestration
 
-- [ ] `cua-engine-browser` over CDP with DOM + screenshot hybrid
+- [x] `cua-engine-browser` over CDP (navigate/click/type/eval, isolated profile)
+- [x] Router delegates URL tasks to the browser engine
 - [ ] Cross-engine plans (vision discovers, code fixes, browser verifies)
 - [ ] Persistent task state, resume after crash
 - [x] MCP server over stdio exposing run_task / capture / tree / find / invoke

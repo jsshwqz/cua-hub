@@ -161,12 +161,41 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 run_dir: None,
                 settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
                 ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
+                browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
             };
             match runner::run_task(opts).await {
                 Ok(report) => {
                     let payload = json!({
                         "summary": report.summary(),
                         "success": report.is_success(),
+                        "steps": report.steps,
+                        "artifacts": report.run_dir.to_string_lossy(),
+                    });
+                    tool_ok(json!([{ "type": "text", "text": payload.to_string() }]))
+                }
+                Err(e) => tool_err(e),
+            }
+        }
+        "browser_task" => {
+            let task = match required_str(args, "task") {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            let opts = cua_engine_browser::BrowserRunOptions {
+                task,
+                max_steps: args["max_steps"].as_u64().unwrap_or(15) as u32,
+                dry_run: args["dry_run"].as_bool().unwrap_or(false),
+                model: args["model"].as_str().map(str::to_string),
+                headed: args["headed"].as_bool().unwrap_or(false),
+                start_url: args["start_url"].as_str().map(str::to_string),
+                run_dir: None,
+                screenshot_quality: 70,
+            };
+            match cua_engine_browser::run_task(opts).await {
+                Ok(report) => {
+                    let payload = json!({
+                        "summary": report.outcome.summary(report.steps),
+                        "success": report.outcome.is_success(),
                         "steps": report.steps,
                         "artifacts": report.run_dir.to_string_lossy(),
                     });
@@ -303,6 +332,22 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "browser_task",
+            "description": "Drive a headless Chromium browser through a natural-language task using CDP (navigate, click, type, eval). Runs in an isolated temporary profile. Requires an OpenAI-compatible model key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "Goal in natural language" },
+                    "start_url": { "type": "string", "description": "Optional page opened before the loop" },
+                    "max_steps": { "type": "integer", "default": 15 },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "headed": { "type": "boolean", "default": false, "description": "Show the browser window" },
+                    "model": { "type": "string" }
+                },
+                "required": ["task"]
+            }
+        },
+        {
             "name": "capture_screen",
             "description": "Capture the primary display and return a JPEG image content block plus its dimensions.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -390,6 +435,7 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         assert!(names.contains(&"run_task".to_string()));
+        assert!(names.contains(&"browser_task".to_string()));
         assert!(names.contains(&"capture_screen".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
     }

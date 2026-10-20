@@ -57,6 +57,8 @@ pub struct RunOptions {
     pub run_dir: Option<PathBuf>,
     pub settle_ms: u64,
     pub ui_tree: bool,
+    /// Show the browser window instead of headless mode.
+    pub browser_headed: bool,
 }
 
 impl Default for RunOptions {
@@ -74,6 +76,7 @@ impl Default for RunOptions {
             run_dir: None,
             settle_ms: 600,
             ui_tree: false,
+            browser_headed: false,
         }
     }
 }
@@ -83,7 +86,8 @@ pub enum Outcome {
     Completed(String),
     Failed(String),
     StepLimit,
-    DryRun(Action),
+    /// Planned action already described as text.
+    DryRun(String),
 }
 
 #[derive(Debug)]
@@ -99,7 +103,7 @@ impl RunReport {
             Outcome::Completed(s) => format!("completed: {s}"),
             Outcome::Failed(s) => format!("failed: {s}"),
             Outcome::StepLimit => format!("stopped after {} steps", self.steps),
-            Outcome::DryRun(a) => format!("dry-run planned: {}", describe(a)),
+            Outcome::DryRun(planned) => format!("dry-run planned: {planned}"),
         }
     }
 
@@ -118,11 +122,37 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
         reason = %decision.reason,
         "routing task"
     );
-    if matches!(decision.kind, EngineKind::Access | EngineKind::Browser) {
+    if decision.kind == EngineKind::Access {
         warn!(
             requested = decision.kind.as_str(),
             "engine not implemented yet; falling back to vision"
         );
+    }
+
+    // Browser tasks run in their own CDP session and action space.
+    if decision.kind == EngineKind::Browser {
+        let report = cua_engine_browser::run_task(cua_engine_browser::BrowserRunOptions {
+            task: opts.task.clone(),
+            max_steps: opts.max_steps,
+            dry_run: opts.dry_run,
+            model: opts.model.clone(),
+            headed: opts.browser_headed,
+            start_url: None,
+            run_dir: opts.run_dir.clone(),
+            screenshot_quality: 70,
+        })
+        .await?;
+        let outcome = match report.outcome {
+            cua_engine_browser::BrowserOutcome::Completed(s) => Outcome::Completed(s),
+            cua_engine_browser::BrowserOutcome::Failed(s) => Outcome::Failed(s),
+            cua_engine_browser::BrowserOutcome::StepLimit => Outcome::StepLimit,
+            cua_engine_browser::BrowserOutcome::DryRun(s) => Outcome::DryRun(s),
+        };
+        return Ok(RunReport {
+            outcome,
+            run_dir: report.run_dir,
+            steps: report.steps,
+        });
     }
 
     let provider = resolve_provider(opts.provider)?;
@@ -201,7 +231,7 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
 
         if opts.dry_run {
             write_record(&mut log_file, &record)?;
-            outcome = Outcome::DryRun(action);
+            outcome = Outcome::DryRun(describe(&action));
             break;
         }
 
