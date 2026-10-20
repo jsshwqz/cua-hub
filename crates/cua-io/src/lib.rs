@@ -3,5 +3,5 @@
 pub mod capture;
 pub mod input;
 
-pub use capture::{capture_primary, encode_png, fit_to, observe, Captured, Frame};
+pub use capture::{capture_primary, dpi_scale, encode_png, fit_to, observe, Captured, Frame};
 pub use input::{apply, cursor_position};

@@ -6,7 +6,10 @@
 - [x] Cross-platform capture (xcap) and input (enigo)
 - [x] Anthropic Computer Use loop with official tool protocol
 - [x] Rule router, risk gate, dry-run, JSONL run log
-- [ ] First end-to-end task on Windows and Linux
+- [x] OpenAI-compatible vision provider (OpenRouter / OpenAI / Ollama / vLLM)
+- [x] First end-to-end task on Windows (Start menu, visually verified)
+- [x] DPI-aware coordinate mapping (model -> physical -> logical input)
+- [ ] First end-to-end task on Linux
 - [ ] Model adapter trait extracted from the Anthropic provider
 
 ## Phase 2 — Multi-engine

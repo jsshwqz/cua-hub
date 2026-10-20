@@ -20,8 +20,26 @@ pub struct Frame {
     pub observation: Observation,
     /// physical = model * scale
     pub scale: f32,
+    /// input = physical / dpi, i.e. the multiplier from model space to the
+    /// coordinate space used by enigo (logical pixels on Windows/macOS).
+    pub input_scale: f32,
+    pub dpi: f32,
     pub png: Vec<u8>,
     pub physical: (u32, u32),
+}
+
+/// DPI scale of the primary monitor (1.0 at 100% scaling).
+pub fn dpi_scale() -> f32 {
+    xcap::Monitor::all()
+        .ok()
+        .and_then(|m| {
+            m.iter()
+                .find(|m| m.is_primary().unwrap_or(false))
+                .or_else(|| m.first())
+                .and_then(|m| m.scale_factor().ok())
+        })
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0)
 }
 
 /// Capture the primary display.
@@ -52,6 +70,11 @@ pub fn capture_primary() -> Result<Captured> {
 pub fn observe(max_edge: u32, jpeg_quality: u8) -> Result<Frame> {
     let captured = capture_primary()?;
     let physical = (captured.width, captured.height);
+    let dpi = if captured.scale_factor > 0.0 {
+        captured.scale_factor
+    } else {
+        1.0
+    };
     let png = encode_png(&captured.image)?;
     let (resized, scale) = fit_to(captured.image, max_edge);
     let (w, h) = resized.dimensions();
@@ -64,6 +87,8 @@ pub fn observe(max_edge: u32, jpeg_quality: u8) -> Result<Frame> {
     Ok(Frame {
         observation: Observation::new(jpeg, "image/jpeg", w, h),
         scale,
+        input_scale: scale / dpi,
+        dpi,
         png,
         physical,
     })

@@ -1,4 +1,9 @@
-//! Anthropic Computer Use provider and the vision engine wrapper.
+//! Vision-language-model engines: Anthropic Computer Use and any
+//! OpenAI-compatible chat-completions gateway.
+
+pub mod openai;
+
+pub use openai::{parse_action, OpenAiConfig, OpenAiVisionEngine};
 
 use std::collections::VecDeque;
 use std::time::Duration;

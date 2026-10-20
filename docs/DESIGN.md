@@ -13,18 +13,34 @@ runner loop (cua-cli)
 
 ## Coordinate spaces
 
-There are two spaces:
+There are three spaces, and getting them wrong sends clicks to the wrong place:
 
-* **physical** — what `xcap` captures and what `enigo` addresses. On Windows
-  these are the same physical pixels even when DPI scaling is on (verified:
-  capture 1920x1080, `SetCursorPos` round-trips 1:1).
 * **model** — the screenshot after downscaling to `--max-edge` (default 1568).
-  The model's tool coordinates live here.
+  Engine coordinates live here.
+* **physical** — what `xcap` captures (e.g. 1920x1080 on a 125% scaled display).
+  `Frame.scale` = physical / model.
+* **logical / input** — what `enigo` addresses on Windows and macOS. With DPI
+  scaling 125%, logical is 1536x864 while physical stays 1920x1080, so
+  `Frame.input_scale` = `Frame.scale / dpi`.
 
-`Frame.scale` = physical / model. Every `Point` coming from an engine is
-multiplied by `scale` before injection. This keeps token cost bounded without
-introducing drift: we always send the exact dimensions the model is told about
-in the tool declaration.
+The runner multiplies every engine `Point` by `input_scale` before injection.
+On a 1280-wide model screenshot of a 1920-physical / 1536-logical screen the
+factor is 1.5 / 1.25 = 1.2. Verified on hardware: a click at model (19,703)
+becomes logical (22, 843), which opens the Start menu.
+
+The DPI factor comes from `xcap`'s monitor `scale_factor()`. Linux/X11 normally
+reports 1.0 and input coordinates are physical, so the factor is 1.0 there.
+
+## Providers
+
+Two vision backends ship today:
+
+* **Anthropic** — native computer tool (`computer_20250124`), stateful tool loop.
+* **OpenAI-compatible** — chat completions with an image URL and a strict JSON
+  action schema; works with OpenRouter, OpenAI, Ollama `/v1` and vLLM. Some
+  reasoning models spend the token budget on `reasoning` and return empty
+  `content`; the provider falls back to extracting the action object from the
+  reasoning text.
 
 ## Anthropic computer tool loop
 

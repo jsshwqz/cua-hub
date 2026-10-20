@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use cua_core::{Action, Engine, EngineKind, Risk, StepRecord};
-use cua_engine_vision::{AnthropicConfig, VisionEngine};
+use cua_engine_vision::{AnthropicConfig, OpenAiConfig, OpenAiVisionEngine, VisionEngine};
 use cua_router::{Router, RuleRouter};
 use tracing::{info, warn};
 
@@ -30,6 +30,19 @@ enum Command {
         #[arg(default_value = "capture.png")]
         output: PathBuf,
     },
+    /// Click at physical screen coordinates (no model involved).
+    Click {
+        x: i32,
+        y: i32,
+        /// Right button instead of left.
+        #[arg(long)]
+        right: bool,
+        /// Double click.
+        #[arg(long)]
+        double: bool,
+    },
+    /// Send a key chord, e.g. "ctrl+esc" or "Return".
+    Key { combo: String },
     /// Run a natural-language task on this machine.
     Run {
         /// What to do, in natural language.
@@ -46,6 +59,9 @@ enum Command {
         /// Force an engine instead of auto-routing.
         #[arg(long, value_enum)]
         engine: Option<EngineArg>,
+        /// Model provider for the vision engine.
+        #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
+        provider: ProviderArg,
         /// Override the vision model name.
         #[arg(long, env = "CUA_HUB_MODEL")]
         model: Option<String>,
@@ -67,6 +83,16 @@ enum EngineArg {
     Access,
     Browser,
     Code,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ProviderArg {
+    /// Anthropic if its key is set, otherwise any OpenAI-compatible gateway.
+    Auto,
+    /// Anthropic Computer Use (native tool protocol).
+    Anthropic,
+    /// OpenAI / OpenRouter / Ollama / vLLM chat completions.
+    Openai,
 }
 
 impl From<EngineArg> for EngineKind {
@@ -93,12 +119,40 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Doctor => doctor(),
         Command::Capture { output } => capture(&output),
+        Command::Click {
+            x,
+            y,
+            right,
+            double,
+        } => {
+            let action = Action::Click {
+                at: cua_core::Point::new(x, y),
+                button: if right {
+                    cua_core::MouseButton::Right
+                } else {
+                    cua_core::MouseButton::Left
+                },
+                double,
+            };
+            cua_io::apply(&action, 1.0 / cua_io::dpi_scale())?;
+            println!("clicked ({x},{y})");
+            Ok(())
+        }
+        Command::Key { combo } => {
+            let action = Action::Key {
+                combo: combo.clone(),
+            };
+            cua_io::apply(&action, 1.0)?;
+            println!("sent key {combo}");
+            Ok(())
+        }
         Command::Run {
             task,
             max_steps,
             yes,
             dry_run,
             engine,
+            provider,
             model,
             max_edge,
             run_dir,
@@ -111,6 +165,7 @@ fn main() -> Result<()> {
                 yes,
                 dry_run,
                 engine: engine.map(Into::into),
+                provider,
                 model,
                 max_edge,
                 run_dir,
@@ -149,6 +204,19 @@ fn doctor() -> Result<()> {
         _ => println!("api: ANTHROPIC_API_KEY missing -- vision engine unavailable"),
     }
 
+    match std::env::var("OPENROUTER_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY")) {
+        Ok(k) if !k.is_empty() => {
+            let base = std::env::var("CUA_HUB_OPENAI_BASE_URL")
+                .or_else(|_| std::env::var("OPENROUTER_BASE_URL"))
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            let model = std::env::var("CUA_HUB_MODEL")
+                .or_else(|_| std::env::var("OPENROUTER_MODEL"))
+                .unwrap_or_else(|_| "gpt-4o-mini".into());
+            println!("api: openai-compatible key set, base={base}, model={model}");
+        }
+        _ => println!("api: no OPENAI_API_KEY / OPENROUTER_API_KEY"),
+    }
+
     let model = std::env::var("CUA_HUB_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".into());
     println!("model: {model}");
 
@@ -180,6 +248,7 @@ struct RunOptions {
     yes: bool,
     dry_run: bool,
     engine: Option<EngineKind>,
+    provider: ProviderArg,
     model: Option<String>,
     max_edge: u32,
     run_dir: Option<PathBuf>,
@@ -211,23 +280,47 @@ async fn run_task(opts: RunOptions) -> Result<()> {
         );
     }
 
-    let mut config = AnthropicConfig::from_env()?;
-    if let Some(m) = opts.model {
-        config.model = m;
-    }
+    let provider = match opts.provider {
+        ProviderArg::Auto => {
+            if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+                ProviderArg::Anthropic
+            } else if std::env::var("OPENAI_API_KEY").is_ok()
+                || std::env::var("OPENROUTER_API_KEY").is_ok()
+            {
+                ProviderArg::Openai
+            } else {
+                bail!(
+                    "no model credentials: set ANTHROPIC_API_KEY, OPENAI_API_KEY or OPENROUTER_API_KEY"
+                );
+            }
+        }
+        p => p,
+    };
+
+    let mut engine: Box<dyn Engine> = match provider {
+        ProviderArg::Anthropic => {
+            let mut config = AnthropicConfig::from_env()?;
+            if let Some(m) = opts.model.clone() {
+                config.model = m;
+            }
+            println!("provider: anthropic model={}", config.model);
+            Box::new(VisionEngine::new(config))
+        }
+        ProviderArg::Openai | ProviderArg::Auto => {
+            let config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
+            println!("provider: openai-compatible model={}", config.model);
+            Box::new(OpenAiVisionEngine::new(config))
+        }
+    };
+
     if opts.dry_run {
-        println!(
-            "[dry-run] model={} max_steps={}",
-            config.model, opts.max_steps
-        );
+        println!("[dry-run] max_steps={}", opts.max_steps);
     }
 
     let run_dir = opts.run_dir.unwrap_or_else(default_run_dir);
     std::fs::create_dir_all(&run_dir)?;
     let log_path = run_dir.join("steps.jsonl");
     let mut log_file = std::fs::File::create(&log_path)?;
-
-    let mut engine = VisionEngine::new(config);
     let mut history: Vec<StepRecord> = Vec::new();
     let mut outcome = Outcome::StepLimit;
 
@@ -288,7 +381,7 @@ async fn run_task(opts: RunOptions) -> Result<()> {
 
         let result = tokio::task::spawn_blocking({
             let action = action.clone();
-            let scale = frame.scale;
+            let scale = frame.input_scale;
             move || cua_io::apply(&action, scale)
         })
         .await
