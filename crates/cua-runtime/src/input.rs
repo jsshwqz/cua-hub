@@ -70,6 +70,35 @@ pub fn press_combo(enigo: &mut Enigo, combo: &str) -> Result<()> {
     Ok(())
 }
 
+/// 单独按下/抬起（key_down / key_up）：按下按序、抬起逆序。
+/// 可只给修饰键（"shift"），也可给组合（"ctrl+shift"）——
+/// 配合鼠标点击实现 Shift 点选、Ctrl 拖动复制等组合操作。
+pub fn key_state(enigo: &mut Enigo, combo: &str, pressed: bool) -> Result<()> {
+    let parts: Vec<&str> = combo
+        .split('+')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        bail!("empty key combo");
+    }
+    let dir = if pressed {
+        Direction::Press
+    } else {
+        Direction::Release
+    };
+    if pressed {
+        for p in &parts {
+            enigo.key(parse_key(p)?, dir)?;
+        }
+    } else {
+        for p in parts.iter().rev() {
+            enigo.key(parse_key(p)?, dir)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

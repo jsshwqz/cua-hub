@@ -35,6 +35,16 @@ pub enum Action {
     TypeText { text: String },
     /// 按键或组合键，如 "Return"、"ctrl+l"、"alt+f4"
     KeyPress { combo: String },
+    /// 鼠标按钮单独按下/抬起（配合移动/点击做组合操作，如按住拖选）
+    MouseButtonState { button: MouseButton, pressed: bool },
+    /// 键盘按键单独按下/抬起（如先按住 Shift 再点选多个文件）
+    KeyState { combo: String, pressed: bool },
+    /// 把文本写入剪贴板
+    SetClipboard { text: String },
+    /// 读取剪贴板文本（只读）
+    GetClipboard,
+    /// 查询主屏尺寸与当前鼠标位置（只读）
+    ScreenInfo,
     /// 等待
     Wait { ms: u64 },
     /// 启动程序（高风险：可拉起任意进程）
@@ -56,9 +66,11 @@ pub enum SafetyLevel {
 impl Action {
     pub fn safety(&self) -> SafetyLevel {
         match self {
-            Action::Screenshot | Action::MouseMove { .. } | Action::Wait { .. } => {
-                SafetyLevel::Safe
-            }
+            Action::Screenshot
+            | Action::GetClipboard
+            | Action::ScreenInfo
+            | Action::MouseMove { .. }
+            | Action::Wait { .. } => SafetyLevel::Safe,
             Action::LaunchApp { .. } => SafetyLevel::Risky,
             _ => SafetyLevel::Input,
         }
@@ -81,6 +93,24 @@ impl Action {
                 )
             }
             Action::KeyPress { combo } => format!("key_press({combo})"),
+            Action::MouseButtonState { button, pressed } => {
+                format!(
+                    "mouse_{}({button:?})",
+                    if *pressed { "down" } else { "up" }
+                )
+            }
+            Action::KeyState { combo, pressed } => {
+                format!(
+                    "key_{}({combo})",
+                    if *pressed { "down" } else { "up" }
+                )
+            }
+            // 剪贴板内容不进日志，只记长度
+            Action::SetClipboard { text } => {
+                format!("set_clipboard({} chars)", text.chars().count())
+            }
+            Action::GetClipboard => "clipboard_get".to_string(),
+            Action::ScreenInfo => "screen_info".to_string(),
             Action::Wait { ms } => format!("wait({ms}ms)"),
             Action::LaunchApp { program, args } => {
                 format!("launch_app({program} {})", args.join(" "))

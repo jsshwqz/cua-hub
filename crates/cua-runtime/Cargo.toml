@@ -9,6 +9,7 @@ description = "执行核心：截屏（Linux x11rb / Windows xcap）/ 键鼠注�
 [dependencies]
 cua-types = { path = "../cua-types" }
 enigo = { version = "0.2", default-features = false }
+arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 serde_json.workspace = true

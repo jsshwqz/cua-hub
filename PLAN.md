@@ -82,13 +82,20 @@ computer-use-agent/
 
 **2a. MCP server（已完成，2026-10-20）**
 - 新增 `crates/cua-mcp`：把 runtime 包装成 MCP server（stdio/JSON-RPC），
-  10 个工具（screenshot/click/type_text/key_press/launch_app …），
-  全部经 guard 围栏 + 审计；默认 supervised 从严，autonomous 需显式开启，
+  工具全部经 guard 围栏 + 审计；默认 supervised 从严，autonomous 需显式开启，
   launch_app 还需 `--allow-launch`
 - 大脑直接用现成 agent 的模型（Claude Code / Qoder / Cursor），不需任何 API key
 - 验收：`scripts/mcp_smoke.py` 真实 MCP 客户端全流程通过
   （握手/工具列表/真 PNG 截图/开 xterm 并真实执行命令落盘）；
   用法见 `docs/MCP.md`
+- 版本演进：v0.1.0 首个 Windows 可下载版；v0.1.1 DSH 适配
+  （官方 TS SDK 互通实测、wait 封顶 50s、DSH 配置进 zip）并通过
+  真实 Windows 实机验收（1920x1080、记事本输入闭环、三档围栏）；
+  v0.1.2 工具扩到 17 个（新增 mouse/key 的 down/up、剪贴板读写、
+  screen_info）+ 指向类动作加屏幕边界校验
+- 已知短板（实机验收反馈）：无窗口聚焦/找窗口能力，
+  launch_app 不抢前台、type_text 可能静默打错窗口；
+  v0.1.3 计划 list_windows / focus_window + 启动后自动前台化
 
 **2b. 独立 API provider（后置，可选）**
 - `Brain` trait 已定义（Phase 0）；需要无人值守独立运行时再接：

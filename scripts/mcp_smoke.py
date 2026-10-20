@@ -81,6 +81,7 @@ try:
     print("tools:", ", ".join(tools))
     check("tools/list includes core tools",
           {"screenshot", "click", "type_text", "key_press", "launch_app"} <= set(tools))
+    check("tools/list has all 17 tools", len(tools) == 17)
 
     shot = call_tool("screenshot")
     img = next(c for c in shot["content"] if c["type"] == "image")
@@ -103,6 +104,25 @@ try:
     check("type_text executed", not r["isError"])
     r = call_tool("key_press", {"combo": "Return"})
     check("key_press Return executed", not r["isError"])
+
+    # v0.1.2 新增工具：屏幕信息 / 剪贴板往返 / 按下-抬起
+    r = call_tool("screen_info")
+    info = next(c["text"] for c in r["content"] if c["type"] == "text")
+    print("screen_info:", info)
+    check("screen_info reports screen + cursor",
+          not r["isError"] and "screen 1280x800" in info and "cursor at" in info)
+
+    marker = "cua-clip-12345"
+    r = call_tool("clipboard_set", {"text": marker})
+    check("clipboard_set executed", not r["isError"])
+    r = call_tool("clipboard_get")
+    got = next(c["text"] for c in r["content"] if c["type"] == "text")
+    check("clipboard roundtrip", not r["isError"] and got == marker)
+
+    for name, args in [("key_down", {"combo": "shift"}), ("key_up", {"combo": "shift"}),
+                       ("mouse_down", {}), ("mouse_up", {})]:
+        r = call_tool(name, args)
+        check(f"{name} executed", not r["isError"])
 
     ok = False
     for _ in range(50):

@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod capture;
+pub mod clipboard;
 pub mod guard;
 pub mod input;
 pub mod runtime;

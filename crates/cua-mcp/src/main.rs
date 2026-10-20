@@ -172,6 +172,9 @@ impl Server {
                             .unwrap_or_default()
                     )));
                     tool_result(content, false)
+                } else if let Some(note) = outcome.note {
+                    // 只读查询（剪贴板/屏幕信息）：文本结果直接回给大脑。
+                    tool_result(vec![text_content(&note)], false)
                 } else {
                     tool_result(vec![text_content(&format!("{describe} -> executed"))], false)
                 }
@@ -205,6 +208,20 @@ fn build_action(name: &str, args: &Value) -> Result<Action, String> {
             .ok_or_else(|| format!("tool {name}: missing integer argument '{k}'"))
     };
     let opt_i = |k: &str| args.get(k).and_then(|v| v.as_i64()).map(|v| v as i32);
+    let btn = |tool: &str| -> Result<MouseButton, String> {
+        match args.get("button").and_then(|v| v.as_str()).unwrap_or("left") {
+            "left" => Ok(MouseButton::Left),
+            "right" => Ok(MouseButton::Right),
+            "middle" => Ok(MouseButton::Middle),
+            other => Err(format!("tool {tool}: unknown button '{other}'")),
+        }
+    };
+    let req_s = |tool: &str, k: &str| -> Result<String, String> {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("tool {tool}: missing string argument '{k}'"))
+    };
 
     Ok(match name {
         "screenshot" => Action::Screenshot,
@@ -213,12 +230,7 @@ fn build_action(name: &str, args: &Value) -> Result<Action, String> {
             y: req_i("y")?,
         },
         "click" => {
-            let button = match args.get("button").and_then(|v| v.as_str()).unwrap_or("left") {
-                "left" => MouseButton::Left,
-                "right" => MouseButton::Right,
-                "middle" => MouseButton::Middle,
-                other => return Err(format!("tool click: unknown button '{other}'")),
-            };
+            let button = btn("click")?;
             let at = match (opt_i("x"), opt_i("y")) {
                 (Some(x), Some(y)) => Some((x, y)),
                 (None, None) => None,
@@ -255,6 +267,27 @@ fn build_action(name: &str, args: &Value) -> Result<Action, String> {
                 combo: combo.to_string(),
             }
         }
+        "mouse_down" => Action::MouseButtonState {
+            button: btn("mouse_down")?,
+            pressed: true,
+        },
+        "mouse_up" => Action::MouseButtonState {
+            button: btn("mouse_up")?,
+            pressed: false,
+        },
+        "key_down" => Action::KeyState {
+            combo: req_s("key_down", "combo")?,
+            pressed: true,
+        },
+        "key_up" => Action::KeyState {
+            combo: req_s("key_up", "combo")?,
+            pressed: false,
+        },
+        "clipboard_set" => Action::SetClipboard {
+            text: req_s("clipboard_set", "text")?,
+        },
+        "clipboard_get" => Action::GetClipboard,
+        "screen_info" => Action::ScreenInfo,
         "wait" => {
             let ms = args
                 .get("ms")
@@ -348,6 +381,47 @@ fn tool_defs() -> Value {
             "name": "key_press",
             "description": "Press a key or combination, e.g. \"Return\", \"Tab\", \"ctrl+l\", \"alt+F4\".",
             "inputSchema": obj(json!({ "combo": { "type": "string" } }), json!(["combo"]))
+        },
+        {
+            "name": "mouse_down",
+            "description": "Press and HOLD a mouse button (default left) without releasing. Pair with mouse_up. Enables hold-drag and modifier-click patterns beyond drag.",
+            "inputSchema": obj(
+                json!({ "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" } }),
+                json!([])
+            )
+        },
+        {
+            "name": "mouse_up",
+            "description": "Release a mouse button previously held with mouse_down.",
+            "inputSchema": obj(
+                json!({ "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" } }),
+                json!([])
+            )
+        },
+        {
+            "name": "key_down",
+            "description": "Press and HOLD a key or modifier, e.g. \"shift\" or \"ctrl\". Pair with key_up. Use for Shift-click multi-select or Ctrl-drag copy.",
+            "inputSchema": obj(json!({ "combo": { "type": "string" } }), json!(["combo"]))
+        },
+        {
+            "name": "key_up",
+            "description": "Release a key or modifier previously held with key_down.",
+            "inputSchema": obj(json!({ "combo": { "type": "string" } }), json!(["combo"]))
+        },
+        {
+            "name": "clipboard_set",
+            "description": "Put text into the system clipboard (e.g. to paste long or non-ASCII text reliably with ctrl+v afterwards).",
+            "inputSchema": obj(json!({ "text": { "type": "string" } }), json!(["text"]))
+        },
+        {
+            "name": "clipboard_get",
+            "description": "Read the current clipboard text. Fails if the clipboard holds non-text content. Long content is truncated at 8000 chars.",
+            "inputSchema": obj(json!({}), json!([]))
+        },
+        {
+            "name": "screen_info",
+            "description": "Report the primary screen size in pixels and the current cursor position.",
+            "inputSchema": obj(json!({}), json!([]))
         },
         {
             "name": "wait",

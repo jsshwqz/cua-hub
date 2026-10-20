@@ -54,10 +54,21 @@ claude mcp add cua -- /abs/path/to/cua-mcp --mode autonomous --allow-launch
 | `drag` | `from_x, from_y, to_x, to_y` | 按住左键拖拽 |
 | `type_text` | `text` | 在当前焦点输入文本 |
 | `key_press` | `combo` | 按键/组合键，如 `Return`、`ctrl+l`、`alt+F4` |
-| `wait` | `ms` | 等待毫秒 |
+| `mouse_down` / `mouse_up` | `button?` | 单独按下/抬起鼠标键（配合移动与点击做组合操作） |
+| `key_down` / `key_up` | `combo` | 单独按下/抬起键（如按住 `shift` 再点选） |
+| `clipboard_set` | `text` | 把文本写入剪贴板 |
+| `clipboard_get` | — | 读取剪贴板文本（超 8000 字符截断回传） |
+| `screen_info` | — | 主屏尺寸 + 当前鼠标位置 |
+| `wait` | `ms` | 等待毫秒（单次封顶 50 秒） |
 | `launch_app` | `program, args?` | 启动程序（高风险，需 `--allow-launch`） |
 
-坐标系：绝对像素，(0,0) 为左上角。建议 agent 每步先 `screenshot` 看屏幕再行动。
+坐标系：绝对像素，(0,0) 为左上角。指向类动作（移动/点击/双击/拖拽）
+带屏幕边界校验：坐标超出主屏范围直接报错，不会静默执行。
+建议 agent 每步先 `screenshot` 看屏幕再行动。
+
+注意：`type_text` / `key_press` 作用于**当前有焦点的窗口**。
+`launch_app` 不保证新窗口获得焦点（窗口聚焦工具在后续版本提供），
+连续操作前请先点击目标窗口或用 `alt+tab` 切换确认。
 
 ## 安全模式（--mode）
 

@@ -15,11 +15,15 @@ pub struct Runtime {
     policy: Policy,
     audit: AuditLog,
     shot_dir: PathBuf,
+    /// 常驻剪贴板实例（X11 下必须常驻，见 clipboard 模块说明）；惰性初始化。
+    clipboard: Option<arboard::Clipboard>,
 }
 
 pub struct ExecOutcome {
     pub executed: bool,
     pub observation: Option<Observation>,
+    /// 文本型结果（读剪贴板、屏幕信息这类只读查询的回传内容）
+    pub note: Option<String>,
 }
 
 impl Runtime {
@@ -37,7 +41,15 @@ impl Runtime {
             policy,
             audit: AuditLog::new(audit_path),
             shot_dir,
+            clipboard: None,
         })
+    }
+
+    fn clipboard(&mut self) -> Result<&mut arboard::Clipboard> {
+        if self.clipboard.is_none() {
+            self.clipboard = Some(arboard::Clipboard::new().context("open clipboard")?);
+        }
+        Ok(self.clipboard.as_mut().expect("clipboard just set"))
     }
 
     /// 观测：截屏落盘并返回 Observation。不经安全围栏（只读操作），
@@ -68,16 +80,22 @@ impl Runtime {
                 Ok(ExecOutcome {
                     executed: false,
                     observation: None,
+                    note: None,
                 })
             }
             Decision::Execute => {
                 let result = self.execute_inner(action);
                 match &result {
-                    Ok(obs) => {
+                    Ok((obs, note)) => {
                         let detail = obs
                             .as_ref()
                             .and_then(|o| o.screenshot_path.as_ref())
-                            .map(|p| p.display().to_string());
+                            .map(|p| p.display().to_string())
+                            .or_else(|| match action {
+                                // 只有屏幕信息可以进审计；剪贴板内容绝不落日志
+                                Action::ScreenInfo => note.clone(),
+                                _ => None,
+                            });
                         self.audit
                             .record(action, "execute", "ok", detail.as_deref())
                             .context("audit")?;
@@ -88,37 +106,65 @@ impl Runtime {
                             .context("audit")?;
                     }
                 }
-                let observation = result?;
+                let (observation, note) = result?;
                 Ok(ExecOutcome {
                     executed: true,
                     observation,
+                    note,
                 })
             }
         }
     }
 
-    fn execute_inner(&mut self, action: &Action) -> Result<Option<Observation>> {
+    /// 主屏尺寸（像素）。
+    pub fn display_size(&mut self) -> Result<(i32, i32)> {
+        Ok(self.enigo.main_display()?)
+    }
+
+    /// 当前鼠标位置（像素）。
+    pub fn cursor_location(&mut self) -> Result<(i32, i32)> {
+        Ok(self.enigo.location()?)
+    }
+
+    fn execute_inner(
+        &mut self,
+        action: &Action,
+    ) -> Result<(Option<Observation>, Option<String>)> {
+        // 坐标边界校验：超出主屏范围的指向直接报错，不让误坐标
+        // 静默落到屏幕外或被系统钳到边缘误触（实机验收反馈）。
+        let (sw, sh) = self.display_size().unwrap_or((0, 0));
+        let in_bounds = |x: i32, y: i32| -> Result<()> {
+            if sw > 0 && (x < 0 || y < 0 || x >= sw || y >= sh) {
+                return Err(anyhow::anyhow!(
+                    "point ({x}, {y}) is outside the main screen ({sw}x{sh})"
+                ));
+            }
+            Ok(())
+        };
         match action {
             Action::Screenshot => {
                 let obs = self.observe()?;
-                Ok(Some(obs))
+                Ok((Some(obs), None))
             }
             Action::MouseMove { x, y } => {
+                in_bounds(*x, *y)?;
                 self.enigo.move_mouse(*x, *y, Coordinate::Abs)?;
-                Ok(None)
+                Ok((None, None))
             }
             Action::Click { button, at } => {
                 if let Some((x, y)) = at {
+                    in_bounds(*x, *y)?;
                     self.enigo.move_mouse(*x, *y, Coordinate::Abs)?;
                 }
                 self.enigo.button(to_button(*button), Direction::Click)?;
-                Ok(None)
+                Ok((None, None))
             }
             Action::DoubleClick { at } => {
+                in_bounds(at.0, at.1)?;
                 self.enigo.move_mouse(at.0, at.1, Coordinate::Abs)?;
                 self.enigo.button(Button::Left, Direction::Click)?;
                 self.enigo.button(Button::Left, Direction::Click)?;
-                Ok(None)
+                Ok((None, None))
             }
             Action::Scroll { dx, dy } => {
                 if *dy != 0 {
@@ -127,26 +173,64 @@ impl Runtime {
                 if *dx != 0 {
                     self.enigo.scroll(*dx, Axis::Horizontal)?;
                 }
-                Ok(None)
+                Ok((None, None))
             }
             Action::Drag { from, to } => {
+                in_bounds(from.0, from.1)?;
+                in_bounds(to.0, to.1)?;
                 self.enigo.move_mouse(from.0, from.1, Coordinate::Abs)?;
                 self.enigo.button(Button::Left, Direction::Press)?;
                 self.enigo.move_mouse(to.0, to.1, Coordinate::Abs)?;
                 self.enigo.button(Button::Left, Direction::Release)?;
-                Ok(None)
+                Ok((None, None))
             }
             Action::TypeText { text } => {
                 self.enigo.text(text)?;
-                Ok(None)
+                Ok((None, None))
             }
             Action::KeyPress { combo } => {
                 input::press_combo(&mut self.enigo, combo)?;
-                Ok(None)
+                Ok((None, None))
+            }
+            Action::MouseButtonState { button, pressed } => {
+                let dir = if *pressed {
+                    Direction::Press
+                } else {
+                    Direction::Release
+                };
+                self.enigo.button(to_button(*button), dir)?;
+                Ok((None, None))
+            }
+            Action::KeyState { combo, pressed } => {
+                input::key_state(&mut self.enigo, combo, *pressed)?;
+                Ok((None, None))
+            }
+            Action::SetClipboard { text } => {
+                let text = text.clone();
+                crate::clipboard::set_text(self.clipboard()?, &text)?;
+                Ok((None, None))
+            }
+            Action::GetClipboard => {
+                let text = crate::clipboard::get_text(self.clipboard()?)?;
+                // 超长剪贴板截断回传，避免撑爆大脑上下文；全文长度会注明。
+                const CAP: usize = 8000;
+                let total = text.chars().count();
+                let note = if total > CAP {
+                    let head: String = text.chars().take(CAP).collect();
+                    format!("{head}… [truncated: clipboard holds {total} chars]")
+                } else {
+                    text
+                };
+                Ok((None, Some(note)))
+            }
+            Action::ScreenInfo => {
+                let (w, h) = self.display_size()?;
+                let (cx, cy) = self.cursor_location()?;
+                Ok((None, Some(format!("screen {w}x{h}, cursor at ({cx}, {cy})"))))
             }
             Action::Wait { ms } => {
                 std::thread::sleep(std::time::Duration::from_millis(*ms));
-                Ok(None)
+                Ok((None, None))
             }
             Action::LaunchApp { program, args } => {
                 std::process::Command::new(program)
@@ -156,7 +240,7 @@ impl Runtime {
                     .stderr(std::process::Stdio::null())
                     .spawn()
                     .with_context(|| format!("launch {program}"))?;
-                Ok(None)
+                Ok((None, None))
             }
         }
     }
