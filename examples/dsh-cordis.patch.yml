@@ -1,0 +1,29 @@
+# DeepSeek Harness (dsh) 挂载 cua-mcp 的配置片段
+#
+# 放置位置（web profile 的用户 patch 层）：
+#   Windows: C:\Users\<用户名>\.dsh\profiles\web\cordis.patch.yml
+#   macOS/Linux: ~/.dsh/profiles/web/cordis.patch.yml
+#
+# 用法：把下面这段并入该文件。若文件中已有 insert: 段，
+# 只把 mcp-cua 这一项加进它已有的列表，不要重复写 insert: 键。
+# 改完重启 dsh web 并新开会话，工具会以 mcp__cua__<工具名> 出现。
+#
+# 前提：cua-mcp.exe 已解压到 C:\cua-mcp（见仓库 Release muse-v0.1.0）。
+# 依据：DeepSeek Harness 官方文档《MCP Integration》
+#       https://deepseekdocs.com/en/docs/features/mcp
+
+- insert:
+  - id: mcp-cua
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: cua
+      transport: stdio
+      command: 'C:\cua-mcp\cua-mcp.exe'
+      args:
+        - '--mode'
+        - 'autonomous'
+        - '--allow-launch'
+        - '--audit'
+        - 'C:\cua-mcp\audit.jsonl'
+        - '--shots'
+        - 'C:\cua-mcp\screenshots'
