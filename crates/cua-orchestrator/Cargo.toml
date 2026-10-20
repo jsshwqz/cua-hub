@@ -1,0 +1,14 @@
+[package]
+name = "cua-orchestrator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "任务循环：观测 → 规划 → 执行（完整编排：重试/检查点/队列在 Phase 3）"
+
+[dependencies]
+cua-types = { path = "../cua-types" }
+cua-brain = { path = "../cua-brain" }
+cua-runtime = { path = "../cua-runtime" }
+anyhow.workspace = true
+tracing.workspace = true

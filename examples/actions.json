@@ -1,0 +1,1 @@
+[{"type":"screenshot"},{"args":[],"program":"xterm","type":"launch_app"},{"ms":1200,"type":"wait"},{"type":"mouse_move","x":200,"y":100},{"at":null,"button":"left","type":"click"},{"text":"echo cua-smoke-ok > /tmp/cua_smoke.txt","type":"type_text"},{"combo":"Return","type":"key_press"},{"ms":600,"type":"wait"},{"type":"screenshot"}]

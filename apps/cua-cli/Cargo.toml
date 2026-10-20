@@ -1,0 +1,20 @@
+[package]
+name = "cua-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "命令行入口：screenshot / info / exec"
+
+[[bin]]
+name = "cua-cli"
+path = "src/main.rs"
+
+[dependencies]
+cua-types = { path = "../../crates/cua-types" }
+cua-runtime = { path = "../../crates/cua-runtime" }
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

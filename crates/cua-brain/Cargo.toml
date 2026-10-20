@@ -1,0 +1,12 @@
+[package]
+name = "cua-brain"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "大脑抽象：Brain trait 与测试用 Mock 大脑（真实 provider 在 Phase 2）"
+
+[dependencies]
+cua-types = { path = "../cua-types" }
+anyhow.workspace = true
+serde_json.workspace = true

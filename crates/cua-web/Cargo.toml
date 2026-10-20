@@ -1,0 +1,9 @@
+[package]
+name = "cua-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Web UI：屏幕直播、远程接管、任务管理（Phase 3 实现）"
+
+[dependencies]
