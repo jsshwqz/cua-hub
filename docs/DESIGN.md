@@ -252,6 +252,23 @@ stays open). Non-loopback binds are refused unless a token is set, or
 `CUA_HUB_ALLOW_REMOTE=1` acknowledges that an authenticating proxy sits in
 front. Without one, every tool here can control the machine.
 
+## Input state and clipboard
+
+`mouse_down` / `key_down` only make sense if the button or key stays held
+between calls, so `cua-io` now keeps one process-wide `Enigo` behind a mutex
+instead of constructing a fresh instance per action. Releases unwind chords in
+reverse order.
+
+Clipboard access uses one process-wide `arboard::Clipboard`. On X11 the
+clipboard contents are owned by the living process; a per-call instance would
+make the copied text vanish as soon as the tool returned.
+
+MCP pointing tools validate coordinates against the primary display before
+injecting input, so an out-of-bounds model answer turns into a tool error
+instead of a stray click. These four pieces (clipboard, hold/release,
+screen_info, bounds checks) were ported from the `muse-vm-phase0-1` branch; see
+`docs/VERSIONS.md`.
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

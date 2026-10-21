@@ -11,6 +11,7 @@ cua-core = { path = "../cua-core" }
 image.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+arboard = "3"
 enigo = "0.6"
 xcap = "0.9"
 

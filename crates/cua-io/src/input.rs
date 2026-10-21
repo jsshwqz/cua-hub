@@ -1,15 +1,31 @@
 //! Input injection on top of `enigo`.
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use cua_core::{Action, Error, Point, Result};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
+/// One process-wide Enigo instance so held buttons/keys survive across calls
+/// (`mouse_down` → later `mouse_up`), which a per-call instance cannot do.
+fn enigo() -> Result<MutexGuard<'static, Enigo>> {
+    static INSTANCE: OnceLock<Mutex<Enigo>> = OnceLock::new();
+    if INSTANCE.get().is_none() {
+        let created = Enigo::new(&Settings::default())
+            .map_err(|e| Error::Input(format!("enigo init: {e}")))?;
+        let _ = INSTANCE.set(Mutex::new(created));
+    }
+    INSTANCE
+        .get()
+        .expect("just initialised")
+        .lock()
+        .map_err(|e| Error::Input(format!("enigo lock: {e}")))
+}
+
 /// Execute a mutating action. Points are in model space and are scaled by
 /// `scale` (physical = model * scale).
 pub fn apply(action: &Action, scale: f32) -> Result<()> {
-    let mut enigo =
-        Enigo::new(&Settings::default()).map_err(|e| Error::Input(format!("enigo init: {e}")))?;
+    let mut enigo = enigo()?;
 
     match action {
         Action::Move { to } => {
@@ -79,9 +95,54 @@ pub fn apply(action: &Action, scale: f32) -> Result<()> {
 
 /// Current pointer position in physical pixels.
 pub fn cursor_position() -> Result<(i32, i32)> {
-    let enigo =
-        Enigo::new(&Settings::default()).map_err(|e| Error::Input(format!("enigo init: {e}")))?;
+    let enigo = enigo()?;
     enigo.location().map_err(input_err)
+}
+
+/// Press or release a mouse button without moving the pointer.
+pub fn mouse_button(button: cua_core::MouseButton, down: bool) -> Result<()> {
+    let mut enigo = enigo()?;
+    let direction = if down {
+        Direction::Press
+    } else {
+        Direction::Release
+    };
+    enigo
+        .button(map_button(button), direction)
+        .map_err(input_err)
+}
+
+/// Press or release a key or chord, e.g. `"shift"` or `"ctrl+shift"`.
+pub fn key_state(combo: &str, down: bool) -> Result<()> {
+    let mut enigo = enigo()?;
+    let parts: Vec<&str> = combo
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err(Error::InvalidAction("empty key combo".into()));
+    }
+    let direction = if down {
+        Direction::Press
+    } else {
+        Direction::Release
+    };
+    let mut keys = Vec::new();
+    for part in parts {
+        let key = parse_modifier(part)
+            .or_else(|| parse_key(part))
+            .ok_or_else(|| Error::InvalidAction(format!("unknown key: {part}")))?;
+        keys.push(key);
+    }
+    // Release in reverse order so chords unwind cleanly.
+    if !down {
+        keys.reverse();
+    }
+    for key in keys {
+        enigo.key(key, direction).map_err(input_err)?;
+    }
+    Ok(())
 }
 
 fn phys(p: Point, scale: f32) -> (i32, i32) {
@@ -165,6 +226,9 @@ fn parse_key(name: &str) -> Option<Key> {
         "right" | "arrowright" => Key::RightArrow,
         "capslock" => Key::CapsLock,
         "meta" | "win" | "super" | "cmd" => Key::Meta,
+        "ctrl" | "control" => Key::Control,
+        "alt" | "option" | "opt" => Key::Alt,
+        "shift" => Key::Shift,
         "f1" => Key::F1,
         "f2" => Key::F2,
         "f3" => Key::F3,

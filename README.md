@@ -99,7 +99,7 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露的工具：
+暴露 22 个工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -114,6 +114,10 @@ export OPENROUTER_API_KEY=sk-or-...
 | `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
 | `type_text` | 向焦点窗口输入任意 Unicode 文本 |
 | `key` | 发送按键组合（PageUp/PageDown/方向键/系统快捷键等） |
+| `mouse_down` / `mouse_up` | 按住/释放鼠标键（Shift 多选、Ctrl 拖拽） |
+| `key_down` / `key_up` | 按住/释放按键或组合键 |
+| `clipboard_get` / `clipboard_set` | 剪贴板文本读写（常驻实例） |
+| `screen_info` | 主屏尺寸、原点、DPI、光标位置 |
 
 远程/容器内调用可以走 HTTP（streamable POST）：
 
@@ -177,7 +181,8 @@ cua-cli  ->  cua-router  ->  cua-engine-vision (Anthropic / OpenAI-compatible)
 坐标链：模型截图像素 → 物理像素（`Frame.scale`）→ 输入逻辑像素
 （`Frame.input_scale`，已处理 Windows 125% DPI 缩放）。
 
-细节见 [docs/DESIGN.md](docs/DESIGN.md)，路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+细节见 [docs/DESIGN.md](docs/DESIGN.md)，路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)，
+仓库内各版本对照见 [docs/VERSIONS.md](docs/VERSIONS.md)。
 
 ## 许可证
 

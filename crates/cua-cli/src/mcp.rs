@@ -196,6 +196,18 @@ fn tool_err(message: impl std::fmt::Display) -> Value {
     })
 }
 
+/// Reject coordinates outside the primary display before injecting input.
+fn ensure_on_screen(x: i64, y: i64) -> std::result::Result<(), Value> {
+    let screen = cua_io::capture_primary().map_err(tool_err)?;
+    if x < 0 || y < 0 || x >= screen.width as i64 || y >= screen.height as i64 {
+        return Err(tool_err(format!(
+            "point ({x},{y}) is outside the screen ({}x{})",
+            screen.width, screen.height
+        )));
+    }
+    Ok(())
+}
+
 fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
     args[key]
         .as_str()
@@ -407,6 +419,9 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) else {
                 return tool_err("click requires integer x and y (physical pixels)");
             };
+            if let Err(e) = ensure_on_screen(x, y) {
+                return e;
+            }
             let button = if args["middle"].as_bool().unwrap_or(false) {
                 cua_core::MouseButton::Middle
             } else if args["right"].as_bool().unwrap_or(false) {
@@ -447,6 +462,9 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             if dy == 0 && dx == 0 {
                 return tool_err("scroll requires a non-zero dy or dx");
             }
+            if let Err(e) = ensure_on_screen(x, y) {
+                return e;
+            }
             let action = Action::Scroll {
                 at: Point::new(x as i32, y as i32),
                 dx,
@@ -461,6 +479,9 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) else {
                 return tool_err("move requires integer x and y (physical pixels)");
             };
+            if let Err(e) = ensure_on_screen(x, y) {
+                return e;
+            }
             let action = Action::Move {
                 to: Point::new(x as i32, y as i32),
             };
@@ -479,12 +500,65 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let (Some(x), Some(y), Some(x2), Some(y2)) = coords else {
                 return tool_err("drag requires integer x, y, x2, y2 (physical pixels)");
             };
+            if let Err(e) = ensure_on_screen(x, y).and_then(|_| ensure_on_screen(x2, y2)) {
+                return e;
+            }
             let action = Action::Drag {
                 from: Point::new(x as i32, y as i32),
                 to: Point::new(x2 as i32, y2 as i32),
             };
             match cua_io::apply(&action, 1.0 / cua_io::dpi_scale()) {
                 Ok(()) => tool_ok(format!("dragged ({x},{y}) -> ({x2},{y2})")),
+                Err(e) => tool_err(e),
+            }
+        }
+        "clipboard_get" => match cua_io::clipboard_get() {
+            Ok(text) => tool_ok(text),
+            Err(e) => tool_err(e),
+        },
+        "clipboard_set" => {
+            let text = match required_str(args, "text") {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            match cua_io::clipboard_set(&text) {
+                Ok(()) => tool_ok(format!("copied {} chars", text.chars().count())),
+                Err(e) => tool_err(e),
+            }
+        }
+        "screen_info" => match cua_io::capture_primary() {
+            Ok(screen) => {
+                let cursor = cua_io::cursor_position().ok();
+                tool_ok(json!({
+                    "width": screen.width,
+                    "height": screen.height,
+                    "origin": { "x": screen.origin.0, "y": screen.origin.1 },
+                    "scale_factor": screen.scale_factor,
+                    "dpi": cua_io::dpi_scale(),
+                    "cursor": cursor.map(|(x, y)| json!({ "x": x, "y": y })),
+                }))
+            }
+            Err(e) => tool_err(e),
+        },
+        "mouse_down" | "mouse_up" => {
+            let button = match args["button"].as_str().unwrap_or("left") {
+                "left" => cua_core::MouseButton::Left,
+                "right" => cua_core::MouseButton::Right,
+                "middle" => cua_core::MouseButton::Middle,
+                other => return tool_err(format!("unknown button: {other}")),
+            };
+            match cua_io::mouse_button(button, name == "mouse_down") {
+                Ok(()) => tool_ok(name),
+                Err(e) => tool_err(e),
+            }
+        }
+        "key_down" | "key_up" => {
+            let combo = match required_str(args, "combo") {
+                Ok(c) => c,
+                Err(e) => return e,
+            };
+            match cua_io::key_state(&combo, name == "key_down") {
+                Ok(()) => tool_ok(format!("{} {combo}", name)),
                 Err(e) => tool_err(e),
             }
         }
@@ -639,6 +713,63 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "clipboard_get",
+            "description": "Read text from the system clipboard. Returns an error if the clipboard holds a non-text payload.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "clipboard_set",
+            "description": "Write text to the system clipboard (persistent instance, so X11 keeps the contents).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "screen_info",
+            "description": "Primary display size, origin, DPI scale and current cursor position. Use it to validate coordinates.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "mouse_down",
+            "description": "Press and hold a mouse button without releasing. Pair with mouse_up for hold-drag or modifier-click.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" }
+                }
+            }
+        },
+        {
+            "name": "mouse_up",
+            "description": "Release a mouse button previously held with mouse_down.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" }
+                }
+            }
+        },
+        {
+            "name": "key_down",
+            "description": "Press and hold a key or chord, e.g. `shift` or `ctrl+shift`. Pair with key_up.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "combo": { "type": "string" } },
+                "required": ["combo"]
+            }
+        },
+        {
+            "name": "key_up",
+            "description": "Release a key or chord previously held with key_down.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "combo": { "type": "string" } },
+                "required": ["combo"]
+            }
+        },
+        {
             "name": "type_text",
             "description": "Type arbitrary Unicode text into the focused window.",
             "inputSchema": {
@@ -749,6 +880,9 @@ mod tests {
         assert!(names.contains(&"type_text".to_string()));
         assert!(names.contains(&"scroll".to_string()));
         assert!(names.contains(&"drag".to_string()));
+        assert!(names.contains(&"clipboard_get".to_string()));
+        assert!(names.contains(&"mouse_down".to_string()));
+        assert!(names.contains(&"screen_info".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
     }
 }
