@@ -196,6 +196,26 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 Ubuntu 22.04 不可用：xcap 依赖的 libspa 0.10 需要较新的 pipewire 头文件；
 另外需要 `libgbm-dev` / `libdrm-dev` 才能完成链接。
 
+## 作为 Skill / MCP 安装
+
+一键安装（构建 release、复制 Skill 到 Qoder/Claude、注册 MCP）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-qoder.ps1
+```
+
+安装内容：
+
+- `dist\cua-hub.exe`（约 7MB）
+- `~/.qoder/skills/cua-hub/SKILL.md` 与 `~/.claude/skills/cua-hub/SKILL.md`
+- `~/.qoder/mcp.json` 增加 `cua-hub` 条目（原文件自动备份）
+
+重启 Qoder 后，新会话可直接让 Agent 调用 `capture_screen`、`accessibility_tree`、
+`set_control_text`、`browser_task` 等工具。模型密钥放在用户环境变量
+（`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`），子进程会继承。
+
+细节见 [integrations/README.md](integrations/README.md)。
+
 ## 架构
 
 ```
