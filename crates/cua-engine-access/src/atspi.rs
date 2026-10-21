@@ -99,7 +99,7 @@ fn role_from_name(name: &str) -> u32 {
 fn walk(
     max_nodes: usize,
     max_depth: usize,
-    visit: &mut dyn FnMut(&UiNode) -> bool,
+    visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
 ) -> Result<(bool, bool)> {
     let conn = a11y_connection()?;
     let root_kids = children(&conn, REGISTRY, ROOT_PATH)?;
@@ -135,7 +135,7 @@ fn walk(
             automation_id: String::new(),
             rect,
         };
-        if visit(&node) {
+        if visit(&conn, &node, &dest, &path) {
             return Ok((truncated, true));
         }
 
@@ -152,7 +152,7 @@ fn walk(
 
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     let mut nodes = Vec::new();
-    let (truncated, _) = walk(max_nodes, max_depth, &mut |node| {
+    let (truncated, _) = walk(max_nodes, max_depth, &mut |_, node, _, _| {
         nodes.push(node.clone());
         false
     })?;
@@ -164,7 +164,7 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
     let mut exact: Option<(u8, UiNode)> = None;
     let mut partial: Option<(u8, UiNode)> = None;
 
-    walk(max_nodes, max_depth, &mut |node| {
+    walk(max_nodes, max_depth, &mut |_, node, _, _| {
         if node.name.is_empty() || node.rect.2 <= 0 || node.rect.3 <= 0 {
             return false;
         }
@@ -196,6 +196,51 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
     })?;
 
     Ok(exact.or(partial).map(|(_, node)| node))
+}
+
+/// Fire the control's first AT-SPI action (usually "click"/"press").
+pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+    let mut hit = None;
+    walk(600, 10, &mut |conn, node, dest, path| {
+        if node.name != name || node.rect.2 <= 0 {
+            return false;
+        }
+        if let Ok(action) = Proxy::new(conn, dest, path, "org.a11y.atspi.Action") {
+            if action.call::<_, _, bool>("DoAction", &(0i32,)).is_ok() {
+                hit = Some(node.clone());
+                return true;
+            }
+        }
+        false
+    })?;
+    Ok(hit)
+}
+
+/// Replace text through the EditableText interface.
+pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+    let mut hit = None;
+    walk(600, 10, &mut |conn, node, dest, path| {
+        if node.name != name || node.rect.2 <= 0 {
+            return false;
+        }
+        if let Ok(editable) = Proxy::new(conn, dest, path, "org.a11y.atspi.EditableText") {
+            if editable
+                .call::<_, _, ()>("SetTextContents", &(text,))
+                .is_ok()
+            {
+                hit = Some(node.clone());
+                return true;
+            }
+        }
+        false
+    })?;
+    Ok(hit)
+}
+
+/// AT-SPI state flags are not exposed as a simple property on the D-Bus
+/// interface; the caller can still use `snapshot`/`find` for structure.
+pub fn state(_name: &str) -> Result<Option<crate::ControlState>> {
+    Ok(None)
 }
 
 #[cfg(test)]

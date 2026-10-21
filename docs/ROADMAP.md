@@ -17,7 +17,9 @@
 - [x] `cua-engine-code`: LLM-generated PowerShell/sh with risk-gated execution
 - [x] `cua-engine-access`: Windows UIA snapshot (cached, depth-bounded)
 - [x] Hybrid context: `--ui-tree` adds the tree to vision prompts
-- [x] `cua-engine-access`: find/invoke controls by accessible name
+- [x] `cua-engine-access`: find/invoke controls by name or AutomationId
+- [x] UIA Invoke/Value patterns and control state (Windows, verified)
+- [x] AT-SPI DoAction/SetTextContents (implemented; live Linux runtime pending)
 - [x] Linux AT-SPI2 tree + find (verified in WSL with a GTK3 window)
 - [ ] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
 - [ ] UI-TARS via Ollama as a local vision backend

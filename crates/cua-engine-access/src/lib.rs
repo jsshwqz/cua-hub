@@ -24,6 +24,23 @@ pub struct UiSnapshot {
     pub truncated: bool,
 }
 
+/// Snapshot of a control's actionable state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlState {
+    pub name: String,
+    pub control_type: String,
+    pub enabled: bool,
+    pub offscreen: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toggle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range_value: Option<f64>,
+}
+
 impl UiSnapshot {
     /// Compact prompt-friendly text, one node per line.
     pub fn to_text(&self) -> String {
@@ -84,6 +101,44 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
     #[cfg(not(windows))]
     {
         atspi::find(name, max_nodes, max_depth)
+    }
+}
+
+/// Invoke a control through its accessibility Invoke pattern. Returns `None`
+/// when the control has no invoke pattern (caller should fall back to a click).
+pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+    #[cfg(windows)]
+    {
+        imp::invoke(name)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::invoke(name)
+    }
+}
+
+/// Set a control's text through its Value/EditableText pattern. Returns `None`
+/// when unsupported (caller can fall back to focus + typing).
+pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+    #[cfg(windows)]
+    {
+        imp::set_value(name, text)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::set_value(name, text)
+    }
+}
+
+/// Read common state fields from a control.
+pub fn state(name: &str) -> Result<Option<ControlState>> {
+    #[cfg(windows)]
+    {
+        imp::state(name)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::state(name)
     }
 }
 
@@ -191,10 +246,137 @@ mod imp {
     }
 
     pub fn find(name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
+        Ok(find_element(name)?
+            .map(|el| element_to_node(&el))
+            .filter(|n| n.rect.2 > 0 && n.rect.3 > 0))
+    }
+
+    pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+        use windows::Win32::UI::Accessibility::{IUIAutomationInvokePattern, UIA_InvokePatternId};
+
+        let Some(element) = find_element(name)? else {
+            return Ok(None);
+        };
+        let node = element_to_node(&element);
+        let pattern: windows::core::Result<IUIAutomationInvokePattern> =
+            unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) };
+        match pattern {
+            Ok(p) => {
+                unsafe { p.Invoke() }
+                    .map_err(|e| Error::Capture(format!("UIA Invoke failed: {e}")))?;
+                Ok(Some(node))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+        use windows::core::BSTR;
+        use windows::Win32::UI::Accessibility::{IUIAutomationValuePattern, UIA_ValuePatternId};
+
+        let Some(element) = find_element(name)? else {
+            return Ok(None);
+        };
+        let node = element_to_node(&element);
+        let pattern: windows::core::Result<IUIAutomationValuePattern> =
+            unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) };
+        match pattern {
+            Ok(p) => {
+                unsafe { p.SetValue(&BSTR::from(text)) }
+                    .map_err(|e| Error::Capture(format!("UIA SetValue failed: {e}")))?;
+                Ok(Some(node))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn state(name: &str) -> Result<Option<super::ControlState>> {
+        use windows::Win32::UI::Accessibility::{
+            ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
+            ExpandCollapseState_PartiallyExpanded, IUIAutomationExpandCollapsePattern,
+            IUIAutomationRangeValuePattern, IUIAutomationTogglePattern, IUIAutomationValuePattern,
+            ToggleState_Indeterminate, ToggleState_Off, ToggleState_On,
+            UIA_ExpandCollapsePatternId, UIA_RangeValuePatternId, UIA_TogglePatternId,
+            UIA_ValuePatternId,
+        };
+
+        let Some(element) = find_element(name)? else {
+            return Ok(None);
+        };
+        let node = element_to_node(&element);
+
+        let toggle = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+        }
+        .ok()
+        .and_then(|p| unsafe { p.CurrentToggleState().ok() })
+        .map(|s| {
+            if s == ToggleState_On {
+                "on"
+            } else if s == ToggleState_Off {
+                "off"
+            } else if s == ToggleState_Indeterminate {
+                "indeterminate"
+            } else {
+                "unknown"
+            }
+        })
+        .map(str::to_string);
+
+        let value =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+                .ok()
+                .and_then(|p| unsafe { p.CurrentValue().ok() })
+                .map(|b| b.to_string());
+
+        let expanded = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(
+                UIA_ExpandCollapsePatternId,
+            )
+        }
+        .ok()
+        .and_then(|p| unsafe { p.CurrentExpandCollapseState().ok() })
+        .map(|s| {
+            if s == ExpandCollapseState_Expanded {
+                "expanded"
+            } else if s == ExpandCollapseState_Collapsed {
+                "collapsed"
+            } else if s == ExpandCollapseState_PartiallyExpanded {
+                "partially_expanded"
+            } else {
+                "leaf"
+            }
+        })
+        .map(str::to_string);
+
+        let range_value = unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationRangeValuePattern>(UIA_RangeValuePatternId)
+        }
+        .ok()
+        .and_then(|p| unsafe { p.CurrentValue().ok() });
+
+        Ok(Some(super::ControlState {
+            name: node.name,
+            control_type: node.control_type,
+            enabled: unsafe { element.CurrentIsEnabled() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false),
+            offscreen: unsafe { element.CurrentIsOffscreen() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false),
+            toggle,
+            value,
+            expanded,
+            range_value,
+        }))
+    }
+
+    fn find_element(name: &str) -> Result<Option<IUIAutomationElement>> {
         use windows::core::BSTR;
         use windows::Win32::System::Variant::VARIANT;
         use windows::Win32::UI::Accessibility::{
-            IUIAutomation, TreeScope_Subtree, UIA_ControlTypePropertyId, UIA_NamePropertyId,
+            IUIAutomation, TreeScope_Subtree, UIA_AutomationIdPropertyId,
+            UIA_ControlTypePropertyId, UIA_NamePropertyId,
         };
 
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -203,6 +385,23 @@ mod imp {
                 .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
         let root = unsafe { automation.GetRootElement() }
             .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
+
+        // `id:<AutomationId>` targets controls whose Name is dynamic or empty
+        // (e.g. Win32 edit id 15, Calculator's num1Button).
+        if let Some(id) = name.strip_prefix("id:") {
+            let condition = unsafe {
+                automation.CreatePropertyCondition(
+                    UIA_AutomationIdPropertyId,
+                    &VARIANT::from(BSTR::from(id)),
+                )
+            }
+            .map_err(|e| Error::Capture(format!("UIA condition: {e}")))?;
+            if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &condition) } {
+                return Ok(Some(el));
+            }
+            return Ok(None);
+        }
+
         let name_cond = unsafe {
             automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(BSTR::from(name)))
         }
@@ -210,7 +409,6 @@ mod imp {
 
         // Prefer actionable controls: the Start menu and its button share a
         // name, but only the button (control type 50000) is clickable chrome.
-        let mut node = None;
         for type_id in [50000i32, 50011, 50007] {
             let type_cond = unsafe {
                 automation
@@ -222,17 +420,14 @@ mod imp {
                 continue;
             };
             if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &combined) } {
-                node = Some(element_to_node(&el));
-                break;
+                return Ok(Some(el));
             }
         }
 
-        if node.is_none() {
-            if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &name_cond) } {
-                node = Some(element_to_node(&el));
-            }
+        if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &name_cond) } {
+            return Ok(Some(el));
         }
-        Ok(node.filter(|n| n.rect.2 > 0 && n.rect.3 > 0))
+        Ok(None)
     }
 
     fn element_to_node(el: &IUIAutomationElement) -> UiNode {

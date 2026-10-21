@@ -252,6 +252,25 @@ stays open). Non-loopback binds are refused unless a token is set, or
 `CUA_HUB_ALLOW_REMOTE=1` acknowledges that an authenticating proxy sits in
 front. Without one, every tool here can control the machine.
 
+## Accessibility actions
+
+`cua-engine-access` no longer stops at rectangles:
+
+* **Windows UIA**: `invoke` uses `InvokePattern`, `set_value` uses
+  `ValuePattern`, and `state` reads enabled/offscreen plus Toggle, Value,
+  ExpandCollapse and RangeValue patterns. `invoke_control` falls back to a
+  center click when the control exposes no pattern.
+* **Linux AT-SPI**: `Action.DoAction(0)` for invoke and
+  `EditableText.SetTextContents` for set-value. Implemented and compiled in CI,
+  but not yet exercised on a live Linux desktop.
+* Controls can be addressed as `name` or `id:<AutomationId>`. The id form is
+  required when the accessible name is dynamic or empty (Win32 edit `15`,
+  Calculator `num1Button`, display `CalculatorResults`).
+
+Verified on Windows: `set_control_text(id:15)` filled Notepad through
+ValuePattern (readback via `control_state`), and `invoke_control(id:num1Button)`
+changed the Calculator display to 1 without moving the pointer.
+
 ## Input state and clipboard
 
 `mouse_down` / `key_down` only make sense if the button or key stays held

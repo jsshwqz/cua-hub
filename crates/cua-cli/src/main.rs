@@ -263,6 +263,15 @@ fn main() -> Result<()> {
             max_nodes,
             depth,
         } => {
+            // Prefer the Invoke pattern: no pointer movement, works when the
+            // control is covered by another window.
+            if let Some(node) = cua_engine_access::invoke(&name)? {
+                println!(
+                    "invoked {} \"{}\" via accessibility pattern",
+                    node.control_type, node.name
+                );
+                return Ok(());
+            }
             let node = cua_engine_access::find(&name, max_nodes, depth)?
                 .ok_or_else(|| anyhow::anyhow!("no control matching {name:?}"))?;
             let (x, y, w, h) = node.rect;

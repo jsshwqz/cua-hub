@@ -387,11 +387,56 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Err(e) => tool_err(e),
             }
         }
+        "set_control_text" => {
+            let name = match required_str(args, "name") {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let text = match required_str(args, "text") {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            match cua_engine_access::set_value(&name, &text) {
+                Ok(Some(node)) => tool_ok(format!(
+                    "set text of {} \"{}\" ({} chars)",
+                    node.control_type,
+                    node.name,
+                    text.chars().count()
+                )),
+                Ok(None) => tool_err(format!(
+                    "control {name:?} has no Value/EditableText pattern; focus it and use type_text"
+                )),
+                Err(e) => tool_err(e),
+            }
+        }
+        "control_state" => {
+            let name = match required_str(args, "name") {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            match cua_engine_access::state(&name) {
+                Ok(Some(state)) => tool_ok(json!(state)),
+                Ok(None) => tool_err(format!("no state available for control {name:?}")),
+                Err(e) => tool_err(e),
+            }
+        }
         "invoke_control" => {
             let name = match required_str(args, "name") {
                 Ok(n) => n,
                 Err(e) => return e,
             };
+            // Prefer the accessibility Invoke pattern: no pointer movement and
+            // immune to overlapping windows.
+            match cua_engine_access::invoke(&name) {
+                Ok(Some(node)) => {
+                    return tool_ok(format!(
+                        "invoked {} \"{}\" via accessibility pattern",
+                        node.control_type, node.name
+                    ))
+                }
+                Ok(None) => {}
+                Err(e) => return tool_err(e),
+            }
             match cua_engine_access::find(&name, 400, 8) {
                 Ok(Some(node)) => {
                     let (x, y, w, h) = node.rect;
@@ -689,8 +734,29 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "set_control_text",
+            "description": "Set a control's text through its Value/EditableText accessibility pattern (no synthetic keystrokes). Use type_text when the control has no such pattern.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["name", "text"]
+            }
+        },
+        {
+            "name": "control_state",
+            "description": "Read a control's enabled/offscreen flags plus toggle, value, expanded and range values when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }
+        },
+        {
             "name": "invoke_control",
-            "description": "Find a control by accessible name and click its center.",
+            "description": "Invoke a control by accessible name (Invoke pattern first, click-center fallback).",
             "inputSchema": {
                 "type": "object",
                 "properties": { "name": { "type": "string" } },
@@ -883,6 +949,8 @@ mod tests {
         assert!(names.contains(&"clipboard_get".to_string()));
         assert!(names.contains(&"mouse_down".to_string()));
         assert!(names.contains(&"screen_info".to_string()));
+        assert!(names.contains(&"set_control_text".to_string()));
+        assert!(names.contains(&"control_state".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
     }
 }

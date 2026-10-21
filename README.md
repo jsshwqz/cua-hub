@@ -99,7 +99,7 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露 22 个工具：
+暴露 24 个工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -109,7 +109,9 @@ export OPENROUTER_API_KEY=sk-or-...
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
-| `find_control` / `invoke_control` | 按无障碍名称定位 / 点击控件 |
+| `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心 |
+| `set_control_text` | 用 Value/EditableText 模式直接设值（不模拟键盘） |
+| `control_state` | 读取启用/可见、勾选、文本值、展开状态、范围值 |
 | `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽 |
 | `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
 | `type_text` | 向焦点窗口输入任意 Unicode 文本 |
@@ -118,6 +120,9 @@ export OPENROUTER_API_KEY=sk-or-...
 | `key_down` / `key_up` | 按住/释放按键或组合键 |
 | `clipboard_get` / `clipboard_set` | 剪贴板文本读写（常驻实例） |
 | `screen_info` | 主屏尺寸、原点、DPI、光标位置 |
+
+控件名支持 `id:<AutomationId>` 形式，用于名称动态或为空的控件，例如
+Win32 编辑框 `id:15`、计算器按键 `id:num1Button`、结果显示 `id:CalculatorResults`。
 
 远程/容器内调用可以走 HTTP（streamable POST）：
 
