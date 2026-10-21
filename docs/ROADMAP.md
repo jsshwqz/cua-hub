@@ -41,7 +41,8 @@
 
 ## Phase 4 — Product
 
-- [ ] HTTP API + web console with live screen
+- [x] Web console: live screen preview, start/cancel jobs, hosts /mcp
+- [ ] Streaming video and operator takeover
 - [x] Run history and deterministic replay (`runs` / `replay`, MCP tools)
 - [ ] Fine-tune pipeline for a local model (replace API calls for hot paths)
 - [ ] SDK for Rust, Python, TypeScript

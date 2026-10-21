@@ -1,3 +1,5 @@
+mod console;
+mod jobs;
 mod mcp;
 mod orchestrator;
 mod replay;
@@ -189,6 +191,12 @@ enum Command {
         /// Replay only records with index < N.
         #[arg(long)]
         max_steps: Option<u32>,
+    },
+    /// Serve the local web console: live screen, jobs and cancellation.
+    Console {
+        /// Bind address. Loopback by default; remote binds need CUA_HUB_MCP_TOKEN.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
     },
     /// Speak MCP over stdio (or HTTP with --http) so other agents can drive
     /// this machine.
@@ -439,6 +447,10 @@ fn main() -> Result<()> {
             }))?;
             println!("{}", report.summary());
             Ok(())
+        }
+        Command::Console { bind } => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(console::serve(&bind))
         }
         Command::Serve { http } => {
             let runtime = tokio::runtime::Runtime::new()?;

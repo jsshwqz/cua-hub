@@ -258,6 +258,24 @@ The same hook is wired into `replay_run`.
 HTTP has no reverse channel, so `serve --http` keeps the hard block and callers
 must pass `allow_high: true` explicitly.
 
+### Web console
+
+`cua-hub console` serves a single-process control panel:
+
+* `GET /` — embedded HTML/JS (dark, two-column), polls `/frame.jpg` every
+  800ms and `/state` every 1s; no WebSocket/SSE yet
+* `GET /frame.jpg` — 1280px JPEG of the primary display
+* `GET /state` — screen size/DPI/cursor plus the job list
+* `POST /run` — start a task (same option parser as MCP `run_task`)
+* `POST /jobs/{id}/cancel` — abort a job
+* `POST /mcp` — the same MCP JSON-RPC handler, hosted in the console process so
+  agent-started jobs appear in the UI (jobs are in-process state; a separate
+  `serve --http` process has its own empty registry)
+
+Auth is the same `CUA_HUB_MCP_TOKEN` (query or bearer); loopback binds need no
+token. The console is view + start + cancel, not screen takeover: there is no
+input forwarding and no pause of an in-flight action.
+
 ### Async jobs
 
 `run_task` blocks for the whole run; `start_task` instead spawns it in the

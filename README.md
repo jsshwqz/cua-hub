@@ -82,7 +82,21 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划；`--retries/--max-replans` 控制恢复） |
 | `cua-hub runs` | 列出 `.runs` 下的历史运行（任务、结果、步数） |
 | `cua-hub replay <run_dir>` | 按 `steps.jsonl` 逐步重放（`--dry-run` 预览） |
+| `cua-hub console` | 本地 Web 控制台：实时画面、启动/取消任务（默认 `127.0.0.1:8787`） |
 | `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
+
+## Web 控制台
+
+```bash
+./target/release/cua-hub console --bind 127.0.0.1:8787
+# 打开 http://127.0.0.1:8787/
+```
+
+- 每 800ms 刷新主屏 JPEG，右下角显示分辨率、DPI、光标位置
+- 可直接输入任务并启动（可选 vision / code / browser 引擎）
+- 后台任务列表：状态、步数、摘要，可取消
+- 同一进程还挂载了 `/mcp`，Agent 通过它启动的任务会实时出现在面板里
+- 设置 `CUA_HUB_MCP_TOKEN` 后，页面与接口都需要 `?token=` 或 Bearer；非回环绑定必须设置 token
 
 ## MCP 接入
 
