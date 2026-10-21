@@ -6,13 +6,74 @@
 //! capture the screen, read the accessibility tree, find/invoke controls, and
 //! inject mouse/keyboard input.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use cua_core::{Action, EngineKind, Point};
 use serde_json::{json, Value};
 
 use crate::runner::{self, RunOptions};
+
+/// Background jobs created by `start_task`.
+struct Job {
+    task: String,
+    status: String,
+    run_dir: PathBuf,
+    summary: Option<String>,
+    success: Option<bool>,
+    steps: usize,
+    handle: tokio::task::AbortHandle,
+}
+
+fn jobs() -> &'static Mutex<HashMap<String, Job>> {
+    static JOBS: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_job_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn count_steps(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("steps.jsonl"))
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn run_options_from_args(args: &Value) -> std::result::Result<RunOptions, Value> {
+    let task = required_str(args, "task")?;
+    let engine = match args["engine"].as_str() {
+        Some("vision") => Some(EngineKind::Vision),
+        Some("code") => Some(EngineKind::Code),
+        Some("access") => Some(EngineKind::Access),
+        Some("browser") => Some(EngineKind::Browser),
+        _ => None,
+    };
+    Ok(RunOptions {
+        task,
+        max_steps: args["max_steps"].as_u64().unwrap_or(20) as u32,
+        yes: args["yes"].as_bool().unwrap_or(true),
+        allow_high: args["allow_high"].as_bool().unwrap_or(false),
+        dry_run: args["dry_run"].as_bool().unwrap_or(false),
+        engine,
+        provider: crate::runner::ProviderArg::Auto,
+        model: args["model"].as_str().map(str::to_string),
+        max_edge: args["max_edge"].as_u64().unwrap_or(1568) as u32,
+        run_dir: None,
+        settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
+        ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
+        browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
+    })
+}
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -217,32 +278,101 @@ fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
 
 async fn call_tool(name: &str, args: &Value) -> Value {
     match name {
-        "run_task" => {
-            let task = match required_str(args, "task") {
-                Ok(t) => t,
+        "start_task" => {
+            let mut opts = match run_options_from_args(args) {
+                Ok(o) => o,
                 Err(e) => return e,
             };
-            let engine = match args["engine"].as_str() {
-                Some("vision") => Some(EngineKind::Vision),
-                Some("code") => Some(EngineKind::Code),
-                Some("access") => Some(EngineKind::Access),
-                Some("browser") => Some(EngineKind::Browser),
-                _ => None,
+            let id = next_job_id();
+            let run_dir = crate::runner::default_run_dir().join(format!("job-{id}"));
+            opts.run_dir = Some(run_dir.clone());
+            let task = opts.task.clone();
+
+            let job_id = id.clone();
+            let handle = tokio::spawn(async move {
+                let result = runner::run_task(opts).await;
+                let mut guard = jobs().lock().expect("jobs lock");
+                if let Some(job) = guard.get_mut(&job_id) {
+                    match result {
+                        Ok(report) => {
+                            job.status = if report.is_success() {
+                                "completed".into()
+                            } else {
+                                "failed".into()
+                            };
+                            job.summary = Some(report.summary());
+                            job.success = Some(report.is_success());
+                            job.steps = report.steps;
+                        }
+                        Err(e) => {
+                            job.status = "failed".into();
+                            job.summary = Some(format!("error: {e}"));
+                            job.success = Some(false);
+                        }
+                    }
+                }
+            });
+            let abort = handle.abort_handle();
+
+            jobs().lock().expect("jobs lock").insert(
+                id.clone(),
+                Job {
+                    task,
+                    status: "running".into(),
+                    run_dir,
+                    summary: None,
+                    success: None,
+                    steps: 0,
+                    handle: abort,
+                },
+            );
+            tool_ok(json!({ "job_id": id, "status": "running" }))
+        }
+        "task_status" => {
+            let id = match required_str(args, "job_id") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let opts = RunOptions {
-                task,
-                max_steps: args["max_steps"].as_u64().unwrap_or(20) as u32,
-                yes: args["yes"].as_bool().unwrap_or(true),
-                allow_high: args["allow_high"].as_bool().unwrap_or(false),
-                dry_run: args["dry_run"].as_bool().unwrap_or(false),
-                engine,
-                provider: crate::runner::ProviderArg::Auto,
-                model: args["model"].as_str().map(str::to_string),
-                max_edge: args["max_edge"].as_u64().unwrap_or(1568) as u32,
-                run_dir: None,
-                settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
-                ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
-                browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
+            let mut guard = jobs().lock().expect("jobs lock");
+            let Some(job) = guard.get_mut(&id) else {
+                return tool_err(format!("unknown job: {id}"));
+            };
+            if job.status == "running" {
+                job.steps = count_steps(&job.run_dir);
+            }
+            tool_ok(json!({
+                "job_id": id,
+                "task": job.task,
+                "status": job.status,
+                "steps": job.steps,
+                "summary": job.summary,
+                "success": job.success,
+                "artifacts": job.run_dir.to_string_lossy(),
+            }))
+        }
+        "task_cancel" => {
+            let id = match required_str(args, "job_id") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let mut guard = jobs().lock().expect("jobs lock");
+            let Some(job) = guard.get_mut(&id) else {
+                return tool_err(format!("unknown job: {id}"));
+            };
+            if job.status == "running" {
+                job.handle.abort();
+                job.status = "cancelled".into();
+                job.summary = Some("cancelled by client".into());
+                job.success = Some(false);
+                tool_ok(json!({ "job_id": id, "status": "cancelled" }))
+            } else {
+                tool_ok(json!({ "job_id": id, "status": job.status }))
+            }
+        }
+        "run_task" => {
+            let opts = match run_options_from_args(args) {
+                Ok(o) => o,
+                Err(e) => return e,
             };
             match runner::run_task(opts).await {
                 Ok(report) => {
@@ -629,6 +759,43 @@ async fn call_tool(name: &str, args: &Value) -> Value {
 fn tool_defs() -> Value {
     json!([
         {
+            "name": "start_task",
+            "description": "Start a task in the background and return a job_id immediately. Poll with task_status; cancel with task_cancel. Arguments match run_task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "max_steps": { "type": "integer", "default": 20 },
+                    "dry_run": { "type": "boolean", "default": false },
+                    "engine": { "type": "string", "enum": ["vision", "code", "access", "browser"] },
+                    "model": { "type": "string" },
+                    "yes": { "type": "boolean", "default": true },
+                    "allow_high": { "type": "boolean", "default": false },
+                    "ui_tree": { "type": "boolean", "default": false },
+                    "settle_ms": { "type": "integer", "default": 600 }
+                },
+                "required": ["task"]
+            }
+        },
+        {
+            "name": "task_status",
+            "description": "Status of a background task: running/completed/failed/cancelled, step count, summary and artifacts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "job_id": { "type": "string" } },
+                "required": ["job_id"]
+            }
+        },
+        {
+            "name": "task_cancel",
+            "description": "Cancel a running background task. Abort is immediate and may interrupt an action already in flight.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "job_id": { "type": "string" } },
+                "required": ["job_id"]
+            }
+        },
+        {
             "name": "run_task",
             "description": "Run a natural-language task on this Windows desktop using the multi-engine agent (vision or code). Requires model credentials in the server environment. Returns a summary, success flag, step count and artifact directory.",
             "inputSchema": {
@@ -951,6 +1118,8 @@ mod tests {
         assert!(names.contains(&"screen_info".to_string()));
         assert!(names.contains(&"set_control_text".to_string()));
         assert!(names.contains(&"control_state".to_string()));
+        assert!(names.contains(&"start_task".to_string()));
+        assert!(names.contains(&"task_status".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
     }
 }

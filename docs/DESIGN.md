@@ -239,6 +239,20 @@ non-obvious constraints shaped the implementation:
 High-risk actions are never enabled by `run_task`'s default `yes`; they need
 `allow_high: true`, mirroring the CLI's `--allow-high` flag.
 
+### Async jobs
+
+`run_task` blocks for the whole run; `start_task` instead spawns it in the
+background and returns a `job_id` immediately. `task_status` reports
+running/completed/failed/cancelled, counts steps from the job's `steps.jsonl`,
+and returns the summary plus artifact path when done. `task_cancel` aborts the
+Tokio task.
+
+Jobs live in a process-wide `HashMap` for the lifetime of the server — they are
+not persisted across restarts. Abort is immediate: an action already handed to
+the input thread may still finish, and the browser engine relies on session Drop
+to kill Chromium. Use `run_task` when the caller can wait; use `start_task` for
+anything that may exceed a client's tool-call timeout.
+
 ### HTTP transport
 
 `serve --http 127.0.0.1:8765` reuses the same `handle_request` function as

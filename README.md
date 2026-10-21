@@ -100,11 +100,12 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露 24 个工具：
+暴露 27 个工具：
 
 | 工具 | 作用 |
 |------|------|
-| `run_task` | 自然语言任务（视觉/代码/浏览器引擎），返回摘要与产物路径 |
+| `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径 |
+| `start_task` / `task_status` / `task_cancel` | 后台任务：立即返回 job_id，可查进度、可取消 |
 | `browser_task` | 在隔离 Chromium 里执行网页任务（CDP） |
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
