@@ -556,6 +556,43 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Err(e) => tool_err(e),
             }
         }
+        "focus_window" => {
+            let selector = match required_str(args, "window") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let wanted_id = selector.parse::<u32>().ok();
+            let windows = if wanted_id.is_some() {
+                cua_io::list_windows(None, true)
+            } else {
+                cua_io::list_windows(Some(&selector), true)
+            };
+            match windows {
+                Ok(windows) => {
+                    let chosen = wanted_id
+                        .and_then(|id| windows.iter().find(|w| w.id == id))
+                        .or_else(|| {
+                            windows.iter().find(|w| {
+                                w.title.eq_ignore_ascii_case(&selector)
+                                    || w.app.eq_ignore_ascii_case(&selector)
+                            })
+                        })
+                        .or_else(|| windows.first());
+                    match chosen {
+                        Some(window) => match cua_engine_access::focus_window(window.id) {
+                            Ok(()) => tool_ok(json!({
+                                "id": window.id,
+                                "title": window.title,
+                                "app": window.app,
+                            })),
+                            Err(e) => tool_err(e),
+                        },
+                        None => tool_err(format!("no window matches `{selector}`")),
+                    }
+                }
+                Err(e) => tool_err(e),
+            }
+        }
         "accessibility_tree" => {
             let max_nodes = args["max_nodes"].as_u64().unwrap_or(120) as usize;
             let depth = args["depth"].as_u64().unwrap_or(2) as usize;
@@ -1046,6 +1083,17 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "focus_window",
+            "description": "Bring a window to the foreground by id or title/app. Call this before typing or clicking when another app may have stolen focus.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "string", "description": "Window id from list_windows, or a title/app substring" }
+                },
+                "required": ["window"]
+            }
+        },
+        {
             "name": "accessibility_tree",
             "description": "Return a text snapshot of the Windows accessibility tree (window titles, buttons, edits) with rectangles.",
             "inputSchema": {
@@ -1296,6 +1344,7 @@ mod tests {
         assert!(names.contains(&"capture_screen".to_string()));
         assert!(names.contains(&"list_windows".to_string()));
         assert!(names.contains(&"capture_window".to_string()));
+        assert!(names.contains(&"focus_window".to_string()));
         assert!(names.contains(&"invoke_element".to_string()));
         assert!(names.contains(&"set_element_value".to_string()));
         assert!(names.contains(&"list_runs".to_string()));

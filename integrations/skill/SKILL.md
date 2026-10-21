@@ -16,6 +16,7 @@ Perception
 - `capture_screen` — primary display as a JPEG plus dimensions.
 - `list_windows {query?, include_minimized?}` — top-level windows with id, app, title, bounds, focus state.
 - `capture_window {window, max_edge?, quality?}` — capture one window by id or title/app; sees content covered by other windows and returns `origin`/`image_scale` so `screen = origin + image * scale`.
+- `focus_window {window}` — bring a window to the foreground before typing or clicking when focus may have moved.
 - `screen_info` — screen size, origin, DPI, cursor position (use to validate coordinates).
 - `accessibility_tree {max_nodes?, depth?}` — UIA (Windows) / AT-SPI (Linux) tree with rects.
 - `find_control {name}` — locate by accessible name or `id:<AutomationId>`, returns rectangle and centre.

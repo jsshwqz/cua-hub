@@ -154,6 +154,50 @@ pub fn node_at(index: usize, max_nodes: usize, max_depth: usize) -> Result<Optio
         .find(|node| node.index == index))
 }
 
+/// Bring a top-level window to the foreground. Uses the foreground thread
+/// attachment trick because Windows blocks SetForegroundWindow from a
+/// background process otherwise.
+#[cfg(windows)]
+pub fn focus_window(id: u32) -> Result<()> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, ShowWindow,
+        SW_RESTORE,
+    };
+
+    if id == 0 {
+        return Err(cua_core::Error::Capture("invalid window id 0".into()));
+    }
+    unsafe {
+        let hwnd = HWND(id as *mut _);
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let current = GetCurrentThreadId();
+        let attached = AttachThreadInput(current, foreground_thread, true).as_bool();
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let focused = SetForegroundWindow(hwnd).as_bool();
+        if attached {
+            let _ = AttachThreadInput(current, foreground_thread, false);
+        }
+        if !focused {
+            return Err(cua_core::Error::Capture(format!(
+                "Windows refused to focus window {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn focus_window(_id: u32) -> Result<()> {
+    Err(cua_core::Error::InvalidAction(
+        "focus_window is only implemented on Windows".into(),
+    ))
+}
+
 /// Map a control-type id to a short readable name. UIA uses ids in the 50000
 /// range; AT-SPI roles are small integers (see `AtspiRole`).
 fn control_type_name(id: u32) -> &'static str {

@@ -114,7 +114,7 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露 31 个工具：
+暴露 32 个工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -126,6 +126,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `list_windows` | 列出可捕获的顶层窗口（标题、应用、坐标、焦点、最小化） |
 | `capture_window` | 按窗口截取（被其他窗口遮挡也能看到），返回原点/缩放用于坐标换算 |
+| `focus_window` | 按 id/标题把窗口带到前台；输入前防止焦点被别的应用抢走 |
 | `accessibility_tree` | 带编号的 UIA 树（窗口/按钮/输入框 + 矩形），编号可在下一次操作中引用 |
 | `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心 |
 | `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |

@@ -29,8 +29,8 @@
 - 主通道：`Python 控制台`（当前已打开，位于窗口底部）。
 - 窗口截图：`capture_window {window:"FreeCAD 1.1.3"}` 在 Qoder 盖住 FreeCAD 时
   仍能截到完整窗口，返回 `origin`、`image_scale`；点击坐标 = origin + 图坐标 × scale。
-- 输入：`type_text` 已修复 Shift 字符（大写、括号、引号）。每条命令后按 `Return`，
-  再截图或读回值确认。
+- 输入：先 `focus_window` 把 FreeCAD 带到前台，再点控制台输入行；`type_text` 已修复
+  Shift 字符（大写、括号、引号）。每条命令后按 `Return`，再截图或读回值确认。
 - 已验证的只读命令：
 
 ```python
@@ -43,6 +43,9 @@ print("WB", Gui.activeWorkbench().name())
 
 - 写操作规则：只允许新建临时文档 / 临时文件，禁止覆盖用户图纸；保存前确认路径；
   关闭临时文档时如果弹出保存询问，选择不保存。设备/产线相关操作不适用于 FreeCAD。
+- 2026-10-22 实测：新建未保存文档 `CUA_Probe_20261022`，添加 `Part::Box`，
+  重算后对象为 `[('Box', 'Part::Box')]`，体积 `999.9999999999998`（默认 10×10×10）；
+  结果写入 `D:/Temp/freecad_model_result.txt` 校验，未保存任何工程文件。
 - 下一步：对象树读取、临时文档建模、导出后校验；全部在只读/临时范围内完成。
 
 ## TIA Portal V14（已安装，未探测）
