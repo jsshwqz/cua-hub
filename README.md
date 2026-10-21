@@ -114,7 +114,7 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露 27 个工具：
+暴露 31 个工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -124,13 +124,16 @@ export OPENROUTER_API_KEY=sk-or-...
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
-| `accessibility_tree` | 可读的 UIA 树（窗口/按钮/输入框 + 矩形） |
+| `list_windows` | 列出可捕获的顶层窗口（标题、应用、坐标、焦点、最小化） |
+| `capture_window` | 按窗口截取（被其他窗口遮挡也能看到），返回原点/缩放用于坐标换算 |
+| `accessibility_tree` | 带编号的 UIA 树（窗口/按钮/输入框 + 矩形），编号可在下一次操作中引用 |
 | `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心 |
-| `set_control_text` | 用 Value/EditableText 模式直接设值（不模拟键盘） |
+| `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |
+| `set_control_text` / `set_element_value` | 用 Value/EditableText 模式按名称/编号直接设值（不模拟键盘） |
 | `control_state` | 读取启用/可见、勾选、文本值、展开状态、范围值 |
 | `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽 |
 | `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
-| `type_text` | 向焦点窗口输入任意 Unicode 文本 |
+| `type_text` | 向焦点窗口输入任意 Unicode 文本（自动处理 Shift 大写/括号） |
 | `key` | 发送按键组合（PageUp/PageDown/方向键/系统快捷键等） |
 | `mouse_down` / `mouse_up` | 按住/释放鼠标键（Shift 多选、Ctrl 拖拽） |
 | `key_down` / `key_up` | 按住/释放按键或组合键 |

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiNode {
+    /// Snapshot-scoped index, stable until the tree changes.
+    #[serde(default)]
+    pub index: usize,
     pub depth: usize,
     pub control_type: String,
     pub name: String,
@@ -46,6 +49,7 @@ impl UiSnapshot {
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for n in &self.nodes {
+            out.push_str(&format!("[{}] ", n.index));
             out.push_str(&"  ".repeat(n.depth));
             out.push_str(&n.control_type);
             if !n.name.is_empty() {
@@ -140,6 +144,14 @@ pub fn state(name: &str) -> Result<Option<ControlState>> {
     {
         atspi::state(name)
     }
+}
+
+/// Resolve a snapshot-scoped index to a node by taking a fresh snapshot.
+pub fn node_at(index: usize, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
+    Ok(snapshot(max_nodes, max_depth)?
+        .nodes
+        .into_iter()
+        .find(|node| node.index == index))
 }
 
 /// Map a control-type id to a short readable name. UIA uses ids in the 50000
@@ -239,7 +251,9 @@ mod imp {
     pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
         let mut nodes = Vec::new();
         let (truncated, _) = walk(max_nodes, max_depth, |node| {
-            nodes.push(node.clone());
+            let mut node = node.clone();
+            node.index = nodes.len();
+            nodes.push(node);
             false
         })?;
         Ok(UiSnapshot { nodes, truncated })
@@ -432,6 +446,7 @@ mod imp {
 
     fn element_to_node(el: &IUIAutomationElement) -> UiNode {
         UiNode {
+            index: 0,
             depth: 0,
             control_type: unsafe { el.CurrentControlType() }
                 .map(|id| control_type_name(id.0 as u32))
@@ -525,6 +540,7 @@ mod imp {
             if !(name.is_empty() && automation_id.is_empty() && rect.2 == 0) {
                 visited += 1;
                 let node = UiNode {
+                    index: 0,
                     depth,
                     control_type,
                     name,

@@ -329,6 +329,18 @@ fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
         .ok_or_else(|| tool_err(format!("missing string argument `{key}`")))
 }
 
+/// Turn an indexed accessibility node back into a selector understood by
+/// `invoke` / `set_value`. AutomationId wins because names are often dynamic.
+fn selector_for_node(node: &cua_engine_access::UiNode) -> Option<String> {
+    if !node.automation_id.is_empty() {
+        Some(format!("id:{}", node.automation_id))
+    } else if !node.name.is_empty() {
+        Some(node.name.clone())
+    } else {
+        None
+    }
+}
+
 async fn call_tool(name: &str, args: &Value) -> Value {
     match name {
         "start_task" => {
@@ -483,6 +495,67 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             }
             Err(e) => tool_err(e),
         },
+        "list_windows" => {
+            let query = args["query"].as_str();
+            let include_minimized = args["include_minimized"].as_bool().unwrap_or(false);
+            match cua_io::list_windows(query, include_minimized) {
+                Ok(windows) => tool_ok(json!({
+                    "count": windows.len(),
+                    "windows": windows
+                        .iter()
+                        .map(|w| json!({
+                            "id": w.id,
+                            "pid": w.pid,
+                            "app": w.app,
+                            "title": w.title,
+                            "x": w.x,
+                            "y": w.y,
+                            "width": w.width,
+                            "height": w.height,
+                            "minimized": w.minimized,
+                            "focused": w.focused,
+                        }))
+                        .collect::<Vec<_>>()
+                })),
+                Err(e) => tool_err(e),
+            }
+        }
+        "capture_window" => {
+            let selector = match required_str(args, "window") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let max_edge = args["max_edge"].as_u64().unwrap_or(1280) as u32;
+            let quality = args["quality"].as_u64().unwrap_or(75) as u8;
+            match cua_io::capture_window(&selector, max_edge, quality) {
+                Ok(cap) => {
+                    use base64::Engine as _;
+                    let data = base64::engine::general_purpose::STANDARD
+                        .encode(&cap.frame.observation.image);
+                    let meta = json!({
+                        "id": cap.info.id,
+                        "pid": cap.info.pid,
+                        "app": cap.info.app,
+                        "title": cap.info.title,
+                        "origin": { "x": cap.info.x, "y": cap.info.y },
+                        "window_size": { "width": cap.info.width, "height": cap.info.height },
+                        "model_size": {
+                            "width": cap.frame.observation.width,
+                            "height": cap.frame.observation.height
+                        },
+                        "physical": { "width": cap.frame.physical.0, "height": cap.frame.physical.1 },
+                        "image_scale": cap.frame.scale,
+                        "dpi": cap.frame.dpi,
+                        "mapping": "screen = origin + image * image_scale",
+                    });
+                    tool_ok(json!([
+                        { "type": "image", "data": data, "mimeType": cap.frame.observation.media_type },
+                        { "type": "text", "text": meta.to_string() }
+                    ]))
+                }
+                Err(e) => tool_err(e),
+            }
+        }
         "accessibility_tree" => {
             let max_nodes = args["max_nodes"].as_u64().unwrap_or(120) as usize;
             let depth = args["depth"].as_u64().unwrap_or(2) as usize;
@@ -538,6 +611,83 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             match cua_engine_access::state(&name) {
                 Ok(Some(state)) => tool_ok(json!(state)),
                 Ok(None) => tool_err(format!("no state available for control {name:?}")),
+                Err(e) => tool_err(e),
+            }
+        }
+        "invoke_element" => {
+            let index = args["index"].as_u64().unwrap_or(u64::MAX) as usize;
+            match cua_engine_access::node_at(index, 400, 8) {
+                Ok(Some(node)) => {
+                    let Some(selector) = selector_for_node(&node) else {
+                        return tool_err(format!(
+                            "control at index {index} has no accessible name or automation id"
+                        ));
+                    };
+                    match cua_engine_access::invoke(&selector) {
+                        Ok(Some(invoked)) => {
+                            return tool_ok(format!(
+                                "invoked {} \"{}\" via accessibility pattern",
+                                invoked.control_type, invoked.name
+                            ))
+                        }
+                        Ok(None) => {}
+                        Err(e) => return tool_err(e),
+                    }
+                    let (x, y, w, h) = node.rect;
+                    if w <= 0 || h <= 0 {
+                        return tool_err(format!(
+                            "control at index {index} has no usable rectangle"
+                        ));
+                    }
+                    let action = Action::Click {
+                        at: Point::new(x + w / 2, y + h / 2),
+                        button: cua_core::MouseButton::Left,
+                        double: false,
+                    };
+                    match cua_io::apply(&action, 1.0) {
+                        Ok(()) => tool_ok(format!(
+                            "clicked {} \"{}\" at ({},{})",
+                            node.control_type,
+                            node.name,
+                            x + w / 2,
+                            y + h / 2
+                        )),
+                        Err(e) => tool_err(e),
+                    }
+                }
+                Ok(None) => tool_err(format!(
+                    "no control at index {index}; re-read accessibility_tree"
+                )),
+                Err(e) => tool_err(e),
+            }
+        }
+        "set_element_value" => {
+            let index = args["index"].as_u64().unwrap_or(u64::MAX) as usize;
+            let text = match required_str(args, "text") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            match cua_engine_access::node_at(index, 400, 8) {
+                Ok(Some(node)) => {
+                    let Some(selector) = selector_for_node(&node) else {
+                        return tool_err(format!(
+                            "control at index {index} has no accessible name or automation id"
+                        ));
+                    };
+                    match cua_engine_access::set_value(&selector, &text) {
+                        Ok(Some(set)) => tool_ok(format!(
+                            "set {} \"{}\" via Value/EditableText",
+                            set.control_type, set.name
+                        )),
+                        Ok(None) => tool_err(format!(
+                            "control at index {index} has no Value/EditableText pattern; use type_text"
+                        )),
+                        Err(e) => tool_err(e),
+                    }
+                }
+                Ok(None) => tool_err(format!(
+                    "no control at index {index}; re-read accessibility_tree"
+                )),
                 Err(e) => tool_err(e),
             }
         }
@@ -872,6 +1022,30 @@ fn tool_defs() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "list_windows",
+            "description": "List capturable top-level windows with id, app, title, bounds and focused/minimized flags. Filter by a case-insensitive title/app substring.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Title or app substring" },
+                    "include_minimized": { "type": "boolean", "default": false }
+                }
+            }
+        },
+        {
+            "name": "capture_window",
+            "description": "Capture one window by id or title/app selector. Window-scoped capture still sees content covered by other windows; returns the origin and scale needed to map image coordinates back to the screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "string", "description": "Window id from list_windows, or a title/app substring" },
+                    "max_edge": { "type": "integer", "default": 1280 },
+                    "quality": { "type": "integer", "default": 75 }
+                },
+                "required": ["window"]
+            }
+        },
+        {
             "name": "accessibility_tree",
             "description": "Return a text snapshot of the Windows accessibility tree (window titles, buttons, edits) with rectangles.",
             "inputSchema": {
@@ -919,6 +1093,27 @@ fn tool_defs() -> Value {
                 "type": "object",
                 "properties": { "name": { "type": "string" } },
                 "required": ["name"]
+            }
+        },
+        {
+            "name": "invoke_element",
+            "description": "Invoke a control by its snapshot-scoped index from accessibility_tree (Invoke pattern first, click-center fallback). Re-read the tree first if the UI changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "index": { "type": "integer" } },
+                "required": ["index"]
+            }
+        },
+        {
+            "name": "set_element_value",
+            "description": "Set the text of a control by its snapshot-scoped index from accessibility_tree. Falls back to nothing if the control has no Value/EditableText pattern.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "index": { "type": "integer" },
+                    "text": { "type": "string" }
+                },
+                "required": ["index", "text"]
             }
         },
         {
@@ -1099,6 +1294,10 @@ mod tests {
         assert!(names.contains(&"orchestrate".to_string()));
         assert!(names.contains(&"browser_task".to_string()));
         assert!(names.contains(&"capture_screen".to_string()));
+        assert!(names.contains(&"list_windows".to_string()));
+        assert!(names.contains(&"capture_window".to_string()));
+        assert!(names.contains(&"invoke_element".to_string()));
+        assert!(names.contains(&"set_element_value".to_string()));
         assert!(names.contains(&"list_runs".to_string()));
         assert!(names.contains(&"replay_run".to_string()));
         assert!(names.contains(&"type_text".to_string()));

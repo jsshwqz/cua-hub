@@ -129,6 +129,7 @@ fn walk(
 
         visited += 1;
         let node = UiNode {
+            index: 0,
             depth,
             control_type: control_type_name(role).to_string(),
             name,
@@ -153,7 +154,9 @@ fn walk(
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     let mut nodes = Vec::new();
     let (truncated, _) = walk(max_nodes, max_depth, &mut |_, node, _, _| {
-        nodes.push(node.clone());
+        let mut node = node.clone();
+        node.index = nodes.len();
+        nodes.push(node);
         false
     })?;
     Ok(UiSnapshot { nodes, truncated })

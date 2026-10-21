@@ -65,18 +65,158 @@ pub fn capture_primary() -> Result<Captured> {
     })
 }
 
+/// A top-level window that can be captured independently of the desktop.
+#[derive(Debug, Clone)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub pid: u32,
+    pub app: String,
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub minimized: bool,
+    pub focused: bool,
+}
+
+/// A window capture plus its on-screen origin, so window-relative model
+/// coordinates can be translated back to absolute input coordinates.
+#[derive(Debug, Clone)]
+pub struct WindowCapture {
+    pub info: WindowInfo,
+    pub frame: Frame,
+}
+
+/// List capturable top-level windows, optionally filtered by a case-insensitive
+/// substring of the title or application name.
+pub fn list_windows(query: Option<&str>, include_minimized: bool) -> Result<Vec<WindowInfo>> {
+    let windows =
+        xcap::Window::all().map_err(|e| Error::Capture(format!("enumerate windows: {e}")))?;
+    let needle = query.map(str::to_lowercase);
+    let mut out = Vec::new();
+    for window in windows {
+        let title = window.title().unwrap_or_default();
+        let app = window.app_name().unwrap_or_default();
+        if title.is_empty() && app.is_empty() {
+            continue;
+        }
+        let minimized = window.is_minimized().unwrap_or(false);
+        if minimized && !include_minimized {
+            continue;
+        }
+        if let Some(needle) = &needle {
+            if !title.to_lowercase().contains(needle) && !app.to_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        out.push(WindowInfo {
+            id: window.id().unwrap_or(0),
+            pid: window.pid().unwrap_or(0),
+            app,
+            title,
+            x: window.x().unwrap_or(0),
+            y: window.y().unwrap_or(0),
+            width: window.width().unwrap_or(0),
+            height: window.height().unwrap_or(0),
+            minimized,
+            focused: window.is_focused().unwrap_or(false),
+        });
+    }
+    out.sort_by(|a, b| {
+        b.focused
+            .cmp(&a.focused)
+            .then_with(|| a.app.to_lowercase().cmp(&b.app.to_lowercase()))
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    Ok(out)
+}
+
+/// Capture one window by numeric id or by a case-insensitive title/app selector.
+/// The capture is window-scoped, so it still works when another window covers it
+/// (depending on the platform capture backend).
+pub fn capture_window(selector: &str, max_edge: u32, jpeg_quality: u8) -> Result<WindowCapture> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(Error::Capture("window selector is empty".into()));
+    }
+    let wanted_id = selector.parse::<u32>().ok();
+    let windows =
+        xcap::Window::all().map_err(|e| Error::Capture(format!("enumerate windows: {e}")))?;
+    let mut matches: Vec<_> = windows
+        .into_iter()
+        .filter(|window| {
+            let id_match = wanted_id.is_some_and(|id| window.id().ok() == Some(id));
+            let title = window.title().unwrap_or_default();
+            let app = window.app_name().unwrap_or_default();
+            id_match
+                || title.eq_ignore_ascii_case(selector)
+                || app.eq_ignore_ascii_case(selector)
+                || title.to_lowercase().contains(&selector.to_lowercase())
+                || app.to_lowercase().contains(&selector.to_lowercase())
+        })
+        .collect();
+    if matches.is_empty() {
+        return Err(Error::Capture(format!("no window matches `{selector}`")));
+    }
+    // Prefer an exact title, then the focused window, then the first match.
+    matches.sort_by_key(|window| {
+        let exact = window
+            .title()
+            .map(|t| !t.eq_ignore_ascii_case(selector))
+            .unwrap_or(true);
+        let focused = !window.is_focused().unwrap_or(false);
+        (exact, focused)
+    });
+    let window = matches.remove(0);
+    let info = WindowInfo {
+        id: window.id().unwrap_or(0),
+        pid: window.pid().unwrap_or(0),
+        app: window.app_name().unwrap_or_default(),
+        title: window.title().unwrap_or_default(),
+        x: window.x().unwrap_or(0),
+        y: window.y().unwrap_or(0),
+        width: window.width().unwrap_or(0),
+        height: window.height().unwrap_or(0),
+        minimized: window.is_minimized().unwrap_or(false),
+        focused: window.is_focused().unwrap_or(false),
+    };
+    if info.minimized {
+        return Err(Error::Capture(format!(
+            "window `{}` is minimized; restore it first",
+            info.title
+        )));
+    }
+    let image = window
+        .capture_image()
+        .map_err(|e| Error::Capture(format!("capture window `{}`: {e}", info.title)))?;
+    if image.width() == 0 || image.height() == 0 {
+        return Err(Error::Capture(format!(
+            "window `{}` returned an empty image",
+            info.title
+        )));
+    }
+    let frame = frame_from_image(image, max_edge, jpeg_quality, dpi_scale())?;
+    Ok(WindowCapture { info, frame })
+}
+
 /// Capture, downscale to `max_edge`, and encode both JPEG (for the model) and
 /// PNG (for the local run log).
 pub fn observe(max_edge: u32, jpeg_quality: u8) -> Result<Frame> {
     let captured = capture_primary()?;
-    let physical = (captured.width, captured.height);
     let dpi = if captured.scale_factor > 0.0 {
         captured.scale_factor
     } else {
         1.0
     };
-    let png = encode_png(&captured.image)?;
-    let (resized, scale) = fit_to(captured.image, max_edge);
+    frame_from_image(captured.image, max_edge, jpeg_quality, dpi)
+}
+
+fn frame_from_image(image: RgbaImage, max_edge: u32, jpeg_quality: u8, dpi: f32) -> Result<Frame> {
+    let physical = image.dimensions();
+    let dpi = if dpi > 0.0 { dpi } else { 1.0 };
+    let png = encode_png(&image)?;
+    let (resized, scale) = fit_to(image, max_edge);
     let (w, h) = resized.dimensions();
 
     let mut jpeg = Vec::new();
