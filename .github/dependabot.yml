@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # zbus 6 移除了 blocking-api，AT-SPI 适配层需改成 async 才能升级，先挡住主版本。
+    ignore:
+      - dependency-name: "zbus"
+        update-types: ["version-update:semver-major"]
+    groups:
+      runtime:
+        patterns: ["tokio*", "reqwest", "axum", "tower*"]
+      gui:
+        patterns: ["xcap", "enigo", "arboard", "image"]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

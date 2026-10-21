@@ -1,0 +1,42 @@
+name: Upstream watch
+
+on:
+  schedule:
+    # Mondays 09:00 Beijing time (01:00 UTC)
+    - cron: "0 1 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Compare upstreams
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/upstream_watch.mjs | tee upstream-report.md
+
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if grep -q "| update |" upstream-report.md; then
+            gh label create upstream --color FBCA04 --force >/dev/null 2>&1 || true
+            n=$(gh issue list --label upstream --state open --limit 1 --json number -q '.[0].number')
+            if [ -n "$n" ]; then
+              gh issue comment "$n" --body-file upstream-report.md
+            else
+              gh issue create --title "Upstream updates available" --label upstream --body-file upstream-report.md
+            fi
+          else
+            echo "no upstream updates"
+          fi

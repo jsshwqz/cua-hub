@@ -1,0 +1,24 @@
+{
+  "checked_at": "2026-10-21",
+  "github": [
+    { "repo": "modelcontextprotocol/modelcontextprotocol", "tag": "2026-07-28", "affects": "MCP 协议、工具 schema、传输" },
+    { "repo": "bytedance/UI-TARS-desktop", "tag": "v0.3.1", "affects": "本地视觉 Agent 参考实现" },
+    { "repo": "trycua/cua", "tag": "cua-sdk-v0.6.0", "affects": "VM 沙箱/CUA 基础设施" },
+    { "repo": "browser-use/browser-use", "tag": "0.13.13", "affects": "浏览器 Agent 策略" },
+    { "repo": "Skyvern-AI/skyvern", "tag": "v1.0.56", "affects": "网页工作流/表单" },
+    { "repo": "simular-ai/Agent-S", "tag": "v0.3.2", "affects": "桌面 Agent 策略与跑分" },
+    { "repo": "OthersideAI/self-operating-computer", "tag": "v1.5.8", "affects": "截图驱动 Agent 参考" },
+    { "repo": "anthropics/anthropic-sdk-python", "tag": "v1.17.0", "affects": "Anthropic Computer Use 工具 schema/beta" }
+  ],
+  "crates": [
+    { "name": "xcap", "version": "0.9.8", "affects": "屏幕捕获" },
+    { "name": "enigo", "version": "0.6.1", "affects": "鼠标键盘注入" },
+    { "name": "zbus", "version": "5.19.0", "affects": "Linux AT-SPI" },
+    { "name": "arboard", "version": "3.7.0", "affects": "剪贴板" },
+    { "name": "axum", "version": "0.8.9", "affects": "MCP HTTP / 控制台" },
+    { "name": "reqwest", "version": "0.13.5", "affects": "模型与 CDP HTTP" },
+    { "name": "tokio", "version": "1.54.0", "affects": "异步运行时" },
+    { "name": "image", "version": "0.25.10", "affects": "截图编码" },
+    { "name": "tokio-tungstenite", "version": "0.30.0", "affects": "CDP WebSocket" }
+  ]
+}
