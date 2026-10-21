@@ -13,14 +13,61 @@ use crate::cdp::{self, LaunchOptions, PageSummary};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BrowserAction {
-    Navigate { url: String },
-    Click { selector: String },
-    Type { selector: String, text: String },
-    Press { key: String },
-    Eval { script: String },
-    Wait { ms: u64 },
-    Done { summary: String },
-    Fail { reason: String },
+    Navigate {
+        url: String,
+    },
+    Click {
+        selector: String,
+    },
+    Type {
+        selector: String,
+        text: String,
+    },
+    Press {
+        key: String,
+    },
+    Eval {
+        script: String,
+    },
+    Wait {
+        ms: u64,
+    },
+    Scroll {
+        #[serde(default)]
+        dx: i32,
+        #[serde(default = "default_scroll")]
+        dy: i32,
+    },
+    WaitFor {
+        selector: String,
+        #[serde(default = "default_wait_ms")]
+        timeout_ms: u64,
+    },
+    TabList,
+    TabNew {
+        url: String,
+    },
+    TabSwitch {
+        index: usize,
+    },
+    TabClose {
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    Done {
+        summary: String,
+    },
+    Fail {
+        reason: String,
+    },
+}
+
+fn default_scroll() -> i32 {
+    600
+}
+
+fn default_wait_ms() -> u64 {
+    5000
 }
 
 impl BrowserAction {
@@ -38,6 +85,18 @@ impl BrowserAction {
                 format!("eval {preview}")
             }
             BrowserAction::Wait { ms } => format!("wait {ms}ms"),
+            BrowserAction::Scroll { dx, dy } => format!("scroll dx={dx} dy={dy}"),
+            BrowserAction::WaitFor {
+                selector,
+                timeout_ms,
+            } => format!("wait_for {selector} (≤{timeout_ms}ms)"),
+            BrowserAction::TabList => "tab_list".into(),
+            BrowserAction::TabNew { url } => format!("tab_new {url}"),
+            BrowserAction::TabSwitch { index } => format!("tab_switch {index}"),
+            BrowserAction::TabClose { index } => match index {
+                Some(i) => format!("tab_close {i}"),
+                None => "tab_close current".into(),
+            },
             BrowserAction::Done { summary } => format!("done: {summary}"),
             BrowserAction::Fail { reason } => format!("fail: {reason}"),
         }
@@ -137,6 +196,7 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
             url: String::new(),
             title: String::new(),
             text: String::new(),
+            ax: String::new(),
         });
         let shot = session.screenshot_jpeg(opts.screenshot_quality).await?;
         std::fs::write(run_dir.join(format!("browser-step-{index:02}.jpg")), &shot)?;
@@ -230,6 +290,46 @@ async fn execute(session: &mut cdp::BrowserSession, action: &BrowserAction) -> R
             tokio::time::sleep(Duration::from_millis(*ms)).await;
             Ok(format!("waited {ms}ms"))
         }
+        BrowserAction::Scroll { dx, dy } => {
+            session.scroll(*dx, *dy).await?;
+            Ok(format!("scrolled dx={dx} dy={dy}"))
+        }
+        BrowserAction::WaitFor {
+            selector,
+            timeout_ms,
+        } => {
+            let found = session.wait_for_selector(selector, *timeout_ms).await?;
+            Ok(if found {
+                format!("found {selector}")
+            } else {
+                format!("timeout waiting for {selector}")
+            })
+        }
+        BrowserAction::TabList => {
+            let tabs = session.list_tabs().await?;
+            let mut out = String::new();
+            for (i, tab) in tabs.iter().enumerate() {
+                out.push_str(&format!("{i}: {} — {}\n", tab.title, tab.url));
+            }
+            Ok(out.trim_end().to_string())
+        }
+        BrowserAction::TabNew { url } => {
+            session.new_tab(url).await?;
+            let s = session.page_summary().await?;
+            Ok(format!("opened tab {} ({})", s.url, s.title))
+        }
+        BrowserAction::TabSwitch { index } => {
+            session.switch_tab(*index).await?;
+            let s = session.page_summary().await?;
+            Ok(format!("tab {index}: {} ({})", s.url, s.title))
+        }
+        BrowserAction::TabClose { index } => {
+            session.close_tab(*index).await?;
+            Ok(format!(
+                "closed tab; {} remaining",
+                session.list_tabs().await?.len()
+            ))
+        }
         BrowserAction::Done { .. } | BrowserAction::Fail { .. } => Ok("terminal".into()),
     }
 }
@@ -268,10 +368,11 @@ async fn ask(
             .join("\n")
     };
     let user_text = format!(
-        "TASK: {task}\n\nURL: {}\nTITLE: {}\n\nPAGE TEXT (trimmed):\n{}\n\nRECENT STEPS:\n{}\n\nChoose one next action. JSON only.",
+        "TASK: {task}\n\nURL: {}\nTITLE: {}\n\nACCESSIBILITY TREE (trimmed):\n{}\n\nPAGE TEXT (trimmed):\n{}\n\nRECENT STEPS:\n{}\n\nChoose one next action. JSON only.",
         page.url,
         page.title,
-        page.text.chars().take(2500).collect::<String>(),
+        page.ax.chars().take(2500).collect::<String>(),
+        page.text.chars().take(2000).collect::<String>(),
         trail
     );
 
@@ -349,9 +450,16 @@ Actions:\n\
 {\"action\":\"press\",\"key\":\"Enter|Tab|Escape\"}\n\
 {\"action\":\"eval\",\"script\":\"JS expression returning JSON-able data\"}\n\
 {\"action\":\"wait\",\"ms\":1000}\n\
+{\"action\":\"scroll\",\"dy\":600}                 positive dy scrolls down\n\
+{\"action\":\"wait_for\",\"selector\":\"...\",\"timeout_ms\":5000}\n\
+{\"action\":\"tab_list\"}\n\
+{\"action\":\"tab_new\",\"url\":\"https://...\"}\n\
+{\"action\":\"tab_switch\",\"index\":0}\n\
+{\"action\":\"tab_close\",\"index\":0}            omit index to close current\n\
 {\"action\":\"done\",\"summary\":\"one line result\"}\n\
 {\"action\":\"fail\",\"reason\":\"...\"}\n\
-Rules: prefer `text=` selectors when you cannot see exact CSS. Use eval for reading data. \
+Rules: prefer `text=` selectors when you cannot see exact CSS. Selectors also match inside same-origin iframes. \
+Use the accessibility tree for roles/names; use eval for reading data. \
 Do not submit forms, purchase, or log in unless the task explicitly asks. \
 Never repeat a failing action more than twice. When the goal is reached, reply done."
 }
@@ -392,6 +500,22 @@ pub fn parse_browser_action(content: &str) -> Result<BrowserAction> {
         },
         "wait" => BrowserAction::Wait {
             ms: value["ms"].as_u64().unwrap_or(800),
+        },
+        "scroll" => BrowserAction::Scroll {
+            dx: value["dx"].as_i64().unwrap_or(0) as i32,
+            dy: value["dy"].as_i64().unwrap_or(default_scroll() as i64) as i32,
+        },
+        "wait_for" => BrowserAction::WaitFor {
+            selector: s("selector")?,
+            timeout_ms: value["timeout_ms"].as_u64().unwrap_or(default_wait_ms()),
+        },
+        "tab_list" => BrowserAction::TabList,
+        "tab_new" => BrowserAction::TabNew { url: s("url")? },
+        "tab_switch" => BrowserAction::TabSwitch {
+            index: value["index"].as_u64().unwrap_or(0) as usize,
+        },
+        "tab_close" => BrowserAction::TabClose {
+            index: value["index"].as_u64().map(|i| i as usize),
         },
         "done" => BrowserAction::Done {
             summary: value["summary"].as_str().unwrap_or("task complete").into(),
@@ -480,6 +604,31 @@ mod tests {
     fn parses_done_from_prose() {
         let a = parse_browser_action("Result: {\"action\":\"done\",\"summary\":\"ok\"}").unwrap();
         assert!(matches!(a, BrowserAction::Done { summary } if summary == "ok"));
+    }
+
+    #[test]
+    fn parses_scroll_and_wait_for() {
+        let a = parse_browser_action(r#"{"action":"scroll","dy":800}"#).unwrap();
+        assert!(matches!(a, BrowserAction::Scroll { dy: 800, .. }));
+        let b =
+            parse_browser_action(r#"{"action":"wait_for","selector":"main","timeout_ms":3000}"#)
+                .unwrap();
+        assert!(matches!(
+            b,
+            BrowserAction::WaitFor {
+                timeout_ms: 3000,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_tab_actions() {
+        let a =
+            parse_browser_action(r#"{"action":"tab_new","url":"https://example.com"}"#).unwrap();
+        assert!(matches!(a, BrowserAction::TabNew { .. }));
+        let b = parse_browser_action(r#"{"action":"tab_close"}"#).unwrap();
+        assert!(matches!(b, BrowserAction::TabClose { index: None }));
     }
 
     #[test]

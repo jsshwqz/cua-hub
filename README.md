@@ -15,7 +15,7 @@ Phase 2 进行中，Windows 真机验证：
 - **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
 - **无障碍树**：Windows UIA 与 Linux AT-SPI2 快照 + 按名查找（Linux 在 WSL/GTK3 真机验证）
 - **混合上下文**：`--ui-tree` 把浅层无障碍树与截图一起喂给视觉模型
-- **浏览器引擎**：自动拉起 Chrome/Edge（隔离临时 profile），CDP 驱动 navigate/click/type/eval，已真机跑通
+- **浏览器引擎**：隔离 profile 拉起 Chrome/Edge，CDP 驱动导航/点击/输入/滚动/等待/多标签；同源 iframe 内可定位；附带无障碍树作为模型上下文
 - **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步
 - **失败恢复**：同引擎带错误重试（自动加预算），仍失败则重新规划并换引擎，两条路径均已真机验证
 - **动作校验**：桌面动作后比对屏幕指纹，没变化会在步骤记录里提示模型换方法
@@ -27,7 +27,7 @@ Phase 2 进行中，Windows 真机验证：
 |------|----------|------|
 | Vision | 默认 / `--engine vision` | 未知 GUI、跨应用操作 |
 | Code | 任务含"命令/脚本/磁盘空间/进程列表…"或 `--engine code` | 确定性数据获取、批处理 |
-| Browser | 任务含 URL / "浏览器/网页"，或 `cua-hub browser` | 网页读取、点击、表单填写 |
+| Browser | 任务含 URL / "浏览器/网页"，或 `cua-hub browser` | 网页读取、点击、表单、滚动、多标签、同源 iframe |
 | Access | 计划中（当前提供快照） | 精确控件操作 |
 
 ## 快速开始

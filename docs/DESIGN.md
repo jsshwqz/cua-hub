@@ -140,9 +140,17 @@ unless `--headed` is given. It then talks CDP directly over WebSocket:
   each command has a 30s timeout
 * navigation polls `document.readyState` until `complete` (20s budget)
 * actions are `navigate`, `click` (CSS selector or `text=Visible label`),
-  `type`, `press`, `eval`, `wait`, `done`, `fail`
-* screenshots via `Page.captureScreenshot` are archived per step and sent to
-  the model together with URL, title and 2.5k chars of visible text
+  `type`, `press`, `eval`, `wait`, `scroll`, `wait_for`, `tab_list`,
+  `tab_new`, `tab_switch`, `tab_close`, `done`, `fail`
+* selectors also search same-origin iframes (`contentDocument`); cross-origin
+  frames are not reached without per-frame execution contexts
+* every step sends the model URL, title, a flattened CDP accessibility tree
+  (`Accessibility.getFullAXTree`, role/name, ≤120 lines) and 2k chars of text,
+  plus the screenshot
+* `wait_for` polls for a selector instead of sleeping a fixed time; `scroll`
+  dispatches a real mouse-wheel event at the viewport centre
+* tabs are managed over the DevTools HTTP endpoints and a fresh WebSocket per
+  target; closing the current tab reconnects to the first remaining page
 
 Security: `eval` executes model-generated JavaScript. The temporary profile has
 no user cookies or saved logins, and the prompt forbids submitting forms,
