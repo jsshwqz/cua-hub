@@ -208,10 +208,11 @@ powershell -ExecutionPolicy Bypass -File scripts\install-qoder.ps1
 
 - `dist\cua-hub.exe`（约 7MB）
 - `~/.qoder/skills/cua-hub/SKILL.md` 与 `~/.claude/skills/cua-hub/SKILL.md`
-- `~/.qoder/mcp.json` 增加 `cua-hub` 条目（原文件自动备份）
+- `~/.qoder/settings.json` 的 `mcpServers` 增加 `cua-hub` 条目（Qoder 桌面端读取此文件，
+  原文件自动备份）；`~/.qoder/mcp.json` 同步一份给 Qoder CLI
 
-重启 Qoder 后，新会话可直接让 Agent 调用 `capture_screen`、`accessibility_tree`、
-`set_control_text`、`browser_task` 等工具。模型密钥放在用户环境变量
+重启 Qoder 或新开一个会话后（当前会话不会热加载），Agent 可直接调用 `capture_screen`、
+`accessibility_tree`、`set_control_text`、`browser_task` 等工具。模型密钥放在用户环境变量
 （`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`），子进程会继承。
 
 细节见 [integrations/README.md](integrations/README.md)。

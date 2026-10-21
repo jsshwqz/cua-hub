@@ -22,13 +22,17 @@ Claude Code 用户可复制到 `~/.claude/skills/cua-hub/SKILL.md`。
 
 ## 3. 注册 MCP（stdio）
 
-`~/.qoder/mcp.json`：
+Qoder 桌面端读取 `~/.qoder/settings.json` 的 `mcpServers`；Qoder CLI 等客户端读取
+`~/.qoder/mcp.json`。`scripts/install-qoder.ps1` 会同时写入两个文件（均先备份）。
+
+`~/.qoder/settings.json`：
 
 ```json
 {
   "mcpServers": {
     "cua-hub": {
-      "command": "C:\\\\path\\\\to\\\\cua-hub\\\\dist\\\\cua-hub.exe",
+      "type": "stdio",
+      "command": "C:\\path\\to\\cua-hub\\dist\\cua-hub.exe",
       "args": ["serve"],
       "env": {
         "CUA_HUB_MODEL": "minimax/minimax-m3.1-flash:free"
@@ -38,10 +42,23 @@ Claude Code 用户可复制到 `~/.claude/skills/cua-hub/SKILL.md`。
 }
 ```
 
+`~/.qoder/mcp.json`（CLI 用，字段相同但不要求 `type`）：
+
+```json
+{
+  "mcpServers": {
+    "cua-hub": {
+      "command": "C:\\path\\to\\cua-hub\\dist\\cua-hub.exe",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
 模型密钥请放在用户环境变量里（`OPENROUTER_API_KEY` / `OPENAI_API_KEY` /
 `ANTHROPIC_API_KEY`），MCP 子进程会继承，不要把密钥写进仓库或配置文件。
 
-改完配置后重启 Qoder（或重载 MCP），新会话里应能看到 `cua-hub` 的工具。
+改完配置后重启 Qoder 或新开一个对话。MCP 工具在会话启动时注册，已经打开的对话不会热加载。
 
 ## 4. 另一种接法：HTTP
 

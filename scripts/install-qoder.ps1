@@ -32,18 +32,33 @@ if (Test-Path $claudeSkills) {
 }
 
 # MCP registration (merge, keep existing servers)
-$cfgPath = Join-Path $env:USERPROFILE '.qoder\mcp.json'
-if (Test-Path $cfgPath) {
-    Copy-Item $cfgPath "$cfgPath.bak-$(Get-Date -Format yyyyMMdd-HHmmss)" -Force
-    $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
-} else {
-    $cfg = [pscustomobject]@{}
+function Merge-McpServer($Path, $Entry) {
+    if (Test-Path $Path) {
+        Copy-Item $Path "$Path.bak-$(Get-Date -Format yyyyMMdd-HHmmss)" -Force
+        $raw = Get-Content $Path -Raw
+        $cfg = if ([string]::IsNullOrWhiteSpace($raw)) { [pscustomobject]@{} } else { $raw | ConvertFrom-Json }
+    } else {
+        $cfg = [pscustomobject]@{}
+    }
+    if (-not $cfg.PSObject.Properties['mcpServers']) {
+        $cfg | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{})
+    }
+    $cfg.mcpServers | Add-Member -NotePropertyName 'cua-hub' -NotePropertyValue $Entry -Force
+    $json = $cfg | ConvertTo-Json -Depth 100
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "mcp:    $Path"
 }
-if (-not $cfg.PSObject.Properties['mcpServers']) {
-    $cfg | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{})
+
+# Qoder desktop reads settings.json; the legacy mcp.json is kept for the CLI.
+$desktopCfg = Join-Path $env:USERPROFILE '.qoder\settings.json'
+$desktopEntry = [pscustomobject]@{
+    type = 'stdio'
+    command = $exe
+    args = @('serve')
+    env = [pscustomobject]@{}
 }
-$entry = [pscustomobject]@{ command = $exe; args = @('serve') }
-$cfg.mcpServers | Add-Member -NotePropertyName 'cua-hub' -NotePropertyValue $entry -Force
-$json = $cfg | ConvertTo-Json -Depth 10
-[System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "mcp:    $cfgPath (restart Qoder to load)"
+Merge-McpServer $desktopCfg $desktopEntry
+
+$cliCfg = Join-Path $env:USERPROFILE '.qoder\mcp.json'
+Merge-McpServer $cliCfg ([pscustomobject]@{ command = $exe; args = @('serve') })
+Write-Host "Restart Qoder or open a new conversation to load the tools."
