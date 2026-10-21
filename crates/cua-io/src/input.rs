@@ -61,15 +61,26 @@ pub fn apply(action: &Action, scale: f32) -> Result<()> {
                 .map_err(input_err)?;
         }
         Action::Type { text, interval_ms } => {
-            if *interval_ms > 0 {
-                for ch in text.chars() {
-                    enigo
-                        .key(Key::Unicode(ch), Direction::Click)
-                        .map_err(input_err)?;
-                    std::thread::sleep(Duration::from_millis(*interval_ms));
+            // Qt/FreeCAD and some industrial apps ignore Unicode key events for
+            // characters that need Shift (uppercase, (), {}, quotes...). Send
+            // those as an explicit Shift press + base key instead.
+            let delay = Duration::from_millis((*interval_ms).max(1));
+            let mut unicode = String::new();
+            for ch in text.chars() {
+                if ch.is_ascii() {
+                    if !unicode.is_empty() {
+                        enigo.text(&unicode).map_err(input_err)?;
+                        unicode.clear();
+                        std::thread::sleep(delay);
+                    }
+                    type_ascii_char(&mut enigo, ch)?;
+                    std::thread::sleep(delay);
+                } else {
+                    unicode.push(ch);
                 }
-            } else {
-                enigo.text(text).map_err(input_err)?;
+            }
+            if !unicode.is_empty() {
+                enigo.text(&unicode).map_err(input_err)?;
             }
         }
         Action::Key { combo } => key_combo(&mut enigo, combo)?,
@@ -141,6 +152,65 @@ pub fn key_state(combo: &str, down: bool) -> Result<()> {
     }
     for key in keys {
         enigo.key(key, direction).map_err(input_err)?;
+    }
+    Ok(())
+}
+
+/// Base key for ASCII characters that need Shift on a US layout.
+fn shifted_base(ch: char) -> Option<char> {
+    Some(match ch {
+        'A'..='Z' => ch.to_ascii_lowercase(),
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        '~' => '`',
+        _ => return None,
+    })
+}
+
+fn type_ascii_char(enigo: &mut Enigo, ch: char) -> Result<()> {
+    match ch {
+        '\n' | '\r' => {
+            enigo
+                .key(Key::Return, Direction::Click)
+                .map_err(input_err)?;
+            return Ok(());
+        }
+        '\t' => {
+            enigo.key(Key::Tab, Direction::Click).map_err(input_err)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    if let Some(base) = shifted_base(ch) {
+        enigo.key(Key::Shift, Direction::Press).map_err(input_err)?;
+        enigo
+            .key(Key::Unicode(base), Direction::Click)
+            .map_err(input_err)?;
+        enigo
+            .key(Key::Shift, Direction::Release)
+            .map_err(input_err)?;
+    } else {
+        enigo
+            .key(Key::Unicode(ch), Direction::Click)
+            .map_err(input_err)?;
     }
     Ok(())
 }
@@ -250,4 +320,22 @@ fn parse_key(name: &str) -> Option<Key> {
         }
     };
     Some(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shifted_base;
+
+    #[test]
+    fn maps_shifted_keys_but_not_plain_ones() {
+        assert_eq!(shifted_base('A'), Some('a'));
+        assert_eq!(shifted_base('Z'), Some('z'));
+        assert_eq!(shifted_base('('), Some('9'));
+        assert_eq!(shifted_base(')'), Some('0'));
+        assert_eq!(shifted_base('?'), Some('/'));
+        assert_eq!(shifted_base('"'), Some('\''));
+        assert_eq!(shifted_base('a'), None);
+        assert_eq!(shifted_base('1'), None);
+        assert_eq!(shifted_base(' '), None);
+    }
 }
