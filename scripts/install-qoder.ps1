@@ -13,7 +13,30 @@ if (-not $SkipBuild) {
 }
 
 $exe = Join-Path $dist 'cua-hub.exe'
-Copy-Item (Join-Path $Repo 'target\release\cua-hub.exe') $exe -Force
+$newExe = Join-Path $Repo 'target\release\cua-hub.exe'
+if (-not (Test-Path $newExe)) {
+    throw "release binary not found: $newExe (rerun without -SkipBuild)"
+}
+try {
+    Copy-Item $newExe $exe -Force
+} catch {
+    # A running MCP server keeps the old exe open. Renaming a running image is
+    # allowed on Windows, so the current session keeps working and the next one
+    # picks up the new binary; fall back to stopping it only if the rename fails.
+    $oldExe = "$exe.old-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    try {
+        Move-Item $exe $oldExe -Force
+        Copy-Item $newExe $exe -Force
+        Write-Host "binary: $exe (running copy renamed to $oldExe)"
+    } catch {
+        Get-Process cua-hub -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $exe } |
+            Stop-Process -Force
+        Start-Sleep -Milliseconds 500
+        Copy-Item $newExe $exe -Force
+        Write-Host "binary: $exe (stopped a running instance to replace it)"
+    }
+}
 Write-Host "binary: $exe"
 
 # Skill for Qoder
