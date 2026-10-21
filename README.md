@@ -158,17 +158,12 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 
 ## CI
 
-GitHub Actions 配置在 [`ci/github-actions-ci.yml`](ci/github-actions-ci.yml)
-（Windows + Ubuntu 双平台：fmt / clippy / test / release build）。当前 GitHub
-凭据没有 `workflow` 权限，无法直接写入 `.github/workflows/`。启用步骤：
+已启用：[`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在
+**Windows** 和 **Ubuntu 24.04** 上跑 fmt / clippy / test / release build，
+两条线均通过。`ci/github-actions-ci.yml` 是同一份配置的模板备份。
 
-```bash
-unset GITHUB_TOKEN          # 否则 gh 会拒绝 refresh
-gh auth refresh -h github.com -s workflow
-mkdir -p .github/workflows
-cp ci/github-actions-ci.yml .github/workflows/ci.yml
-git add .github && git commit -m "ci: enable workflow" && git push
-```
+Ubuntu 22.04 不可用：xcap 依赖的 libspa 0.10 需要较新的 pipewire 头文件；
+另外需要 `libgbm-dev` / `libdrm-dev` 才能完成链接。
 
 ## 架构
 
