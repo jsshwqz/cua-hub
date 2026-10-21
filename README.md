@@ -18,6 +18,7 @@ Phase 2 进行中，Windows 真机验证：
 - **浏览器引擎**：自动拉起 Chrome/Edge（隔离临时 profile），CDP 驱动 navigate/click/type/eval，已真机跑通
 - **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步
 - **失败恢复**：同引擎带错误重试（自动加预算），仍失败则重新规划并换引擎，两条路径均已真机验证
+- **动作校验**：桌面动作后比对屏幕指纹，没变化会在步骤记录里提示模型换方法
 - **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
 
 ## 引擎

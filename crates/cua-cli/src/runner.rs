@@ -254,6 +254,14 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             continue;
         }
 
+        // Cheap before/after fingerprint so a no-op click or typed key gets
+        // reported back to the model instead of silently "succeeding".
+        let before_hash = if vision_engine {
+            cua_io::screen_hash().ok()
+        } else {
+            None
+        };
+
         let result = tokio::task::spawn_blocking({
             let action = action.clone();
             let scale = frame.as_ref().map(|f| f.input_scale).unwrap_or(1.0);
@@ -263,15 +271,26 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
         .context("input task panicked")?;
 
         record.input_scale = frame.as_ref().map(|f| f.input_scale);
-        match result {
+        match &result {
             Ok(()) => record.note = Some("executed".into()),
             Err(e) => record.note = Some(format!("error: {e}")),
         }
+
+        tokio::time::sleep(Duration::from_millis(opts.settle_ms)).await;
+
+        if let (Ok(()), Some(before)) = (&result, before_hash) {
+            if let Ok(after) = cua_io::screen_hash() {
+                if after == before {
+                    record.note = Some(
+                        "executed, but the screen did not change; try a different approach".into(),
+                    );
+                }
+            }
+        }
+
         write_record(&mut log_file, &record)?;
         engine.on_action_result(&record).await;
         history.push(record);
-
-        tokio::time::sleep(Duration::from_millis(opts.settle_ms)).await;
     }
 
     let report = RunReport {

@@ -109,6 +109,29 @@ pub fn fit_to(image: RgbaImage, max_edge: u32) -> (RgbaImage, f32) {
     (resized, factor)
 }
 
+/// Cheap 8x8 average hash of the screen, used to tell whether an action
+/// changed anything. Coarse on purpose: identical hashes mean a static screen.
+pub fn screen_hash() -> Result<u64> {
+    let captured = capture_primary()?;
+    Ok(average_hash(&captured.image))
+}
+
+fn average_hash(image: &RgbaImage) -> u64 {
+    let small = image::imageops::resize(image, 8, 8, image::imageops::FilterType::Triangle);
+    let luma: Vec<u32> = small
+        .pixels()
+        .map(|p| (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000)
+        .collect();
+    let avg = luma.iter().sum::<u32>() / luma.len().max(1) as u32;
+    let mut hash = 0u64;
+    for (i, value) in luma.iter().enumerate().take(64) {
+        if *value >= avg {
+            hash |= 1 << i;
+        }
+    }
+    hash
+}
+
 /// Encode a screenshot as PNG (lossless, for local logs).
 pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -119,4 +142,29 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
         )
         .map_err(|e| Error::Capture(format!("png encode: {e}")))?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgba;
+
+    #[test]
+    fn identical_images_hash_equal() {
+        let a = RgbaImage::from_pixel(16, 16, Rgba([10, 20, 30, 255]));
+        let b = a.clone();
+        assert_eq!(average_hash(&a), average_hash(&b));
+    }
+
+    #[test]
+    fn different_images_hash_differ() {
+        let a = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 255]));
+        let mut b = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 255]));
+        for x in 0..8 {
+            for y in 0..8 {
+                b.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        assert_ne!(average_hash(&a), average_hash(&b));
+    }
 }

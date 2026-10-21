@@ -252,6 +252,20 @@ stays open). Non-loopback binds are refused unless a token is set, or
 `CUA_HUB_ALLOW_REMOTE=1` acknowledges that an authenticating proxy sits in
 front. Without one, every tool here can control the machine.
 
+## Action verification
+
+A mutating desktop action can "succeed" while doing nothing (clicked a blank
+area, keystroke went nowhere). After each action the runner captures an 8x8
+average hash of the screen (one cheap capture + resize) and compares it with the
+pre-action hash. If they match, the step note becomes
+`executed, but the screen did not change; try a different approach`, which both
+vision engines feed back to the model on the next turn.
+
+It is deliberately coarse and advisory: animations, cursor-only moves and
+non-visual side effects can produce false negatives/positives, and code/browser
+runs skip it entirely. It exists to break the common "repeat the same dead
+click" loop, not to be a correctness oracle.
+
 ## Accessibility actions
 
 `cua-engine-access` no longer stops at rectangles:
