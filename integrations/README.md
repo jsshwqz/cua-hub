@@ -58,7 +58,8 @@ Qoder 桌面端读取 `~/.qoder/settings.json` 的 `mcpServers`；Qoder CLI 等�
 模型密钥请放在用户环境变量里（`OPENROUTER_API_KEY` / `OPENAI_API_KEY` /
 `ANTHROPIC_API_KEY`），MCP 子进程会继承，不要把密钥写进仓库或配置文件。
 
-改完配置后重启 Qoder 或新开一个对话。MCP 工具在会话启动时注册，已经打开的对话不会热加载。
+改完配置后重启 Qoder 或新开一个对话。MCP 工具在会话启动/刷新时注册；如果当前对话
+暂时看不到新服务器，新开一个对话即可（实测有时下一次对话刷新才会出现）。
 
 ## 4. 另一种接法：HTTP
 
