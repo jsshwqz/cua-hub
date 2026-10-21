@@ -70,13 +70,15 @@ fn read_outcome(dir: &Path) -> (String, String, u64) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReplayOptions {
     pub dir: PathBuf,
     pub dry_run: bool,
     pub yes: bool,
     pub allow_high: bool,
     pub max_steps: Option<u32>,
+    /// High-risk approval hook (MCP elicitation); `None` keeps the CLI gate.
+    pub approver: Option<runner::Approver>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +160,7 @@ pub async fn replay(opts: ReplayOptions) -> Result<ReplayReport> {
             continue;
         }
 
-        if !runner::confirm(action, opts.yes, opts.allow_high)? {
+        if !runner::confirm(action, opts.yes, opts.allow_high, opts.approver.as_ref()).await? {
             skipped += 1;
             continue;
         }

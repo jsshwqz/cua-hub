@@ -149,6 +149,12 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 
 本地协议冒烟测试：`node scripts/mcp_smoke.mjs`。
 
+**高危动作确认（stdio）**：支持 MCP elicitation 的客户端会收到
+`elicitation/create` 请求，对删除/格式化/关机类动作逐次批准或拒绝；
+客户端不支持或 60 秒未响应，按拒绝处理。HTTP 模式没有反向通道，高危动作
+仍直接阻断，需要显式 `allow_high: true`。验证脚本：
+`node scripts/mcp_elicit_test.mjs`。
+
 ## 每次运行的产物
 
 `.runs/<时间戳>/` 下包含 `steps.jsonl`（每步动作与结果）、`step-NN.png`

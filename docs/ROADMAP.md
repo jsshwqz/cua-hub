@@ -36,7 +36,8 @@
 - [x] MCP server over stdio exposing run_task / capture / tree / find / invoke
 - [x] MCP over HTTP (loopback-only by default)
 - [x] Async background jobs (start_task / task_status / task_cancel)
-- [ ] Hosted elicitation/confirmation for high-risk actions
+- [x] MCP elicitation for high-risk actions over stdio (accept/decline verified)
+- [ ] HTTP-side confirmation channel
 
 ## Phase 4 — Product
 

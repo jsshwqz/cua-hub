@@ -335,6 +335,7 @@ fn main() -> Result<()> {
                 settle_ms,
                 ui_tree,
                 browser_headed,
+                approver: None,
             }))?;
             if !report.is_success() {
                 bail!("{}", report.summary());
@@ -434,6 +435,7 @@ fn main() -> Result<()> {
                 yes,
                 allow_high,
                 max_steps,
+                approver: None,
             }))?;
             println!("{}", report.summary());
             Ok(())

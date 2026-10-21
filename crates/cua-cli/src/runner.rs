@@ -12,6 +12,13 @@ use cua_engine_vision::{AnthropicConfig, OpenAiConfig, OpenAiVisionEngine, Visio
 use cua_router::{Router, RuleRouter};
 use tracing::{info, warn};
 
+/// Async approval hook for high-risk actions (used by MCP elicitation).
+pub type Approver = std::sync::Arc<
+    dyn Fn(Action) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum EngineArg {
     Vision,
@@ -41,7 +48,7 @@ pub enum ProviderArg {
     Openai,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunOptions {
     pub task: String,
     pub max_steps: u32,
@@ -59,6 +66,9 @@ pub struct RunOptions {
     pub ui_tree: bool,
     /// Show the browser window instead of headless mode.
     pub browser_headed: bool,
+    /// Optional async approval hook used instead of `allow_high` when a
+    /// high-risk action appears (MCP stdio wires this to elicitation).
+    pub approver: Option<Approver>,
 }
 
 impl Default for RunOptions {
@@ -77,6 +87,7 @@ impl Default for RunOptions {
             settle_ms: 600,
             ui_tree: false,
             browser_headed: false,
+            approver: None,
         }
     }
 }
@@ -235,7 +246,7 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             break;
         }
 
-        if !confirm(&action, opts.yes, opts.allow_high)? {
+        if !confirm(&action, opts.yes, opts.allow_high, opts.approver.as_ref()).await? {
             record.note = Some("skipped: user declined".into());
             write_record(&mut log_file, &record)?;
             outcome = Outcome::Failed("action declined by user".into());
@@ -352,9 +363,20 @@ fn build_engine(
     }
 }
 
-pub fn confirm(action: &Action, yes: bool, allow_high: bool) -> Result<bool> {
+pub async fn confirm(
+    action: &Action,
+    yes: bool,
+    allow_high: bool,
+    approver: Option<&Approver>,
+) -> Result<bool> {
     let risk = action.risk();
     if risk == Risk::High && !allow_high {
+        if let Some(approve) = approver {
+            if approve(action.clone()).await {
+                return Ok(true);
+            }
+            bail!("high-risk action declined by client: {}", describe(action));
+        }
         bail!(
             "high-risk action blocked: {}. Re-run with --allow-high / allow_high=true if intended",
             describe(action)

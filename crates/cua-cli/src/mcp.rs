@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use cua_core::{Action, EngineKind, Point};
@@ -43,6 +43,90 @@ fn next_job_id() -> String {
     )
 }
 
+/// Server-initiated elicitation over stdio. Clients that support MCP
+/// elicitation answer `elicitation/create`; others simply never respond and the
+/// action is treated as declined after a timeout.
+#[derive(Clone)]
+struct Elicitor {
+    pending: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>,
+    counter: Arc<AtomicU64>,
+}
+
+impl Elicitor {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    async fn ask(&self, message: &str) -> Option<bool> {
+        let id = format!("elicit-{}", self.counter.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .insert(id.clone(), tx);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "elicitation/create",
+            "params": {
+                "message": message,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "approve": {
+                            "type": "boolean",
+                            "title": "Approve",
+                            "description": "Allow this high-risk action"
+                        }
+                    },
+                    "required": ["approve"]
+                }
+            }
+        });
+        if write_msg(&request).is_err() {
+            self.pending.lock().expect("pending lock").remove(&id);
+            return None;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+            Ok(Ok(resp)) => {
+                let action = resp["result"]["action"].as_str().unwrap_or_default();
+                let approve = resp["result"]["content"]["approve"]
+                    .as_bool()
+                    .unwrap_or(false);
+                Some(action == "accept" && approve)
+            }
+            _ => {
+                self.pending.lock().expect("pending lock").remove(&id);
+                None
+            }
+        }
+    }
+}
+
+fn elicitor() -> &'static OnceLock<Elicitor> {
+    static ELICITOR: OnceLock<Elicitor> = OnceLock::new();
+    &ELICITOR
+}
+
+fn approver_from_elicitor() -> Option<runner::Approver> {
+    let elicitor = elicitor().get()?.clone();
+    Some(Arc::new(move |action| {
+        let elicitor = elicitor.clone();
+        Box::pin(async move {
+            let description = runner::describe(&action);
+            elicitor
+                .ask(&format!("Approve high-risk action? {description}"))
+                .await
+                .unwrap_or(false)
+        })
+    }))
+}
+
 fn count_steps(dir: &std::path::Path) -> usize {
     std::fs::read_to_string(dir.join("steps.jsonl"))
         .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
@@ -72,45 +156,46 @@ fn run_options_from_args(args: &Value) -> std::result::Result<RunOptions, Value>
         settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
         ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
         browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
+        approver: approver_from_elicitor(),
     })
 }
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 pub async fn serve() -> Result<()> {
+    let server_elicitor = Elicitor::new();
+    let _ = elicitor().set(server_elicitor.clone());
+
     // Read stdin on a dedicated blocking thread: tokio's stdin on Windows does
     // not reliably wake for messages that arrive after the first read while
     // the pipe stays open (verified with an MCP client: requests 1-2 answered,
     // request 3 hung until EOF).
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    //
+    // Responses to server-initiated elicitation are dispatched straight to the
+    // waiting oneshot from this thread; routing them through the request loop
+    // would deadlock while a tool call awaits approval.
+    let pending = server_elicitor.pending.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
-                        break;
-                    }
+            let Ok(line) = line else { break };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("method").is_some() {
+                if tx.send(value).is_err() {
+                    break;
                 }
-                Err(_) => break,
+            } else if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                if let Some(sender) = pending.lock().expect("pending lock").remove(id) {
+                    let _ = sender.send(value);
+                }
             }
         }
     });
 
-    while let Some(line) = rx.recv().await {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                let resp = error_response(Value::Null, -32700, &format!("parse error: {e}"));
-                write_msg(&resp)?;
-                continue;
-            }
-        };
-
+    while let Some(request) = rx.recv().await {
         if request["method"].as_str() == Some("shutdown") {
             if let Some(id) = request.get("id").cloned() {
                 write_msg(&success_response(id, json!({})))?;
@@ -465,6 +550,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 yes: args["yes"].as_bool().unwrap_or(false),
                 allow_high: args["allow_high"].as_bool().unwrap_or(false),
                 max_steps: args["max_steps"].as_u64().map(|n| n as u32),
+                approver: approver_from_elicitor(),
             };
             match crate::replay::replay(opts).await {
                 Ok(report) => tool_ok(json!({

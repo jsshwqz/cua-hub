@@ -247,6 +247,17 @@ non-obvious constraints shaped the implementation:
 High-risk actions are never enabled by `run_task`'s default `yes`; they need
 `allow_high: true`, mirroring the CLI's `--allow-high` flag.
 
+Over stdio the server can instead ask the client: a high-risk action triggers an
+`elicitation/create` request (a boolean `approve` field) and waits up to 60s.
+Only `action: "accept"` with `approve: true` lets it run; decline, timeout or a
+client that ignores elicitation all count as refusal. Responses are dispatched
+on the stdin reader thread straight to the waiting oneshot — routing them
+through the request loop would deadlock while a tool call is awaiting approval.
+The same hook is wired into `replay_run`.
+
+HTTP has no reverse channel, so `serve --http` keeps the hard block and callers
+must pass `allow_high: true` explicitly.
+
 ### Async jobs
 
 `run_task` blocks for the whole run; `start_task` instead spawns it in the

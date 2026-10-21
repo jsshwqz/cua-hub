@@ -320,6 +320,7 @@ async fn execute_step(
                 settle_ms: 600,
                 ui_tree: false,
                 browser_headed: opts.headed,
+                approver: None,
             })
             .await?;
             let ok = report.is_success();
