@@ -235,7 +235,8 @@ cua-cli  ->  cua-router  ->  cua-engine-vision (Anthropic / OpenAI-compatible)
 
 细节见 [docs/DESIGN.md](docs/DESIGN.md)，路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)，
 仓库内各版本对照见 [docs/VERSIONS.md](docs/VERSIONS.md)，上游升级流程见
-[docs/UPGRADING.md](docs/UPGRADING.md)。
+[docs/UPGRADING.md](docs/UPGRADING.md)，工业软件适配见
+[docs/INDUSTRIAL.md](docs/INDUSTRIAL.md)。
 
 ## 许可证
 
