@@ -23,14 +23,24 @@
 
 ## FreeCAD 1.1.3（已实测）
 
-- 路径：`E:\Program Files\FreeCAD 1.1\bin\freecad.exe`
+- 路径：`E:\Program Files\FreeCAD 1.1\bin\freecad.exe`；建议 `--safe-mode` 启动，
+  否则第三方工作台（如 AionBridge）会在启动时弹错。
 - 窗口：标题 `FreeCAD 1.1.3`；`list_windows {query:"FreeCAD"}` 可定位。
-- 无障碍：UIA 只暴露主窗口，没有子控件。不要指望按钮名，走 Python 控制台。
-- 主通道：`Python 控制台`（当前已打开，位于窗口底部）。
-- 窗口截图：`capture_window {window:"FreeCAD 1.1.3"}` 在 Qoder 盖住 FreeCAD 时
-  仍能截到完整窗口，返回 `origin`、`image_scale`；点击坐标 = origin + 图坐标 × scale。
-- 输入：优先用 `window_input` 在一次调用里完成“聚焦 → 点控制台输入行 → 输入 → 回车”，
+- 观测：先 `window_state {window, include_text:true}`。Qt 应用能给出工具栏/面板/
+  对话框的元素索引，就用 `click {observation_id, element_index}`，不要再用像素。
+- 窗口截图：`capture_window` 走窗口自身表面，被其他窗口盖住也能拿到整窗，
+  返回 `source`、`origin`、`image_scale`、`hash`；坐标换算由服务端完成，
+  调用方不要再自己加 origin 或除 DPI。
+- 输入：优先 `window_input` 在一次调用里完成“聚焦 → 点控制台输入行 → 输入 → 回车”，
   避免多次调用之间焦点被别的应用抢走；`type_text` 已修复 Shift 字符。
+- 已踩过的坑（修复前请当作事实）：
+  - 进程不声明 DPI 感知时，UIA/`GetWindowRect` 给逻辑像素、截图给物理像素，
+    点击会整体偏移；现在启动即 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`。
+  - 注入点击必须 move→稳定→press→保持→release，否则 Qt 会按上一次的光标位置命中。
+  - 草图编辑器里点中轴线/图元可能直接退出编辑；先 `window_state` 确认状态再动作。
+  - 对话框内的属性输入框里按回车可能触发默认按钮（例如“创建”），需要提交时用 Tab。
+  - 菜单/对话框是独立窗口：目标窗口的像素不会因菜单弹出而变化，
+    要用 `wait_for_change`（它会把同进程弹层一起算进哈希）。
 - 已验证的只读命令：
 
 ```python

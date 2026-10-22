@@ -44,6 +44,36 @@ pub struct ControlState {
     pub range_value: Option<f64>,
 }
 
+/// Snapshot the control tree rooted at one window, so indexes are scoped to the
+/// window the caller is about to act on rather than the whole desktop.
+pub fn snapshot_window(id: u32, max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
+    #[cfg(windows)]
+    {
+        imp::snapshot_window(id, max_nodes, max_depth)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (id, max_nodes, max_depth);
+        Err(cua_core::Error::InvalidAction(
+            "window-scoped accessibility is only implemented on Windows".into(),
+        ))
+    }
+}
+
+/// The control that currently owns keyboard focus, if any. Typing into the
+/// wrong surface is the most common automation mistake, so callers are expected
+/// to check this before sending text.
+pub fn focused_element() -> Result<Option<UiNode>> {
+    #[cfg(windows)]
+    {
+        imp::focused()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
+}
+
 impl UiSnapshot {
     /// Compact prompt-friendly text, one node per line.
     pub fn to_text(&self) -> String {
@@ -192,17 +222,39 @@ pub fn focus_window(id: u32) -> Result<()> {
         if attached {
             let _ = AttachThreadInput(current, foreground_thread, false);
         }
-        if GetForegroundWindow() != hwnd {
-            // Last resort for windows that refuse plain activation.
-            SwitchToThisWindow(hwnd, true);
+        if wait_for_foreground(hwnd, 300) {
+            return Ok(());
         }
-        if GetForegroundWindow() != hwnd {
-            return Err(cua_core::Error::Capture(format!(
-                "Windows refused to focus window {id}"
-            )));
+        // Last resort for windows that refuse plain activation.
+        SwitchToThisWindow(hwnd, true);
+        if wait_for_foreground(hwnd, 500) {
+            return Ok(());
         }
+        return Err(cua_core::Error::Capture(format!(
+            "Windows refused to focus window {id}"
+        )));
     }
+    #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Activation is asynchronous: the OS may report the new foreground window a
+/// few frames after SetForegroundWindow returns. Poll instead of trusting the
+/// instant, because input sent to a window that never came forward lands
+/// somewhere else.
+#[cfg(windows)]
+fn wait_for_foreground(hwnd: windows::Win32::Foundation::HWND, timeout_ms: u64) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if unsafe { GetForegroundWindow() } == hwnd {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
 }
 
 #[cfg(not(windows))]
@@ -307,14 +359,35 @@ mod imp {
     use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomationElement};
 
     pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
+        walk_snapshot(Root::Desktop, max_nodes, max_depth)
+    }
+
+    pub fn snapshot_window(id: u32, max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
+        walk_snapshot(Root::Window(id), max_nodes, max_depth)
+    }
+
+    fn walk_snapshot(root: Root, max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
         let mut nodes = Vec::new();
-        let (truncated, _) = walk(max_nodes, max_depth, |node| {
+        let (truncated, _) = walk(root, max_nodes, max_depth, |node| {
             let mut node = node.clone();
             node.index = nodes.len();
             nodes.push(node);
             false
         })?;
         Ok(UiSnapshot { nodes, truncated })
+    }
+
+    /// The element that owns keyboard focus right now.
+    pub fn focused() -> Result<Option<UiNode>> {
+        use windows::Win32::UI::Accessibility::IUIAutomation;
+
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
+        Ok(unsafe { automation.GetFocusedElement() }
+            .ok()
+            .map(|el| element_to_node(&el)))
     }
 
     pub fn find(name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
@@ -522,8 +595,15 @@ mod imp {
         }
     }
 
+    /// What the walk should be rooted at.
+    enum Root {
+        Desktop,
+        Window(u32),
+    }
+
     /// Depth-first walk in document order. `visit` returns true to stop early.
     fn walk(
+        root_kind: Root,
         max_nodes: usize,
         max_depth: usize,
         mut visit: impl FnMut(&UiNode) -> bool,
@@ -556,8 +636,16 @@ mod imp {
                 .map_err(|e| Error::Capture(format!("UIA cache setup: {e}")))?;
         }
 
-        let root = unsafe { automation.GetRootElementBuildCache(&cache) }
-            .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
+        let root = match root_kind {
+            Root::Desktop => unsafe { automation.GetRootElementBuildCache(&cache) },
+            Root::Window(id) => unsafe {
+                automation.ElementFromHandleBuildCache(
+                    windows::Win32::Foundation::HWND(id as *mut _),
+                    &cache,
+                )
+            },
+        }
+        .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
 
         let mut visited = 0usize;
         let mut truncated = false;

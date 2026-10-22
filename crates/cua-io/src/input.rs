@@ -35,12 +35,17 @@ pub fn apply(action: &Action, scale: f32) -> Result<()> {
         Action::Click { at, button, double } => {
             let (x, y) = phys(*at, scale);
             enigo.move_mouse(x, y, Coordinate::Abs).map_err(input_err)?;
+            // Win32/Qt hit-testing can act on the pointer position from the
+            // previous event when the button arrives in the same tick, which
+            // shows up as "the click landed where the cursor used to be". Give
+            // the move a frame to be processed before pressing.
+            std::thread::sleep(Duration::from_millis(25));
             let btn = map_button(*button);
             if *double {
-                enigo.button(btn, Direction::Click).map_err(input_err)?;
+                press_release(&mut enigo, btn, 40)?;
                 std::thread::sleep(Duration::from_millis(60));
             }
-            enigo.button(btn, Direction::Click).map_err(input_err)?;
+            press_release(&mut enigo, btn, 40)?;
         }
         Action::Drag { from, to } => {
             let (x1, y1) = phys(*from, scale);
@@ -228,6 +233,18 @@ fn map_button(b: cua_core::MouseButton) -> Button {
         cua_core::MouseButton::Right => Button::Right,
         cua_core::MouseButton::Middle => Button::Middle,
     }
+}
+
+/// Press, hold, release. A zero-duration click is accepted by menus but is
+/// dropped or mis-hit by canvas/edit controls that sample the pointer on
+/// press, so the hold is explicit.
+fn press_release(enigo: &mut Enigo, button: Button, hold_ms: u64) -> Result<()> {
+    enigo.button(button, Direction::Press).map_err(input_err)?;
+    std::thread::sleep(Duration::from_millis(hold_ms));
+    enigo
+        .button(button, Direction::Release)
+        .map_err(input_err)?;
+    Ok(())
 }
 
 fn input_err(e: impl std::fmt::Display) -> Error {

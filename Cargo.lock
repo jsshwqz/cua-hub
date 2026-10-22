@@ -783,6 +783,7 @@ dependencies = [
  "image",
  "tokio",
  "tracing",
+ "windows 0.62.2",
  "xcap",
 ]
 

@@ -1,6 +1,9 @@
+#![recursion_limit = "256"]
+
 mod console;
 mod jobs;
 mod mcp;
+mod observations;
 mod orchestrator;
 mod replay;
 mod runner;
@@ -208,6 +211,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // One physical-pixel coordinate space for capture, accessibility and input.
+    cua_io::make_dpi_aware();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -236,7 +241,7 @@ fn main() -> Result<()> {
                 },
                 double,
             };
-            cua_io::apply(&action, 1.0 / cua_io::dpi_scale())?;
+            cua_io::apply(&action, 1.0)?;
             println!("clicked ({x},{y})");
             Ok(())
         }

@@ -114,7 +114,7 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露 33 个工具：
+暴露 35 个工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -125,9 +125,11 @@ export OPENROUTER_API_KEY=sk-or-...
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `list_windows` | 列出可捕获的顶层窗口（标题、应用、坐标、焦点、最小化） |
-| `capture_window` | 按窗口截取（被其他窗口遮挡也能看到），返回原点/缩放用于坐标换算 |
-| `focus_window` | 按 id/标题把窗口带到前台；输入前防止焦点被别的应用抢走 |
-| `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；适合控制台/编辑器 |
+| `window_state` | 观测原语：一次返回窗口截图（含菜单/对话框等独立弹层）与窗口内 UIA 元素树 + `element_index` + 焦点元素，并给出 `observation_id` 作为作用域令牌 |
+| `capture_window` | 抓取窗口自身表面（被遮挡也完整），返回 `origin`/`image_scale`/`source`/`hash`，坐标换算由服务端完成 |
+| `wait_for_change` | 阻塞等待窗口或其弹层真的发生变化，用来验证动作是否生效 |
+| `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |
+| `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选 |
 | `accessibility_tree` | 带编号的 UIA 树（窗口/按钮/输入框 + 矩形），编号可在下一次操作中引用 |
 | `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心 |
 | `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |
