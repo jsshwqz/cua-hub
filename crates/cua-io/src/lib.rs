@@ -1,10 +1,12 @@
 //! Screen capture and input injection for cua-hub.
 
+pub mod apps;
 pub mod capture;
 pub mod clipboard;
 pub mod exec;
 pub mod input;
 
+pub use apps::{launch_app, list_apps, AppInfo, AppSource, AppWindow, LaunchOutcome};
 pub use capture::{
     capture_primary, capture_window, dpi_scale, encode_png, fit_to, image_hash, list_windows,
     make_dpi_aware, observe, related_windows, screen_hash, CaptureSource, Captured, Frame,

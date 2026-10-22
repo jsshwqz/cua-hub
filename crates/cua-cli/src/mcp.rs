@@ -15,6 +15,7 @@ use anyhow::Result;
 use cua_core::{Action, EngineKind, Point};
 use serde_json::{json, Value};
 
+use crate::elements;
 use crate::observations;
 use crate::runner::{self, RunOptions};
 
@@ -758,6 +759,60 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Err(e) => tool_err(e),
             }
         }
+        "list_apps" => {
+            let include_all = args["include_all"].as_bool().unwrap_or(false);
+            match cua_io::list_apps(include_all) {
+                Ok(apps) => tool_ok(json!({
+                    "count": apps.len(),
+                    "include_all": include_all,
+                    "apps": apps.iter().map(|a| json!({
+                        "id": a.id,
+                        "display_name": a.display_name,
+                        "pid": a.pid,
+                        "running": a.running,
+                        "source": if a.source == cua_io::AppSource::Running { "running" } else { "start_menu" },
+                        "windows": a.windows.iter().map(|w| json!({
+                            "id": w.id,
+                            "title": w.title,
+                            "minimized": w.minimized,
+                            "focused": w.focused,
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })),
+                Err(e) => tool_err(e),
+            }
+        }
+        "launch_app" => {
+            let app = match required_str(args, "app") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(20_000);
+            match cua_io::launch_app(&app, timeout_ms) {
+                Ok(outcome) => tool_ok(json!({
+                    "ok": true,
+                    "launched": !outcome.already_running,
+                    "already_running": outcome.already_running,
+                    "app": outcome.id,
+                    "display_name": outcome.display_name,
+                    "pid": outcome.pid,
+                    "matched_by": outcome.matched_by,
+                    "ready": outcome.ready,
+                    "windows": outcome.windows.iter().map(|w| json!({
+                        "id": w.id,
+                        "title": w.title,
+                        "minimized": w.minimized,
+                        "focused": w.focused,
+                    })).collect::<Vec<_>>(),
+                    "usage": if outcome.ready {
+                        "observe one of these windows with window_state before acting"
+                    } else {
+                        "no window appeared within the timeout; run list_windows before retrying, and do not launch the same app again"
+                    },
+                })),
+                Err(e) => tool_err(e),
+            }
+        }
         "capture_window" => {
             let selector = match required_str(args, "window") {
                 Ok(v) => v,
@@ -783,25 +838,37 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             };
             let include_screenshot = args["include_screenshot"].as_bool().unwrap_or(true);
             let include_text = args["include_text"].as_bool().unwrap_or(false);
+            let disable_diffing = args["disable_diffing"].as_bool().unwrap_or(false);
             let max_edge = args["max_edge"].as_u64().unwrap_or(1280) as u32;
             let quality = args["quality"].as_u64().unwrap_or(75) as u8;
             let max_nodes = args["max_nodes"].as_u64().unwrap_or(200) as usize;
             let depth = args["depth"].as_u64().unwrap_or(12) as usize;
 
             let mut content: Vec<Value> = Vec::new();
-            let mut origin = None;
-            let mut scale = 1.0f32;
-            let mut size = None;
             let mut hash = None;
             let mut screenshot: Option<Value> = None;
+            let mut shots: Vec<observations::Shot> = Vec::new();
+            let observation_id = observations::next_id();
 
             if include_screenshot {
                 match cua_io::capture_window(&window.id.to_string(), max_edge, quality) {
                     Ok(cap) => {
-                        origin = Some((cap.info.x, cap.info.y));
-                        scale = cap.frame.scale;
-                        size = Some((cap.frame.observation.width, cap.frame.observation.height));
-                        screenshot = Some(window_capture_meta(&cap));
+                        let shot_id = format!("{observation_id}:s0");
+                        let mut meta = window_capture_meta(&cap);
+                        if let Some(map) = meta.as_object_mut() {
+                            map.insert("role".into(), json!("target"));
+                            map.insert("screenshot_id".into(), json!(shot_id));
+                        }
+                        shots.push(observations::Shot {
+                            id: shot_id,
+                            window_id: window.id,
+                            role: "target",
+                            origin: (cap.info.x, cap.info.y),
+                            scale: cap.frame.scale,
+                            size: (cap.frame.observation.width, cap.frame.observation.height),
+                            hash: cap.hash,
+                        });
+                        screenshot = Some(meta);
                         content.push(json!({
                             "type": "image",
                             "data": encode_base64(&cap.frame.observation.image),
@@ -809,22 +876,39 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                         }));
                         // Menus, tooltips and dialogs are their own windows, so
                         // the target window alone cannot show that one opened.
+                        // Each popup image carries its own id and origin: a
+                        // coordinate read off a menu is not a coordinate in the
+                        // window that owns it.
                         let mut composite = cap.hash;
                         if let Ok(related) =
                             cua_io::related_windows(window.pid, window.id, MAX_RELATED)
                         {
-                            let mut shots = Vec::new();
-                            for rel in related {
+                            let mut related_meta = Vec::new();
+                            for (n, rel) in related.iter().enumerate() {
                                 if let Ok(rel_cap) =
                                     cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
                                 {
+                                    let rel_shot_id = format!("{observation_id}:s{}", n + 1);
                                     composite =
                                         composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
                                     let mut meta = window_capture_meta(&rel_cap);
                                     if let Some(map) = meta.as_object_mut() {
                                         map.insert("role".into(), json!("related"));
+                                        map.insert("screenshot_id".into(), json!(rel_shot_id));
                                     }
-                                    shots.push(meta);
+                                    shots.push(observations::Shot {
+                                        id: rel_shot_id,
+                                        window_id: rel.id,
+                                        role: "related",
+                                        origin: (rel_cap.info.x, rel_cap.info.y),
+                                        scale: rel_cap.frame.scale,
+                                        size: (
+                                            rel_cap.frame.observation.width,
+                                            rel_cap.frame.observation.height,
+                                        ),
+                                        hash: rel_cap.hash,
+                                    });
+                                    related_meta.push(meta);
                                     content.push(json!({
                                         "type": "image",
                                         "data": encode_base64(&rel_cap.frame.observation.image),
@@ -832,11 +916,11 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                                     }));
                                 }
                             }
-                            if !shots.is_empty() {
+                            if !related_meta.is_empty() {
                                 if let Some(map) =
                                     screenshot.as_mut().and_then(Value::as_object_mut)
                                 {
-                                    map.insert("related".into(), json!(shots));
+                                    map.insert("related".into(), json!(related_meta));
                                 }
                             }
                         }
@@ -858,12 +942,19 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let mut accessibility: Option<Value> = None;
             if include_text {
                 match cua_engine_access::snapshot_window(window.id, max_nodes, depth) {
-                    Ok(snap) => {
+                    Ok(mut snap) => {
+                        // Indexes come from a per-window registry, so the same
+                        // control keeps its number and only the changed lines
+                        // need to be sent back.
+                        let view = elements::observe(window.id, &mut snap, disable_diffing);
                         nodes = snap.nodes.clone();
                         accessibility = Some(json!({
-                            "tree": snap.to_text(),
-                            "node_count": snap.nodes.len(),
+                            "mode": view.mode.as_str(),
+                            "tree": view.text,
+                            "node_count": view.node_count,
+                            "changed_lines": view.changed_lines,
                             "truncated": snap.truncated,
+                            "notice": view.notice,
                         }));
                     }
                     Err(e) => return tool_err(e),
@@ -871,15 +962,14 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             }
 
             let focused = cua_engine_access::focused_element().ok().flatten();
-            let observation_id = observations::record(observations::Observation {
-                id: observations::next_id(),
+            let recorded = observations::record(observations::Observation {
+                id: observation_id.clone(),
                 window_id: window.id,
-                origin,
-                scale,
-                size,
                 hash,
+                shots,
                 nodes,
             });
+            let observation_id = recorded;
 
             let mut meta = json!({
                 "ok": true,
@@ -893,7 +983,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                     "rect": { "x": node.rect.0, "y": node.rect.1, "w": node.rect.2, "h": node.rect.3 },
                 })),
                 "accessibility": accessibility,
-                "usage": "element_index and x/y are only valid with this observation_id; re-read after the window changes",
+                "usage": "element_index and x/y are only valid with this observation_id. accessibility.tree is a unified diff against your previous observation of this window unless mode is full or baseline_reset: keep the mapping you have, apply the diff, and treat any index on a '-' line as retired. After acting, re-read this window.",
             });
             if let Some(shot) = screenshot {
                 if let Some(map) = meta.as_object_mut() {
@@ -1162,6 +1252,88 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Err(e) => tool_err(e),
             }
         }
+        "perform_secondary_action" => {
+            let index = args["element_index"]
+                .as_u64()
+                .or_else(|| args["index"].as_u64())
+                .unwrap_or(u64::MAX) as usize;
+            let action = match required_str(args, "action") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let (node, focus_target) =
+                match resolve_indexed_node(args, index, "perform_secondary_action") {
+                    Ok(pair) => pair,
+                    Err(e) => return e,
+                };
+            // The signature is what makes the target unambiguous, and only nodes
+            // that came from a window observation carry one.
+            if node.signature.is_empty() {
+                return tool_err(json!({
+                    "ok": false,
+                    "error": {
+                        "code": "missing_observation",
+                        "message": format!(
+                            "element_index {index} did not come from window_state; pass observation_id and element_index"
+                        ),
+                        "refetch": true,
+                        "retry": true,
+                    }
+                }));
+            }
+            let Some(window_id) = focus_target.or_else(|| window_arg_id(&args["window"])) else {
+                return tool_err(
+                    "perform_secondary_action needs the window the element belongs to; pass observation_id from window_state",
+                );
+            };
+
+            // Check the advertised list before touching the control: guessing an
+            // action name is how an agent "expands" the wrong widget.
+            let requested = action.trim();
+            if !node
+                .actions
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(requested))
+            {
+                return tool_err(json!({
+                    "ok": false,
+                    "error": {
+                        "code": "unsupported_action",
+                        "message": format!(
+                            "`{requested}` is not exposed by {} \"{}\"",
+                            node.control_type, node.name
+                        ),
+                        "supported_actions": node.actions,
+                        "refetch": false,
+                        "retry": false,
+                    }
+                }));
+            }
+
+            // Most patterns only work on the window that owns the foreground.
+            if let Err(e) = cua_engine_access::focus_window(window_id) {
+                return tool_err(e);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+
+            match cua_engine_access::secondary_action(window_id, &node.signature, requested) {
+                Ok(outcome) => tool_ok(json!({
+                    "ok": true,
+                    "action": outcome.action,
+                    "element": {
+                        "index": node.index,
+                        "control_type": node.control_type,
+                        "name": node.name,
+                        "automation_id": node.automation_id,
+                        "rect": { "x": node.rect.0, "y": node.rect.1, "w": node.rect.2, "h": node.rect.3 },
+                    },
+                    "state": outcome.state,
+                    "supported_actions": outcome.supported,
+                    "usage": "the state above is read back from the control; re-read window_state when the action was meant to change what is on screen",
+                })),
+                Err(e) => tool_err(e),
+            }
+        }
         "invoke_control" => {
             let name = match required_str(args, "name") {
                 Ok(n) => n,
@@ -1225,18 +1397,31 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 target_window = Some(obs.window_id);
                 (x + w / 2, y + h / 2)
             } else if let (Some(x), Some(y)) = (args["x"].as_f64(), args["y"].as_f64()) {
+                let shot_id = args["screenshot_id"].as_str();
                 match observation_id.and_then(observations::get) {
                     Some(obs) => {
-                        let Some(mapped) = observations::to_screen(&obs, x, y) else {
+                        let Some((shot, mapped)) = observations::point_in(&obs, shot_id, x, y)
+                        else {
+                            let known = observations::shot_ids(&obs);
                             return stale_err(format!(
-                                "observation {} cannot map ({x},{y}): it has no screenshot, or the point is outside the observed image",
-                                obs.id
+                                "observation {} cannot map ({x},{y}) against screenshot {:?}; its images are [{}], and the point must lie inside the one you name",
+                                obs.id,
+                                shot_id.unwrap_or("the target window"),
+                                known.join(", ")
                             ));
                         };
-                        target_window = Some(obs.window_id);
+                        // A popup is already up and belongs to the foreground
+                        // app; activating its owner can dismiss it, so only the
+                        // target window's own image triggers a focus.
+                        target_window = (shot.role == "target").then_some(obs.window_id);
                         mapped
                     }
                     None => {
+                        if shot_id.is_some() {
+                            return stale_err(
+                                "screenshot_id needs the observation_id that returned it; re-run window_state",
+                            );
+                        }
                         let (x, y) = (x as i32, y as i32);
                         if let Err(e) = ensure_on_screen(x as i64, y as i64) {
                             return e;
@@ -1581,19 +1766,56 @@ fn tool_defs() -> Value {
         },
         {
             "name": "window_state",
-            "description": "The observation to act on: one call returns the window's screenshot and/or its in-window accessibility tree with element indexes, plus which element has keyboard focus. Returns an observation_id; every element_index or screenshot coordinate you act with must cite it, and a rejected stale_observation means you must re-observe rather than retry.",
+            "description": "The observation to act on: one call returns the window's screenshot and/or its in-window accessibility tree with element indexes, plus which element has keyboard focus. Element indexes are stable for a given window, so after the first observation the tree comes back as a unified diff (mode=diff) instead of a full listing; mode=unchanged means your mapping still applies, and mode=baseline_reset means every index you hold is invalid. Returns an observation_id; every element_index or screenshot coordinate you act with must cite it, and a rejected stale_observation means you must re-observe rather than retry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "window": { "description": "Window id, selector, or {app,id}", "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 }, { "type": "object", "properties": { "app": { "type": "string" }, "id": { "type": "integer", "minimum": 1 } }, "required": ["id"] } ] },
                     "include_screenshot": { "type": "boolean", "default": true },
                     "include_text": { "type": "boolean", "default": false, "description": "Add the window-scoped accessibility tree with element indexes" },
+                    "disable_diffing": { "type": "boolean", "default": false, "description": "Return the complete tree and rebuild the numbering baseline; use it when you no longer have the baseline needed to apply a diff" },
                     "max_edge": { "type": "integer", "default": 1280 },
                     "quality": { "type": "integer", "default": 75 },
                     "max_nodes": { "type": "integer", "default": 200 },
                     "depth": { "type": "integer", "default": 12 }
                 },
                 "required": ["window"]
+            }
+        },
+        {
+            "name": "list_apps",
+            "description": "Applications grouped with the windows they own, plus the launchable id (exe path) for each. include_all adds Start Menu entries for apps that are not running, which is what you need before launch_app can start something closed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_all": { "type": "boolean", "default": false, "description": "Also list installed apps that are not currently running" }
+                }
+            }
+        },
+        {
+            "name": "launch_app",
+            "description": "Start an app and wait for its window, so the next step can be an observation instead of a guess. Accepts an id from list_apps, a full .exe or .lnk path, or an exact display name. An app that is already running is reported with its windows rather than started a second time. ready=false means no window appeared within timeout_ms: run list_windows before retrying instead of launching again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "App id, full .exe/.lnk path, or exact display name" },
+                    "timeout_ms": { "type": "integer", "default": 20000, "description": "How long to wait for the first window" }
+                },
+                "required": ["app"]
+            }
+        },
+        {
+            "name": "perform_secondary_action",
+            "description": "Invoke an accessibility action a control exposes besides a click: Expand, Collapse, Raise, Scroll Up/Down/Left/Right, Toggle, Select, Focus or Invoke. Only use names listed in that element's actions= in the window_state tree; an unlisted name returns unsupported_action with the real list instead of guessing. The element's state is read back and returned so the action can be verified.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "observation_id": { "type": "string", "description": "Observation the element_index came from" },
+                    "element_index": { "type": "integer", "description": "Element index from that observation" },
+                    "action": { "type": "string", "description": "Action label as advertised by the element, e.g. Expand, Collapse, Raise, Scroll Down, Toggle, Select, Focus, Invoke" },
+                    "window": { "description": "Optional window id or selector when no observation is given", "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ] }
+                },
+                "required": ["element_index", "action"]
             }
         },
         {
@@ -1738,12 +1960,13 @@ fn tool_defs() -> Value {
         },
         {
             "name": "click",
-            "description": "Click a target. Preferred: element_index + observation_id from window_state, which resolves the control and activates its window for you. Coordinates: pass observation_id with x/y in that screenshot's pixels and the server maps them. Bare x/y are absolute physical pixels and are the last resort.",
+            "description": "Click a target. Preferred: element_index + observation_id from window_state, which resolves the control and activates its window for you. Coordinates: pass observation_id with x/y in that screenshot's pixels and the server maps them; add screenshot_id to name which image the coordinates came from (needed for popup and menu images, whose origin differs from the window's). Bare x/y are absolute physical pixels and are the last resort.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "observation_id": { "type": "string" },
                     "element_index": { "type": "integer" },
+                    "screenshot_id": { "type": "string", "description": "Image id from window_state that x/y belong to; omit for the target window's image" },
                     "x": { "type": "number" },
                     "y": { "type": "number" },
                     "window": { "description": "Window id or selector, for activation when clicking bare coordinates", "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ] },
@@ -1978,5 +2201,46 @@ mod tests {
         assert!(names.contains(&"start_task".to_string()));
         assert!(names.contains(&"task_status".to_string()));
         assert!(names.contains(&"invoke_control".to_string()));
+    }
+
+    #[test]
+    fn tool_list_includes_app_and_secondary_action_tools() {
+        let names: Vec<String> = tool_defs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"list_apps".to_string()));
+        assert!(names.contains(&"launch_app".to_string()));
+        assert!(names.contains(&"perform_secondary_action".to_string()));
+    }
+
+    #[test]
+    fn window_state_exposes_diff_control() {
+        let defs = tool_defs();
+        let def = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "window_state")
+            .expect("window_state should be declared");
+        assert!(def["inputSchema"]["properties"]["disable_diffing"].is_object());
+        assert!(def["description"]
+            .as_str()
+            .expect("description")
+            .contains("baseline_reset"));
+    }
+
+    #[test]
+    fn every_tool_is_described_with_an_object_schema() {
+        for tool in tool_defs().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            assert!(
+                tool["description"].as_str().is_some_and(|d| d.len() > 20),
+                "{name} needs a description a model can act on"
+            );
+            assert_eq!(tool["inputSchema"]["type"], "object", "{name} schema");
+        }
     }
 }

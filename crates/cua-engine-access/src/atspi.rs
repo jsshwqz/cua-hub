@@ -135,6 +135,12 @@ fn walk(
             name,
             automation_id: String::new(),
             rect,
+            // AT-SPI object paths are already a stable per-element identity, so
+            // they serve directly as the signature the index registry keys on.
+            signature: path.clone(),
+            value: String::new(),
+            actions: Vec::new(),
+            focused: false,
         };
         if visit(&conn, &node, &dest, &path) {
             return Ok((truncated, true));

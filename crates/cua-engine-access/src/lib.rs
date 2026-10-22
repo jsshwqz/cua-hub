@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiNode {
-    /// Snapshot-scoped index, stable until the tree changes.
+    /// Index assigned by the caller. `window_state` assigns indexes from a
+    /// per-window registry keyed by [`UiNode::signature`], so the same control
+    /// keeps the same number across observations until it disappears.
     #[serde(default)]
     pub index: usize,
     pub depth: usize,
@@ -19,6 +21,50 @@ pub struct UiNode {
     pub name: String,
     pub automation_id: String,
     pub rect: (i32, i32, i32, i32),
+    /// Structural identity: the path of (ordinal, control type, automation id)
+    /// from the window root to this node. Names and rectangles are deliberately
+    /// excluded so that editing a caption does not renumber the control.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+    /// Current text value, when the control exposes one and it differs from the
+    /// name. Lets the model read a field without a second call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    /// Secondary actions the control actually exposes. Never guess a name that
+    /// is not listed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
+    /// True when this control owns keyboard focus.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub focused: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Build a child's structural signature from its parent's.
+///
+/// The ordinal keeps same-shaped siblings apart (a list of fifty identical rows
+/// still gets fifty distinct signatures) while leaving out anything that changes
+/// when the user edits content.
+pub fn child_signature(
+    parent: &str,
+    ordinal: usize,
+    control_type: &str,
+    automation_id: &str,
+) -> String {
+    let mut out = String::with_capacity(parent.len() + 24);
+    out.push_str(parent);
+    out.push('/');
+    out.push_str(&ordinal.to_string());
+    out.push(':');
+    out.push_str(control_type);
+    if !automation_id.is_empty() {
+        out.push('#');
+        out.push_str(automation_id);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +120,74 @@ pub fn focused_element() -> Result<Option<UiNode>> {
     }
 }
 
+/// What happened when a secondary action was performed. `state` is read back
+/// from the control afterwards so the caller can verify instead of assuming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecondaryOutcome {
+    pub action: String,
+    pub element: UiNode,
+    /// Post-action state where the pattern exposes one: `expanded`,
+    /// `collapsed`, `on`, `off`, `selected`, `normal`, `focused`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The actions this element really supports, returned on success too so a
+    /// caller that guessed wrong can correct itself from the same response.
+    pub supported: Vec<String>,
+}
+
+/// Error payload for an unsupported secondary action: the caller gets the real
+/// list instead of a bare failure.
+#[derive(Debug, Clone)]
+pub struct UnsupportedAction {
+    pub requested: String,
+    pub supported: Vec<String>,
+    pub element: UiNode,
+}
+
+impl std::fmt::Display for UnsupportedAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.supported.is_empty() {
+            write!(
+                f,
+                "`{}` is not available on this {} and it exposes no secondary actions",
+                self.requested, self.element.control_type
+            )
+        } else {
+            write!(
+                f,
+                "`{}` is not available on this {}; supported: {}",
+                self.requested,
+                self.element.control_type,
+                self.supported.join(", ")
+            )
+        }
+    }
+}
+
+/// Perform a secondary accessibility action on the control identified by its
+/// structural signature inside one window: expand a disclosure, raise a window,
+/// scroll a pane, toggle a checkbox, select a list item, focus or invoke.
+///
+/// Signatures come from [`snapshot_window`]; indexes are not used here because
+/// they are assigned by the caller and mean nothing to this crate.
+pub fn secondary_action(window_id: u32, signature: &str, action: &str) -> Result<SecondaryOutcome> {
+    #[cfg(windows)]
+    {
+        imp::secondary_action(window_id, signature, action)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window_id, signature, action);
+        Err(cua_core::Error::InvalidAction(
+            "perform_secondary_action is only implemented on Windows".into(),
+        ))
+    }
+}
+
 impl UiSnapshot {
-    /// Compact prompt-friendly text, one node per line.
+    /// Compact prompt-friendly text, one node per line: an index the input tools
+    /// accept, the hierarchy as indentation, then whatever state matters for
+    /// choosing a target. Rectangles are physical screen pixels.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for n in &self.nodes {
@@ -87,6 +199,15 @@ impl UiSnapshot {
             }
             if !n.automation_id.is_empty() {
                 out.push_str(&format!(" #{}", n.automation_id));
+            }
+            if !n.value.is_empty() && n.value != n.name {
+                out.push_str(&format!(" value=\"{}\"", truncate(&n.value, 60)));
+            }
+            if n.focused {
+                out.push_str(" FOCUSED");
+            }
+            if !n.actions.is_empty() {
+                out.push_str(&format!(" actions={}", n.actions.join(",")));
             }
             let (x, y, w, h) = n.rect;
             if w > 0 && h > 0 {
@@ -351,12 +472,15 @@ fn control_type_name(id: u32) -> &'static str {
 
 #[cfg(windows)]
 mod imp {
-    use super::{control_type_name, UiNode, UiSnapshot};
+    use super::{child_signature, control_type_name, UiNode, UiSnapshot};
     use cua_core::{Error, Result};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
-    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomationElement};
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomationElement, IUIAutomationValuePattern, UIA_ValuePatternId,
+        UIA_PROPERTY_ID,
+    };
 
     pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
         walk_snapshot(Root::Desktop, max_nodes, max_depth)
@@ -368,13 +492,197 @@ mod imp {
 
     fn walk_snapshot(root: Root, max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
         let mut nodes = Vec::new();
-        let (truncated, _) = walk(root, max_nodes, max_depth, |node| {
+        let (truncated, _) = walk(root, max_nodes, max_depth, |node, _element| {
             let mut node = node.clone();
             node.index = nodes.len();
             nodes.push(node);
             false
         })?;
         Ok(UiSnapshot { nodes, truncated })
+    }
+
+    /// Limits for signature lookup: an action target may sit deeper in the tree
+    /// than a context snapshot is allowed to go, and giving up early would look
+    /// like "the control vanished".
+    const FIND_MAX_NODES: usize = 4_000;
+    const FIND_MAX_DEPTH: usize = 32;
+
+    /// Re-walk one window and return the live element whose structural
+    /// signature matches. Acting through a fresh element matters: the cached
+    /// element from an older snapshot may point at a control that has since been
+    /// destroyed, and UIA would then act on nothing at all.
+    pub fn element_for_signature(
+        window_id: u32,
+        signature: &str,
+    ) -> Result<Option<(IUIAutomationElement, UiNode)>> {
+        let mut found = None;
+        walk(
+            Root::Window(window_id),
+            FIND_MAX_NODES,
+            FIND_MAX_DEPTH,
+            |node, element| {
+                if node.signature == signature {
+                    found = Some((element.clone(), node.clone()));
+                    return true;
+                }
+                false
+            },
+        )?;
+        Ok(found)
+    }
+
+    pub fn secondary_action(
+        window_id: u32,
+        signature: &str,
+        action: &str,
+    ) -> Result<super::SecondaryOutcome> {
+        use windows::Win32::UI::Accessibility::{
+            ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
+            IUIAutomationExpandCollapsePattern, IUIAutomationInvokePattern,
+            IUIAutomationScrollPattern, IUIAutomationSelectionItemPattern,
+            IUIAutomationTogglePattern, IUIAutomationWindowPattern, ScrollAmount_NoAmount,
+            ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement, ToggleState_Off,
+            ToggleState_On, UIA_ExpandCollapsePatternId, UIA_InvokePatternId, UIA_ScrollPatternId,
+            UIA_SelectionItemPatternId, UIA_TogglePatternId, UIA_WindowPatternId,
+            WindowVisualState_Normal,
+        };
+
+        let Some((element, node)) = element_for_signature(window_id, signature)? else {
+            return Err(Error::InvalidAction(format!(
+                "no control matching signature `{signature}` in window {window_id}; re-run window_state"
+            )));
+        };
+        let supported = node.actions.clone();
+        let requested = action.trim().to_string();
+        let key = normalize_action(&requested);
+        if !supported.iter().any(|a| normalize_action(a) == key) {
+            return Err(Error::InvalidAction(
+                super::UnsupportedAction {
+                    requested,
+                    supported,
+                    element: node,
+                }
+                .to_string(),
+            ));
+        }
+
+        let state: Option<String> = match key.as_str() {
+            "invoke" => {
+                let pattern: IUIAutomationInvokePattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
+                        .map_err(|e| Error::Capture(format!("UIA Invoke pattern: {e}")))?;
+                unsafe { pattern.Invoke() }
+                    .map_err(|e| Error::Capture(format!("UIA Invoke failed: {e}")))?;
+                None
+            }
+            "expand" | "collapse" => {
+                let pattern: IUIAutomationExpandCollapsePattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_ExpandCollapsePatternId) }
+                        .map_err(|e| Error::Capture(format!("UIA ExpandCollapse pattern: {e}")))?;
+                if key == "expand" {
+                    unsafe { pattern.Expand() }
+                        .map_err(|e| Error::Capture(format!("UIA Expand failed: {e}")))?;
+                } else {
+                    unsafe { pattern.Collapse() }
+                        .map_err(|e| Error::Capture(format!("UIA Collapse failed: {e}")))?;
+                }
+                unsafe { pattern.CurrentExpandCollapseState() }
+                    .ok()
+                    .map(|s| {
+                        if s == ExpandCollapseState_Expanded {
+                            "expanded".to_string()
+                        } else if s == ExpandCollapseState_Collapsed {
+                            "collapsed".to_string()
+                        } else {
+                            "partially_expanded".to_string()
+                        }
+                    })
+            }
+            "raise" => {
+                let pattern: IUIAutomationWindowPattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_WindowPatternId) }
+                        .map_err(|e| Error::Capture(format!("UIA Window pattern: {e}")))?;
+                unsafe { pattern.SetWindowVisualState(WindowVisualState_Normal) }
+                    .map_err(|e| Error::Capture(format!("UIA Raise failed: {e}")))?;
+                Some("normal".to_string())
+            }
+            "scrollup" | "scrolldown" | "scrollleft" | "scrollright" => {
+                let pattern: IUIAutomationScrollPattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_ScrollPatternId) }
+                        .map_err(|e| Error::Capture(format!("UIA Scroll pattern: {e}")))?;
+                let (horizontal, vertical) = match key.as_str() {
+                    "scrollup" => (ScrollAmount_NoAmount, ScrollAmount_SmallDecrement),
+                    "scrolldown" => (ScrollAmount_NoAmount, ScrollAmount_SmallIncrement),
+                    "scrollleft" => (ScrollAmount_SmallDecrement, ScrollAmount_NoAmount),
+                    _ => (ScrollAmount_SmallIncrement, ScrollAmount_NoAmount),
+                };
+                unsafe { pattern.Scroll(horizontal, vertical) }
+                    .map_err(|e| Error::Capture(format!("UIA Scroll failed: {e}")))?;
+                let h = unsafe { pattern.CurrentHorizontalScrollPercent() }.unwrap_or(-1.0);
+                let v = unsafe { pattern.CurrentVerticalScrollPercent() }.unwrap_or(-1.0);
+                Some(format!("scroll {h:.1}%/{v:.1}%"))
+            }
+            "toggle" => {
+                let pattern: IUIAutomationTogglePattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_TogglePatternId) }
+                        .map_err(|e| Error::Capture(format!("UIA Toggle pattern: {e}")))?;
+                unsafe { pattern.Toggle() }
+                    .map_err(|e| Error::Capture(format!("UIA Toggle failed: {e}")))?;
+                unsafe { pattern.CurrentToggleState() }.ok().map(|s| {
+                    if s == ToggleState_On {
+                        "on".to_string()
+                    } else if s == ToggleState_Off {
+                        "off".to_string()
+                    } else {
+                        "indeterminate".to_string()
+                    }
+                })
+            }
+            "select" => {
+                let pattern: IUIAutomationSelectionItemPattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_SelectionItemPatternId) }
+                        .map_err(|e| Error::Capture(format!("UIA SelectionItem pattern: {e}")))?;
+                unsafe { pattern.Select() }
+                    .map_err(|e| Error::Capture(format!("UIA Select failed: {e}")))?;
+                unsafe { pattern.CurrentIsSelected() }
+                    .ok()
+                    .map(|b| {
+                        if b.as_bool() {
+                            "selected"
+                        } else {
+                            "not_selected"
+                        }
+                    })
+                    .map(str::to_string)
+            }
+            "focus" => {
+                unsafe { element.SetFocus() }
+                    .map_err(|e| Error::Capture(format!("UIA SetFocus failed: {e}")))?;
+                Some("focused".to_string())
+            }
+            other => {
+                return Err(Error::InvalidAction(format!(
+                    "`{other}` is not a supported secondary action"
+                )))
+            }
+        };
+
+        Ok(super::SecondaryOutcome {
+            action: requested,
+            element: node,
+            state,
+            supported,
+        })
+    }
+
+    /// Action names arrive with arbitrary spacing and case ("Scroll Up",
+    /// "scroll_up", "SCROLLUP"). Compare on a single normalized form.
+    fn normalize_action(action: &str) -> String {
+        action
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
     }
 
     /// The element that owns keyboard focus right now.
@@ -592,6 +900,266 @@ mod imp {
             rect: unsafe { el.CurrentBoundingRectangle() }
                 .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
                 .unwrap_or((0, 0, 0, 0)),
+            signature: String::new(),
+            value: unsafe {
+                el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+            }
+            .ok()
+            .and_then(|p| unsafe { p.CurrentValue().ok() })
+            .map(|b| super::truncate(&b.to_string(), 160))
+            .unwrap_or_default(),
+            actions: current_actions(el),
+            focused: unsafe { el.CurrentHasKeyboardFocus() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    /// Which secondary actions an element exposes, read live. Only used on the
+    /// single-element paths (`find`, `invoke`, `focused`), where a handful of
+    /// pattern probes is free; the tree walk uses cached availability instead.
+    /// Text a field currently holds.
+    ///
+    /// Read live rather than from the cache: providers such as Win11 Notepad's
+    /// edit control answer the cached Value pattern with an empty string, which
+    /// made a typed value invisible to the tree and the diff. Live reads are
+    /// restricted to the control types where a value is short and meaningful, so
+    /// a document-sized text body is never pulled into a snapshot.
+    fn node_value(el: &IUIAutomationElement, control_type: &str) -> String {
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomationValuePattern, UIA_IsValuePatternAvailablePropertyId,
+        };
+
+        if !matches!(control_type, "Edit" | "ComboBox" | "Spinner") {
+            return String::new();
+        }
+        if !cached_flag(el, UIA_IsValuePatternAvailablePropertyId) {
+            return String::new();
+        }
+        let Ok(pattern) =
+            (unsafe { el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) })
+        else {
+            return String::new();
+        };
+        let value = unsafe { pattern.CurrentValue() }
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        super::truncate(&value, 160)
+    }
+
+    /// Read a cached boolean property. UIA hands these back as a VARIANT, so go
+    /// through the OLE conversion helper instead of poking at the union.
+    fn cached_flag(el: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> bool {
+        use windows::Win32::System::Variant::{VariantClear, VariantToBooleanWithDefault};
+        let Ok(mut variant) = (unsafe { el.GetCachedPropertyValue(property) }) else {
+            return false;
+        };
+        let value = unsafe { VariantToBooleanWithDefault(&variant, false) }.as_bool();
+        let _ = unsafe { VariantClear(&mut variant) };
+        value
+    }
+
+    /// Secondary actions from cached pattern-availability flags. Probing patterns
+    /// live costs one cross-process COM call each, which turns a 200-node walk
+    /// into seconds; the availability flags arrive with the children.
+    fn cached_actions(el: &IUIAutomationElement) -> Vec<String> {
+        use windows::Win32::UI::Accessibility::{
+            ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
+            IUIAutomationExpandCollapsePattern, IUIAutomationScrollPattern,
+            UIA_ExpandCollapsePatternId, UIA_IsExpandCollapsePatternAvailablePropertyId,
+            UIA_IsInvokePatternAvailablePropertyId, UIA_IsScrollPatternAvailablePropertyId,
+            UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
+            UIA_IsWindowPatternAvailablePropertyId, UIA_ScrollPatternId,
+        };
+
+        let mut actions = Vec::new();
+        if cached_flag(el, UIA_IsInvokePatternAvailablePropertyId) {
+            actions.push("Invoke".to_string());
+        }
+        if cached_flag(el, UIA_IsExpandCollapsePatternAvailablePropertyId) {
+            let state = unsafe {
+                el.GetCachedPatternAs::<IUIAutomationExpandCollapsePattern>(
+                    UIA_ExpandCollapsePatternId,
+                )
+            }
+            .ok()
+            .and_then(|p| unsafe { p.CachedExpandCollapseState().ok() });
+            match state {
+                Some(s) if s == ExpandCollapseState_Expanded => {
+                    actions.push("Collapse".to_string())
+                }
+                Some(s) if s == ExpandCollapseState_Collapsed => actions.push("Expand".to_string()),
+                _ => {
+                    actions.push("Expand".to_string());
+                    actions.push("Collapse".to_string());
+                }
+            }
+        }
+        if cached_flag(el, UIA_IsScrollPatternAvailablePropertyId) {
+            let pattern =
+                unsafe { el.GetCachedPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId) }
+                    .ok();
+            let vertical = pattern
+                .as_ref()
+                .and_then(|p| unsafe { p.CachedVerticallyScrollable().ok() })
+                .is_some_and(|b| b.as_bool());
+            let horizontal = pattern
+                .as_ref()
+                .and_then(|p| unsafe { p.CachedHorizontallyScrollable().ok() })
+                .is_some_and(|b| b.as_bool());
+            // When the pattern does not answer, advertise both axes: a missing
+            // label hides a working action, while an extra one only costs a
+            // clear error.
+            if vertical || pattern.is_none() {
+                actions.push("Scroll Up".to_string());
+                actions.push("Scroll Down".to_string());
+            }
+            if horizontal || pattern.is_none() {
+                actions.push("Scroll Left".to_string());
+                actions.push("Scroll Right".to_string());
+            }
+        }
+        if cached_flag(el, UIA_IsTogglePatternAvailablePropertyId) {
+            actions.push("Toggle".to_string());
+        }
+        if cached_flag(el, UIA_IsSelectionItemPatternAvailablePropertyId) {
+            actions.push("Select".to_string());
+        }
+        if cached_flag(el, UIA_IsWindowPatternAvailablePropertyId) {
+            actions.push("Raise".to_string());
+        }
+        if unsafe { el.CachedIsKeyboardFocusable() }
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
+        {
+            actions.push("Focus".to_string());
+        }
+        actions
+    }
+
+    /// Which secondary actions an element exposes, read live. Only used on the
+    /// single-element paths (`find`, `invoke`, `focused`), where a handful of
+    /// pattern probes is free; the tree walk uses cached availability instead.
+    fn current_actions(el: &IUIAutomationElement) -> Vec<String> {
+        use windows::Win32::UI::Accessibility::{
+            ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
+            IUIAutomationExpandCollapsePattern, IUIAutomationInvokePattern,
+            IUIAutomationScrollPattern, IUIAutomationSelectionItemPattern,
+            IUIAutomationTogglePattern, IUIAutomationWindowPattern, UIA_ExpandCollapsePatternId,
+            UIA_InvokePatternId, UIA_ScrollPatternId, UIA_SelectionItemPatternId,
+            UIA_TogglePatternId, UIA_WindowPatternId,
+        };
+
+        let mut actions = Vec::new();
+        if unsafe { el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) }
+            .is_ok()
+        {
+            actions.push("Invoke".to_string());
+        }
+        if let Ok(pattern) = unsafe {
+            el.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(
+                UIA_ExpandCollapsePatternId,
+            )
+        } {
+            match unsafe { pattern.CurrentExpandCollapseState() } {
+                Ok(s) if s == ExpandCollapseState_Expanded => actions.push("Collapse".to_string()),
+                Ok(s) if s == ExpandCollapseState_Collapsed => actions.push("Expand".to_string()),
+                _ => {
+                    actions.push("Expand".to_string());
+                    actions.push("Collapse".to_string());
+                }
+            }
+        }
+        if let Ok(pattern) =
+            unsafe { el.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId) }
+        {
+            if unsafe { pattern.CurrentVerticallyScrollable() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                actions.push("Scroll Up".to_string());
+                actions.push("Scroll Down".to_string());
+            }
+            if unsafe { pattern.CurrentHorizontallyScrollable() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                actions.push("Scroll Left".to_string());
+                actions.push("Scroll Right".to_string());
+            }
+        }
+        if unsafe { el.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId) }
+            .is_ok()
+        {
+            actions.push("Toggle".to_string());
+        }
+        if unsafe {
+            el.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+        }
+        .is_ok()
+        {
+            actions.push("Select".to_string());
+        }
+        if unsafe { el.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) }
+            .is_ok()
+        {
+            actions.push("Raise".to_string());
+        }
+        if unsafe { el.CurrentIsKeyboardFocusable() }
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
+        {
+            actions.push("Focus".to_string());
+        }
+        actions
+    }
+
+    /// Everything the walk needs to know about one element, gathered either from
+    /// the cache (descendants) or live (the root).
+    struct Facts {
+        name: String,
+        control_type: String,
+        automation_id: String,
+        rect: (i32, i32, i32, i32),
+        value: String,
+        actions: Vec<String>,
+        focused: bool,
+    }
+
+    fn cached_facts(el: &IUIAutomationElement) -> Facts {
+        let control_type = unsafe { el.CachedControlType() }
+            .map(|id| control_type_name(id.0 as u32))
+            .unwrap_or("Unknown")
+            .to_string();
+        Facts {
+            name: unsafe { el.CachedName() }
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            control_type: control_type.clone(),
+            automation_id: unsafe { el.CachedAutomationId() }
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
+            rect: unsafe { el.CachedBoundingRectangle() }
+                .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+                .unwrap_or((0, 0, 0, 0)),
+            value: node_value(el, &control_type),
+            actions: cached_actions(el),
+            focused: unsafe { el.CachedHasKeyboardFocus() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    fn live_facts(el: &IUIAutomationElement) -> Facts {
+        let node = element_to_node(el);
+        Facts {
+            name: node.name,
+            control_type: node.control_type,
+            automation_id: node.automation_id,
+            rect: node.rect,
+            value: node.value,
+            actions: node.actions,
+            focused: node.focused,
         }
     }
 
@@ -601,25 +1169,39 @@ mod imp {
         Window(u32),
     }
 
-    /// Depth-first walk in document order. `visit` returns true to stop early.
+    /// Depth-first walk in document order. `visit` returns true to stop early
+    /// and receives the live element so callers can act on the exact node they
+    /// matched instead of re-finding it by name.
     fn walk(
         root_kind: Root,
         max_nodes: usize,
         max_depth: usize,
-        mut visit: impl FnMut(&UiNode) -> bool,
+        mut visit: impl FnMut(&UiNode, &IUIAutomationElement) -> bool,
     ) -> Result<(bool, bool)> {
         // RPC_E_CHANGED_MODE is fine: COM is already initialised differently.
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 
         use windows::Win32::UI::Accessibility::{
-            IUIAutomation, IUIAutomationCacheRequest, TreeScope_Children,
+            IUIAutomation, IUIAutomationCacheRequest, TreeScope_Children, TreeScope_Element,
             UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-            UIA_IsOffscreenPropertyId, UIA_NamePropertyId,
+            UIA_ExpandCollapsePatternId, UIA_HasKeyboardFocusPropertyId, UIA_IsEnabledPropertyId,
+            UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsInvokePatternAvailablePropertyId,
+            UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
+            UIA_IsScrollPatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
+            UIA_IsTogglePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+            UIA_IsWindowPatternAvailablePropertyId, UIA_NamePropertyId,
         };
 
-        // One cache request batches every property fetch into the single COM
-        // call that returns the children, which is dramatically faster than
-        // walking with CurrentX() getters (36s -> under 1s in practice).
+        // One cache request batches every property fetch into the COM call that
+        // returns the children, which is dramatically faster than walking with
+        // CurrentX() getters (36s -> under 1s in practice).
+        //
+        // TreeScope_Element is deliberate: with TreeScope_Children only the root's
+        // immediate children arrive with cached properties, and `GetCachedChildren`
+        // on those children returns an empty array, which silently flattens every
+        // tree to one level (menus looked empty, Explorer looked like four panes).
+        // Walking with FindAllBuildCache per node caches each level as it is
+        // fetched, so depth is real and memory stays bounded by max_nodes.
         let automation: IUIAutomation =
             unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
                 .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
@@ -632,9 +1214,22 @@ mod imp {
                 .and_then(|_| cache.AddProperty(UIA_AutomationIdPropertyId))
                 .and_then(|_| cache.AddProperty(UIA_BoundingRectanglePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsOffscreenPropertyId))
-                .and_then(|_| cache.SetTreeScope(TreeScope_Children))
+                .and_then(|_| cache.AddProperty(UIA_IsEnabledPropertyId))
+                .and_then(|_| cache.AddProperty(UIA_HasKeyboardFocusPropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsKeyboardFocusablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsInvokePatternAvailablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsExpandCollapsePatternAvailablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsScrollPatternAvailablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsTogglePatternAvailablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsSelectionItemPatternAvailablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsWindowPatternAvailablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsValuePatternAvailablePropertyId))
+                .and_then(|_| cache.AddPattern(UIA_ExpandCollapsePatternId))
+                .and_then(|_| cache.SetTreeScope(TreeScope_Element))
                 .map_err(|e| Error::Capture(format!("UIA cache setup: {e}")))?;
         }
+        let anywhere = unsafe { automation.CreateTrueCondition() }
+            .map_err(|e| Error::Capture(format!("UIA condition: {e}")))?;
 
         let root = match root_kind {
             Root::Desktop => unsafe { automation.GetRootElementBuildCache(&cache) },
@@ -649,9 +1244,10 @@ mod imp {
 
         let mut visited = 0usize;
         let mut truncated = false;
-        let mut stack: Vec<(IUIAutomationElement, usize)> = vec![(root, 0)];
+        let mut stack: Vec<(IUIAutomationElement, usize, String, usize)> =
+            vec![(root, 0, String::new(), 0)];
 
-        while let Some((element, depth)) = stack.pop() {
+        while let Some((element, depth, parent_signature, ordinal)) = stack.pop() {
             if visited >= max_nodes {
                 truncated = true;
                 break;
@@ -661,57 +1257,67 @@ mod imp {
                 continue;
             }
 
-            let offscreen = unsafe { element.CachedIsOffscreen() }
-                .map(|b| b.as_bool())
-                .unwrap_or(false);
-            if offscreen {
-                continue;
-            }
+            // The element a BuildCache walk is rooted at comes back with empty
+            // cached properties — TreeScope_Children populates descendants only —
+            // so read the root live. Hosted apps answer with a hollow placeholder
+            // either way and are filtered out below.
+            let facts = if depth == 0 {
+                live_facts(&element)
+            } else {
+                let offscreen = unsafe { element.CachedIsOffscreen() }
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false);
+                if offscreen {
+                    continue;
+                }
+                cached_facts(&element)
+            };
+            let signature = child_signature(
+                &parent_signature,
+                ordinal,
+                &facts.control_type,
+                &facts.automation_id,
+            );
 
-            let name = unsafe { element.CachedName() }
-                .map(|b| b.to_string())
-                .unwrap_or_default();
-            let control_type = unsafe { element.CachedControlType() }
-                .map(|id| control_type_name(id.0 as u32))
-                .unwrap_or("Unknown")
-                .to_string();
-            let automation_id = unsafe { element.CachedAutomationId() }
-                .map(|b| b.to_string())
-                .unwrap_or_default();
-            let rect = unsafe { element.CachedBoundingRectangle() }
-                .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
-                .unwrap_or((0, 0, 0, 0));
-
-            // Skip anonymous chrome to keep the tree readable.
-            if !(name.is_empty() && automation_id.is_empty() && rect.2 == 0) {
+            // Skip anonymous chrome to keep the tree readable. A hollow root is
+            // skipped too: hosted apps (WinUI inside ApplicationFrameHost) answer
+            // with a placeholder element that has no name or rectangle, and its
+            // window title and bounds already come from the window list.
+            if !(facts.name.is_empty() && facts.automation_id.is_empty() && facts.rect.2 == 0) {
                 visited += 1;
                 let node = UiNode {
                     index: 0,
                     depth,
-                    control_type,
-                    name,
-                    automation_id,
-                    rect,
+                    control_type: facts.control_type,
+                    name: facts.name,
+                    automation_id: facts.automation_id,
+                    rect: facts.rect,
+                    signature: signature.clone(),
+                    value: facts.value,
+                    actions: facts.actions,
+                    focused: facts.focused,
                 };
-                if visit(&node) {
+                if visit(&node, &element) {
                     return Ok((truncated, true));
                 }
             }
 
-            if let Ok(array) = unsafe { element.GetCachedChildren() } {
+            if let Ok(array) =
+                unsafe { element.FindAllBuildCache(TreeScope_Children, &anywhere, &cache) }
+            {
                 let len = unsafe { array.Length() }.unwrap_or(0).max(0) as usize;
                 let mut children = Vec::new();
                 for i in 0..len {
                     if let Ok(child) = unsafe { array.GetElement(i as i32) } {
-                        children.push(child);
+                        children.push((child, i));
                     }
                     if children.len() >= max_nodes {
                         truncated = true;
                         break;
                     }
                 }
-                for child in children.into_iter().rev() {
-                    stack.push((child, depth + 1));
+                for (child, child_ordinal) in children.into_iter().rev() {
+                    stack.push((child, depth + 1, signature.clone(), child_ordinal));
                 }
             }
         }

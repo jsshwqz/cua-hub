@@ -114,7 +114,7 @@ export OPENROUTER_API_KEY=sk-or-...
 }
 ```
 
-暴露 35 个工具：
+暴露 38 个工具：
 
 | 工具 | 作用 |
 |------|------|
@@ -125,17 +125,20 @@ export OPENROUTER_API_KEY=sk-or-...
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
 | `list_windows` | 列出可捕获的顶层窗口（标题、应用、坐标、焦点、最小化） |
-| `window_state` | 观测原语：一次返回窗口截图（含菜单/对话框等独立弹层）与窗口内 UIA 元素树 + `element_index` + 焦点元素，并给出 `observation_id` 作为作用域令牌 |
+| `list_apps` | 按进程分组的应用清单（含各自窗口与可启动的 exe 路径）；`include_all` 追加开始菜单里未运行的程序 |
+| `launch_app` | 启动应用并等待其窗口出现；已在运行的直接返回现有窗口；`ready=false` 表示超时内没等到窗口 |
+| `window_state` | 观测原语：一次返回窗口截图（含菜单/对话框等独立弹层，每张图带自己的 `screenshot_id`/原点）与窗口内 UIA 元素树 + `element_index` + 焦点元素，并给出 `observation_id` 作为作用域令牌。元素编号在同一窗口内保持稳定，因此第二次起默认返回 unified diff（`mode=diff`），`unchanged` 表示映射仍有效，`baseline_reset` 表示旧编号全部作废 |
 | `capture_window` | 抓取窗口自身表面（被遮挡也完整），返回 `origin`/`image_scale`/`source`/`hash`，坐标换算由服务端完成 |
 | `wait_for_change` | 阻塞等待窗口或其弹层真的发生变化，用来验证动作是否生效 |
+| `perform_secondary_action` | 调用控件除点击之外的无障碍动作：Expand/Collapse/Raise/Scroll Up·Down·Left·Right/Toggle/Select/Focus/Invoke；只接受该控件在树里 `actions=` 列出的名字，猜错返回 `unsupported_action` 与真实清单，执行后回读状态供验证 |
 | `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |
 | `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选 |
-| `accessibility_tree` | 带编号的 UIA 树（窗口/按钮/输入框 + 矩形），编号可在下一次操作中引用 |
+| `accessibility_tree` | 带编号的桌面级 UIA 树（窗口/按钮/输入框 + 矩形）；日常观测请用 `window_state` |
 | `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心 |
 | `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |
 | `set_control_text` / `set_element_value` | 用 Value/EditableText 模式按名称/编号直接设值（不模拟键盘） |
 | `control_state` | 读取启用/可见、勾选、文本值、展开状态、范围值 |
-| `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽 |
+| `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽；`click` 支持 `observation_id`+`element_index`，或 `observation_id`+`screenshot_id`+`x/y`（弹层图片的坐标系与主窗口不同，必须指名） |
 | `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
 | `type_text` | 向焦点窗口输入任意 Unicode 文本（自动处理 Shift 大写/括号） |
 | `key` | 发送按键组合（PageUp/PageDown/方向键/系统快捷键等） |

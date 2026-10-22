@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod console;
+mod elements;
 mod jobs;
 mod mcp;
 mod observations;
