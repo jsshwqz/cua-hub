@@ -162,8 +162,8 @@ pub fn focus_window(id: u32) -> Result<()> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, ShowWindow,
-        SW_RESTORE,
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
+        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
     };
 
     if id == 0 {
@@ -171,18 +171,32 @@ pub fn focus_window(id: u32) -> Result<()> {
     }
     unsafe {
         let hwnd = HWND(id as *mut _);
-        let foreground = GetForegroundWindow();
-        let foreground_thread = GetWindowThreadProcessId(foreground, None);
-        let current = GetCurrentThreadId();
-        let attached = AttachThreadInput(current, foreground_thread, true).as_bool();
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        let focused = SetForegroundWindow(hwnd).as_bool();
+        if GetForegroundWindow() == hwnd {
+            return Ok(());
+        }
+        // Windows only lets the foreground process call SetForegroundWindow.
+        // Borrow the foreground thread's input queue for the call, then let go
+        // immediately; attaching to the foreground (not the target) thread
+        // avoids the deadlock seen when the target sits in a modal loop.
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let current = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != current
+            && AttachThreadInput(current, foreground_thread, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
         if attached {
             let _ = AttachThreadInput(current, foreground_thread, false);
         }
-        if !focused {
+        if GetForegroundWindow() != hwnd {
+            // Last resort for windows that refuse plain activation.
+            SwitchToThisWindow(hwnd, true);
+        }
+        if GetForegroundWindow() != hwnd {
             return Err(cua_core::Error::Capture(format!(
                 "Windows refused to focus window {id}"
             )));

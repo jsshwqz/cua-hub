@@ -576,8 +576,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                                 w.title.eq_ignore_ascii_case(&selector)
                                     || w.app.eq_ignore_ascii_case(&selector)
                             })
-                        })
-                        .or_else(|| windows.first());
+                        });
                     match chosen {
                         Some(window) => match cua_engine_access::focus_window(window.id) {
                             Ok(()) => tool_ok(json!({
@@ -592,6 +591,76 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 }
                 Err(e) => tool_err(e),
             }
+        }
+        "window_input" => {
+            let selector = match required_str(args, "window") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let text = match required_str(args, "text") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let submit = args["submit"].as_bool().unwrap_or(false);
+            let interval_ms = args["interval_ms"].as_u64().unwrap_or(8);
+            let wanted_id = selector.parse::<u32>().ok();
+            let windows = if wanted_id.is_some() {
+                cua_io::list_windows(None, true)
+            } else {
+                cua_io::list_windows(Some(&selector), true)
+            };
+            let windows = match windows {
+                Ok(w) => w,
+                Err(e) => return tool_err(e),
+            };
+            let chosen = wanted_id
+                .and_then(|id| windows.iter().find(|w| w.id == id))
+                .or_else(|| {
+                    windows.iter().find(|w| {
+                        w.title.eq_ignore_ascii_case(&selector)
+                            || w.app.eq_ignore_ascii_case(&selector)
+                    })
+                });
+            // Never silently fall back to an unrelated window for input.
+            let Some(window) = chosen else {
+                return tool_err(format!("no window matches `{selector}`"));
+            };
+            if let Err(e) = cua_engine_access::focus_window(window.id) {
+                return tool_err(e);
+            }
+            if let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) {
+                let action = Action::Click {
+                    at: Point::new(
+                        window.x.saturating_add(x as i32),
+                        window.y.saturating_add(y as i32),
+                    ),
+                    button: cua_core::MouseButton::Left,
+                    double: false,
+                };
+                if let Err(e) = cua_io::apply(&action, 1.0) {
+                    return tool_err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            let type_action = Action::Type { text, interval_ms };
+            if let Err(e) = cua_io::apply(&type_action, 1.0) {
+                return tool_err(e);
+            }
+            if submit {
+                let enter = Action::Key {
+                    combo: "Return".into(),
+                };
+                if let Err(e) = cua_io::apply(&enter, 1.0) {
+                    return tool_err(e);
+                }
+            }
+            tool_ok(json!({
+                "id": window.id,
+                "title": window.title,
+                "app": window.app,
+                "typed": true,
+                "submitted": submit,
+            }))
         }
         "accessibility_tree" => {
             let max_nodes = args["max_nodes"].as_u64().unwrap_or(120) as usize;
@@ -1094,6 +1163,22 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "window_input",
+            "description": "Atomically focus a window, optionally click a window-relative physical point, type text, and optionally press Return. Use this for consoles/editors where focus can be stolen between separate calls.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "string", "description": "Window id from list_windows, or a title/app substring" },
+                    "text": { "type": "string" },
+                    "x": { "type": "integer", "description": "Window-relative physical X" },
+                    "y": { "type": "integer", "description": "Window-relative physical Y" },
+                    "submit": { "type": "boolean", "default": false },
+                    "interval_ms": { "type": "integer", "default": 8 }
+                },
+                "required": ["window", "text"]
+            }
+        },
+        {
             "name": "accessibility_tree",
             "description": "Return a text snapshot of the Windows accessibility tree (window titles, buttons, edits) with rectangles.",
             "inputSchema": {
@@ -1345,6 +1430,7 @@ mod tests {
         assert!(names.contains(&"list_windows".to_string()));
         assert!(names.contains(&"capture_window".to_string()));
         assert!(names.contains(&"focus_window".to_string()));
+        assert!(names.contains(&"window_input".to_string()));
         assert!(names.contains(&"invoke_element".to_string()));
         assert!(names.contains(&"set_element_value".to_string()));
         assert!(names.contains(&"list_runs".to_string()));

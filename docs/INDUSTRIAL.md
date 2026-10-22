@@ -29,8 +29,8 @@
 - 主通道：`Python 控制台`（当前已打开，位于窗口底部）。
 - 窗口截图：`capture_window {window:"FreeCAD 1.1.3"}` 在 Qoder 盖住 FreeCAD 时
   仍能截到完整窗口，返回 `origin`、`image_scale`；点击坐标 = origin + 图坐标 × scale。
-- 输入：先 `focus_window` 把 FreeCAD 带到前台，再点控制台输入行；`type_text` 已修复
-  Shift 字符（大写、括号、引号）。每条命令后按 `Return`，再截图或读回值确认。
+- 输入：优先用 `window_input` 在一次调用里完成“聚焦 → 点控制台输入行 → 输入 → 回车”，
+  避免多次调用之间焦点被别的应用抢走；`type_text` 已修复 Shift 字符。
 - 已验证的只读命令：
 
 ```python
