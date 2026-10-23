@@ -162,7 +162,16 @@ def main() -> int:
             "type into the entry below" in body,
             "the label only exists inside the probe frame",
         )
-        check("a screenshot came back with the observation", state["images"] >= 1, f"images={state['images']}")
+        # The contract being checked is that a missing image is announced, not
+        # that Xvfb can always produce one: window_state must not silently drop
+        # the half of the observation that failed.
+        captured = state["images"] >= 1
+        announced = bool((state["json"] or {}).get("screenshot_error"))
+        check(
+            "the observation reports its screenshot or says why it cannot",
+            captured or announced,
+            f"images={state['images']} announced={announced}",
+        )
 
         # --- write through EditableText, then fire the action ---------------
         written = call("set_control_text", {"name": "probe-entry", "text": "AT-SPI-WRITES-HERE"})

@@ -11,11 +11,18 @@ import sys
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+from gi.repository import GLib, Gdk, Gtk  # noqa: E402
 
-# WM_CLASS and the AT-SPI application name both come from the program name, so
-# the window list and the accessibility tree agree on which app owns this frame.
-GLib.set_prgname("cua-atspi-probe")
+APP_ID = "cua-atspi-probe"
+
+# The window list and the accessibility tree have to agree on who owns this
+# frame: `set_prgname` names the AT-SPI application, `set_program_class` names
+# the X11 WM_CLASS, and Python leaves the latter as the script filename unless
+# something sets it. Matching is only the backend's problem if both sides were
+# allowed to differ, so they do not here.
+GLib.set_prgname(APP_ID)
+Gdk.set_program_class(APP_ID)
 
 RESULT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/probe_result.txt"
 
