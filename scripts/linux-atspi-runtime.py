@@ -201,9 +201,14 @@ def scenario(identity: str) -> None:
         tree = (state["json"] or {}).get("accessibility") or {}
         body = tree.get("tree") or tree.get("diff") or ""
         node_count = tree.get("node_count", 0)
+        # `disable_diffing` answers `baseline_reset`, not `full`: both mean the
+        # response carried the whole tree, while `diff`/`unchanged` would mean it
+        # referred back to an earlier observation instead.
         check(
             f"[{identity}] window_state returns a window-level accessibility tree",
-            node_count >= 4 and body != "" and tree.get("mode") == "full",
+            node_count >= 4
+            and body != ""
+            and tree.get("mode") in ("full", "baseline_reset"),
             f"nodes={node_count} mode={tree.get('mode')} {state['text'][:120] if node_count < 4 else ''}",
         )
         for control in ("probe-entry", "probe-submit", "probe-toggle"):
