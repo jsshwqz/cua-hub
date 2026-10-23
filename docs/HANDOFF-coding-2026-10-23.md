@@ -170,9 +170,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-qoder.ps1 -S
 
 新留下的口子：
 
-- issue #16：WM_CLASS 与 AT-SPI 应用名不一致的应用（Python 脚本、Electron 一类），
-  Linux 上 `window_state` 匹配不到 frame，只有桌面级 `accessibility_tree` 可用。
-  建议按 pid 对齐，但 AT-SPI 侧取 pid 的接口需要实测确认。
+- ~~issue #16：WM_CLASS 与 AT-SPI 应用名不一致的应用~~ **已解决**：`window_state` 先按
+  进程号认窗口（AT-SPI 接口不报 pid，但总线连接名可以经 `GetConnectionUnixProcessID`
+  换成同一个 pid），名字匹配只作兜底。CI 里 `PROBE_IDENTITY=mismatch` 专门造出两边名字
+  不一致的应用，断言窗口级树仍完整。
+  **仍未验证的一种情形**：包装器启动的应用（flatpak / zap / 启动脚本）可能让窗口的
+  `_NET_WM_PID` 与真正持有总线连接的进程不是同一个号——那时 pid 匹配也会失配并退回名字匹配。
+  没有 Linux 图形桌面可测，别当作已成立。
 - issue #7：文档口径——桌面级 `snapshot()` 与窗口级 `snapshot_window()` 是两条分支，
   结项时不能互相代替。
 
@@ -197,8 +201,9 @@ Qoder 的项目记忆按**工作区路径**键控。通用模式那条对话的�
 
 ## 12. 诚实清单（尚未验证 / 未知）
 
-- Linux 窗口级树与两条动作路径：**已真机验证**（`linux-atspi.yml`，见第 9 节）。
-  仍未验证的是 WM_CLASS 与无障碍应用名不一致的应用 —— issue #16。
+- Linux 窗口级树与两条动作路径：**已真机验证**（`linux-atspi.yml`，见第 9 节），
+  含 WM_CLASS 与无障碍应用名不一致的场景（按 pid 命中）。未验证的是包装器进程
+  （flatpak/zap 一类）下 `_NET_WM_PID` 与总线持有者不同的情形。
 - 观测主序"不切 WGC"的依据是本机五个窗口的样本（记事本/Chrome/微信/资源管理器/Qoder）
   与 release 二进制；换一台 GPU/驱动差异大的机器，兜底触发率可能不同。
 - 代码模式与通用模式的**任务历史是否随模式迁移**，官方文档未说明；本交接文档就是为了

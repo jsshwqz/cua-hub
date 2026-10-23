@@ -16,6 +16,12 @@
 - 链在第一个失败处停止，`stopped_at` / `ran` / `planned` 报告的是**真跑了什么**，
   不是要求跑什么。模型驱动的 `run_task` / `orchestrate` / `browser_task` 不能作为步骤，
   步骤里再带 `then` 会被拒绝——链保持扁平，trace 才能按字面读。
+- **Linux：窗口归属改按进程号判定**（`window_state` 一条路径，issue #16）。
+  `org.a11y.atspi.Application` 本身不报进程号（接口只有 toolkit name、registry 分配的 id
+  和 locale 方法），也不需要：每个应用挂在一条总线连接上，`GetConnectionUnixProcessID`
+  能把那个连接名换成与窗口列表同一个 pid。于是 `WM_CLASS` 与无障碍应用名不一致的常见情况
+  ——Python 应用报脚本文件名、Electron 报 `electron`——也能命中窗口级树，名字匹配退为兜底。
+  匹配不上时的报错也改得能用：列出总线上实际看到的应用名，并指路 `accessibility_tree`。
 
 ### 验证
 
@@ -27,7 +33,8 @@
   第四步的回车没有发出（光标仍在第 1 行第 12 列）。
 - 这组数字早期是在 debug 二进制上取的（94.6 KB / 48.8 KB、约 3.5 秒），debug 下图像缩放
   与哈希慢一个数量级，已按 release 复测更正。
-- 新增 9 项测试（链策略面 8 项、捕获的 lossless 归属 1 项）。
+- 新增 11 项测试（链策略面 8 项、捕获的 lossless 归属 1 项、Linux 窗口匹配 2 项），
+  workspace 测试数 **67 → 78**。
 - Linux 窗口级无障碍路径**真机结项**（`linux-atspi.yml`：Xvfb + openbox + at-spi2-core +
   GTK3 probe 窗口，MCP 服务在作业里真跑）。通过的断言：`list_windows` 看到窗口、
   `window_state` 返回窗口级树 6 个节点且三个命名控件都在树内、帧内标签证明不是桌面级整树、
@@ -44,8 +51,9 @@
   是上面那个 CI 作业跑出来的第一个成果。）
 - Linux：CI probe 应用此前只在 AT-SPI 侧声明身份，X11 的 WM_CLASS 仍是脚本文件名，
   `snapshot_window` 的 app 匹配因此落空。现在两侧统一（`set_prgname` +
-  `set_program_class`）。顺带记下真实缺口：WM_CLASS 与无障碍应用名不一致的应用
-  （Python 脚本应用、Electron 等）今天在 Linux 上只有桌面级树可用 —— issue #16。
+  `set_program_class`），而**这类不一致本身也不再是缺口**：窗口归属优先按进程号判定
+  （见上面「Linux：窗口归属改按进程号判定」），CI 用 `PROBE_IDENTITY=mismatch` 跑一个
+  两边名字确实不同的应用来证明它命中 —— issue #16 因此关闭。
 
 ### 性能与诊断
 

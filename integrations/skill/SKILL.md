@@ -196,6 +196,10 @@ the keystrokes, and say what data goes where and why.
 - Model credentials in the server environment: `OPENROUTER_API_KEY` /
   `OPENAI_API_KEY` (OpenAI-compatible), or `ANTHROPIC_API_KEY`.
 - Windows: UIA works out of the box. Linux: AT-SPI needs a running accessibility
-  bus; X11 input via enigo.
+  bus; X11 input via enigo. `window_state` matches a window to its frame by process
+  id, so apps whose X11 class and accessibility name differ (Python scripts report
+  the script filename, Electron reports `electron`) still resolve. When no frame can
+  be matched the error lists the applications the bus does expose — fall back to
+  `accessibility_tree` plus `find_control`/`invoke_control` by name.
 - CLI fallback: `cua-hub run "<task>"`, `cua-hub browser "<task>"`,
   `cua-hub orchestrate "<task>"`, `cua-hub console` for a local live view.

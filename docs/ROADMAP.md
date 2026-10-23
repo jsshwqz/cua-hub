@@ -72,12 +72,16 @@
   `cua-hub tree` 119→151 节点、`find` 按名定位准确。注意口径：那是**桌面级** `snapshot()`，
   不是窗口级；窗口级与动作路径见下一条）
 - [x] Linux 窗口级 `snapshot_window` + `DoAction` + `SetTextContents` 真机验证
-  （2026-10-23 由 `linux-atspi.yml` 结项：Xvfb + openbox + at-spi2-core + GTK3 probe 窗口，
+  —— 2026-10-23 由 `linux-atspi.yml` 结项：Xvfb + openbox + at-spi2-core + GTK3 probe 窗口，
   MCP 服务在作业里真跑。断言含窗口级树 6 个节点、三个命名控件都在树内、帧内标签证明
   这不是桌面级整树、截图回来了一张、`set_control_text` 写入 18 字符、`invoke_control`
   触发按钮，最后由 probe 应用自己写回的文件确认文本真的进了控件。过程中修掉一个真 bug：
   `SetTextContents` 的回包是 bool，解码成 `()` 会让"应用已经写入"被报成"控件没有该模式"。
-  边界见 issue #16：WM_CLASS 与 AT-SPI 应用名不一致的应用仍只能走桌面级树）
+  issue #16 同期解决：`window_state` 先按**进程号**认窗口——AT-SPI 接口本身不报 pid，
+  但每个应用挂在一条总线连接上，`GetConnectionUnixProcessID` 能把总线名换成与窗口列表
+  同一个 pid，因此 WM_CLASS 与无障碍应用名不一致（Python 脚本、Electron 一类）也能命中，
+  名字匹配退为兜底。CI 用 `PROBE_IDENTITY=mismatch` 造出两边名字确实不同的应用并断言
+  树仍然完整（run `39915558784`，0 failed）。
 - [x] 观测主序是否全面切 WGC：**结论是不切**，保留 PrintWindow 为主、WGC 兜底。
   同一轮交替实测（release 二进制，`capture_window` max_edge 1280）里 WGC 每次都慢
   2.1~5.8 倍（记事本 147→858ms、Chrome 628→1338ms、微信 211→912ms），
