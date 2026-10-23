@@ -66,6 +66,6 @@
 - [x] `then:[…]` 服务端动作链：一次调用按序跑确定性图元动作，只回一份逐步 trace
   加一次观测；步骤继承 `observation_id`/`window`，失败即停在 `stopped_at`，
   模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 48%）
-- [ ] Linux 窗口级 AT-SPI 树的真机验证（代码与 Linux 目标类型检查已过，无可用图形会话）
+- [x] Linux 窗口级 AT-SPI 树的真机验证（2026-10-23 完成：InstaBox 云机 Debian 13 + Xfce 真图形会话，tree 返回 119→151 节点含真实应用窗口，find 按名定位准确；详见 CHANGELOG 的 Unreleased 验证记录）
 - [ ] 观测全面切到 WGC（当前 PrintWindow 为主、WGC 为兜底）
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"
