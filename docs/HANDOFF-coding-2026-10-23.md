@@ -2,6 +2,7 @@
 
 这份文档是给**在代码模式（Coding）下新开的任务**看的。新任务读不到通用模式里那条对话的历史，
 所以这里把目标、现状、契约、命令、纪律和坑一次写全。仓库内其他权威文档：
+`docs/DECISIONS-2026-10-23.md`（需求原文与决策/推翻记录——想知道"为什么这么定"看它）、
 `CHANGELOG.md`（已发布内容）、`docs/ROADMAP.md`（阶段与待办）、`docs/INDUSTRIAL.md`（工业软件实操与坑）、
 `integrations/skill/SKILL.md`（给使用方 Agent 的能力说明书）、`docs/VERSIONS.md`（三条谱系对照）。
 
