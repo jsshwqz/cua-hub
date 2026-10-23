@@ -348,9 +348,13 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
             return false;
         }
         if let Ok(editable) = Proxy::new(conn, dest, path, "org.a11y.atspi.EditableText") {
+            // SetTextContents answers with a boolean. Decoding it as nothing
+            // made a call that the toolkit *had* applied look like a control
+            // without the interface, which is the opposite of what the caller
+            // needs to know.
             if editable
-                .call::<_, _, ()>("SetTextContents", &(text,))
-                .is_ok()
+                .call::<_, _, bool>("SetTextContents", &(text,))
+                .unwrap_or(false)
             {
                 hit = Some(node.clone());
                 return true;
