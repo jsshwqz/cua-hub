@@ -28,6 +28,9 @@ pub struct Frame {
     /// that space is physical pixels and this equals `scale`.
     pub input_scale: f32,
     pub dpi: f32,
+    /// Lossless copy of the unscaled capture, for archiving a run. Empty unless
+    /// the caller asked for it: encoding it costs more than everything else in
+    /// the capture path combined, and only the vision run log reads it.
     pub png: Vec<u8>,
     pub physical: (u32, u32),
 }
@@ -136,6 +139,9 @@ pub struct WindowCapture {
     pub source: CaptureSource,
     /// Average hash of the unscaled capture, for change detection.
     pub hash: u64,
+    /// When a compositor-side backend was tried and refused, the stage that
+    /// refused. `None` when nothing else was attempted or when it worked.
+    pub backend_error: Option<String>,
 }
 
 /// List capturable top-level windows, optionally filtered by a case-insensitive
@@ -253,12 +259,13 @@ pub fn capture_window(selector: &str, max_edge: u32, jpeg_quality: u8) -> Result
         )));
     }
     let hash = average_hash(&image);
-    let frame = frame_from_image(image, max_edge, jpeg_quality, dpi_scale())?;
+    let frame = frame_from_image(image, max_edge, jpeg_quality, dpi_scale(), false)?;
     Ok(WindowCapture {
         info,
         frame,
         source,
         hash,
+        backend_error: backend_error(),
     })
 }
 
@@ -316,6 +323,20 @@ fn window_surface(
     Ok((image, CaptureSource::Platform))
 }
 
+/// Why the compositor backend refused for the capture that just ran on this
+/// thread, if it was tried at all. A fallback that fails silently is not
+/// actionable: the caller can see `source` moved, but only the stage that
+/// refused says why.
+#[cfg(windows)]
+fn backend_error() -> Option<String> {
+    crate::wgc::take_error()
+}
+
+#[cfg(not(windows))]
+fn backend_error() -> Option<String> {
+    None
+}
+
 #[cfg(not(windows))]
 fn window_surface(
     window: &xcap::Window,
@@ -337,12 +358,13 @@ fn capture_hwnd(info: WindowInfo, max_edge: u32, jpeg_quality: u8) -> Result<Win
         )));
     };
     let hash = average_hash(&image);
-    let frame = frame_from_image(image, max_edge, jpeg_quality, dpi_scale())?;
+    let frame = frame_from_image(image, max_edge, jpeg_quality, dpi_scale(), false)?;
     Ok(WindowCapture {
         info,
         frame,
         source,
         hash,
+        backend_error: backend_error(),
     })
 }
 
@@ -564,13 +586,28 @@ pub fn observe(max_edge: u32, jpeg_quality: u8) -> Result<Frame> {
     } else {
         1.0
     };
-    frame_from_image(captured.image, max_edge, jpeg_quality, dpi)
+    frame_from_image(captured.image, max_edge, jpeg_quality, dpi, true)
 }
 
-fn frame_from_image(image: RgbaImage, max_edge: u32, jpeg_quality: u8, dpi: f32) -> Result<Frame> {
+/// Build the frame a model sees.
+///
+/// `lossless` additionally encodes the unscaled capture as PNG. That is the most
+/// expensive step in this path and only the run log reads it, so an observation
+/// that writes no file — every MCP tool call — must not pay for it.
+fn frame_from_image(
+    image: RgbaImage,
+    max_edge: u32,
+    jpeg_quality: u8,
+    dpi: f32,
+    lossless: bool,
+) -> Result<Frame> {
     let physical = image.dimensions();
     let dpi = if dpi > 0.0 { dpi } else { 1.0 };
-    let png = encode_png(&image)?;
+    let png = if lossless {
+        encode_png(&image)?
+    } else {
+        Vec::new()
+    };
     let (resized, scale) = fit_to(image, max_edge);
     let (w, h) = resized.dimensions();
 
@@ -661,5 +698,26 @@ mod tests {
             }
         }
         assert_ne!(average_hash(&a), average_hash(&b));
+    }
+
+    #[test]
+    fn the_lossless_artifact_is_only_built_for_the_caller_that_reads_it() {
+        let image = RgbaImage::from_pixel(64, 48, Rgba([12, 34, 56, 255]));
+        let observed = frame_from_image(image.clone(), 32, 70, 1.0, false).expect("frame");
+        let archived = frame_from_image(image, 32, 70, 1.0, true).expect("frame");
+        // The run log is the only reader of `png`; every MCP observation must
+        // still hand back identical pixels and coordinates without it.
+        assert!(
+            observed.png.is_empty(),
+            "no PNG for a caller that files nothing"
+        );
+        assert!(
+            archived.png.starts_with(&[0x89, b'P', b'N', b'G']),
+            "the vision run log keeps its lossless frame"
+        );
+        assert_eq!(observed.physical, archived.physical);
+        assert_eq!(observed.scale, archived.scale);
+        assert_eq!(observed.observation.width, archived.observation.width);
+        assert!(!observed.observation.image.is_empty());
     }
 }

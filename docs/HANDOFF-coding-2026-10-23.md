@@ -32,8 +32,11 @@
 
 - 已发布 **v0.1.3**（Latest，非预发布）：https://github.com/jsshwqz/cua-hub/releases/tag/v0.1.3
   资产 `cua-hub-windows-x64-0.1.3.zip`（exe + SKILL.md + README + CHANGELOG）。
-- 分支 `main`，最新提交 `07320a4`。CI（ubuntu-24.04 + windows-latest）对该提交**双平台通过**。
-- MCP 工具 **38 个**；本机 `dist/cua-hub.exe` 已装到 0.1.3。
+- 分支 `main`。0.1.3 之后已进：`4c68332` 动作链 `then:[…]`；0.1.3 与本轮之间还有别的
+  会话合入的文档提交（PR #6）。工具数 38（链复用现有工具，未新增工具名）。
+- 门禁：`cargo fmt --check` + `clippy --workspace --all-targets -D warnings` +
+  `test --workspace` 全绿；本机测试数 **76**（0.1.3 时 67）。CI（ubuntu-24.04 +
+  windows-latest）对 `4c68332` 双平台通过。
 - 版本策略：0.x 阶段按发布节奏走，**不为体现功能量级跳版本号**（用户明确要求）。
 - 私有仓库 `jsshwqz/cua-hub`；推送用 `(unset GITHUB_TOKEN; git push origin main)`（环境变量里的
   `GITHUB_TOKEN` 会让 gh/git 403，keyring 里的 classic PAT 才有效）。
@@ -150,14 +153,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-qoder.ps1 -S
 - Git Bash 会把 `C:\\path` 参数吞成 `C:\path`（MSYS 路径转换），JSON 参数里改用正斜杠。
 - `#[cfg(not(windows))]` 里的 `return` 等 lint 本地看不见，Windows 绿灯 ≠ Linux 绿灯。
 
-## 9. 待办候选（按建议顺序，未开工）
+## 9. 待办候选（2026-10-23 下午更新）
 
-1. **Linux 窗口级 AT-SPI 树真机验证**：代码与 Linux 目标类型检查已过，缺可用图形会话
-   （本机 WSL 只剩 podman 精简发行版，无 cargo / 无会话总线）。
-2. **观测全面切 WGC**：目前 PrintWindow 为主、WGC 兜底；需要评估受保护内容与性能边界后再定主序。
-3. **`then:[…]` 服务端动作链**：一次调用里执行确定性动作序列并只回一次状态，省往返。
-4. **连续感知层**（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）：
+1. ~~Linux 窗口级 AT-SPI 树真机验证~~ **已完成**：`linux-atspi.yml` 在 Xvfb + openbox +
+   at-spi2 + GTK3 probe 上真跑 MCP，窗口级树、`SetTextContents`、`DoAction` 都有断言，
+   并以 probe 应用自己写回的文本作独立 oracle。过程中修掉一个只有真机能发现的 bug
+   （回包 bool 被解码成 `()`，把写入成功报成"控件没有该模式"）。
+2. ~~观测全面切 WGC 的评估~~ **已完成，结论是不切**：同一轮交替实测里 WGC 每次慢
+   2.1~5.8 倍，而本机五个窗口（含三个 Chromium 合成窗口）PrintWindow 全不空白、兜底从未触发。
+   要重开这件事，先解决"每次捕获新建 device/frame pool/session"的固定开销。
+   配套已做：WGC 拒绝时在观测里返回 `backend_error.stage`。
+3. ~~`then:[…]` 服务端动作链~~ **已完成**：见 `CHANGELOG.md` Unreleased 与 `SKILL.md`
+   「Chaining several actions into one call」。
+4. 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）：
    用户认可方向但明确"暂不做"，开工前先确认。
+
+新留下的口子：
+
+- ~~issue #16：WM_CLASS 与 AT-SPI 应用名不一致的应用~~ **已解决**：`window_state` 先按
+  进程号认窗口（AT-SPI 接口不报 pid，但总线连接名可以经 `GetConnectionUnixProcessID`
+  换成同一个 pid），名字匹配只作兜底。CI 里 `PROBE_IDENTITY=mismatch` 专门造出两边名字
+  不一致的应用，断言窗口级树仍完整。
+  **仍未验证的一种情形**：包装器启动的应用（flatpak / zap / 启动脚本）可能让窗口的
+  `_NET_WM_PID` 与真正持有总线连接的进程不是同一个号——那时 pid 匹配也会失配并退回名字匹配。
+  没有 Linux 图形桌面可测，别当作已成立。
+- issue #7：文档口径——桌面级 `snapshot()` 与窗口级 `snapshot_window()` 是两条分支，
+  结项时不能互相代替。
 
 ## 10. 协作规矩（用户偏好）
 
@@ -180,7 +201,11 @@ Qoder 的项目记忆按**工作区路径**键控。通用模式那条对话的�
 
 ## 12. 诚实清单（尚未验证 / 未知）
 
-- Linux 窗口级树：未真机验证。
+- Linux 窗口级树与两条动作路径：**已真机验证**（`linux-atspi.yml`，见第 9 节），
+  含 WM_CLASS 与无障碍应用名不一致的场景（按 pid 命中）。未验证的是包装器进程
+  （flatpak/zap 一类）下 `_NET_WM_PID` 与总线持有者不同的情形。
+- 观测主序"不切 WGC"的依据是本机五个窗口的样本（记事本/Chrome/微信/资源管理器/Qoder）
+  与 release 二进制；换一台 GPU/驱动差异大的机器，兜底触发率可能不同。
 - 代码模式与通用模式的**任务历史是否随模式迁移**，官方文档未说明；本交接文档就是为了
   在新任务里重建上下文。
 - `selected_text` 未在遗留 Win32 编辑框与 Win11 记事本上验证（这些应用确实没有 Text 模式），

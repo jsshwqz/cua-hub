@@ -173,6 +173,159 @@ fn walk_from(
 /// Roles that own a window on screen: frame, dialog and window.
 const TOP_LEVEL_ROLES: [u32; 3] = [23, 16, 69];
 
+/// The process that owns a connection on the bus this snapshot is reading.
+///
+/// `org.a11y.atspi.Application` deliberately exposes no process id — its own
+/// documentation lists only the toolkit name, an id assigned by the registry,
+/// and locale methods. The bus name each application is reached through belongs
+/// to a connection, and the daemon that accepted it knows which process made
+/// it, which is enough: `WindowInfo.pid` from the window list and this answer
+/// are the same number for the same process.
+fn bus_pid(conn: &Connection, bus_name: &str) -> Option<u32> {
+    let proxy = Proxy::new(
+        conn,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .ok()?;
+    // The daemon answers 0 for a name it does not know, which is a miss rather
+    // than an error, so it is not a match either.
+    proxy
+        .call::<_, _, u32>("GetConnectionUnixProcessID", &(bus_name,))
+        .ok()
+        .filter(|pid| *pid != 0)
+}
+
+/// Which of one application's top-level frames a window refers to.
+///
+/// A title match wins. With no match, a single frame is the obvious owner; more
+/// than one is refused, because acting on the wrong window is worse than
+/// reporting that the mapping is unavailable. `Err` carries the frame names that
+/// were actually seen, which is what a caller needs to correct a stale title.
+fn resolve_frame(frames: &[String], title: &str) -> std::result::Result<usize, Vec<String>> {
+    if let Some(index) = frames.iter().position(|have| title_matches(have, title)) {
+        return Ok(index);
+    }
+    if frames.len() == 1 {
+        return Ok(0);
+    }
+    Err(frames.to_vec())
+}
+
+/// The report a caller gets when no frame could be chosen. The names the bus
+/// actually exposed are part of it: a failure that only repeats what was asked
+/// for leaves the caller guessing which side of the match was wrong.
+fn no_frame_message(app: &str, title: &str, pid: u32, observed: &[String]) -> String {
+    let mut out = format!("no AT-SPI frame matches window `{title}` of app `{app}` (pid {pid})");
+    if observed.is_empty() {
+        out.push_str("; the accessibility bus lists no applications");
+    } else {
+        let listed = observed
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = observed.len().saturating_sub(8);
+        out.push_str(&format!(
+            "; applications on the bus are: {listed}{}",
+            if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    out.push_str("; read the desktop-wide tree with accessibility_tree and act by name when a window cannot be matched");
+    out
+}
+
+/// Snapshot the subtree of the AT-SPI frame that corresponds to one window.
+///
+/// The frame is found by process id first: the window list and the accessibility
+/// bus agree on the owner of a connection even when the toolkit's X11 class and
+/// its accessibility name disagree, which is ordinary for scripted GTK
+/// applications (`WM_CLASS` is the script filename) and Electron ones
+/// (`electron`). Names remain only as a fallback for when the pid cannot be
+/// resolved, and an ambiguous title is still refused rather than guessed.
+pub fn snapshot_window(
+    app: &str,
+    title: &str,
+    pid: u32,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<UiSnapshot> {
+    let conn = a11y_connection()?;
+    let apps = children(&conn, REGISTRY, ROOT_PATH)?;
+
+    let mut by_pid: Option<(String, OwnedObjectPath)> = None;
+    let mut by_name: Option<(String, OwnedObjectPath)> = None;
+    let mut observed: Vec<String> = Vec::new();
+
+    for (dest, path) in &apps {
+        let (name, _role, _rect, _kids) = read_node(&conn, dest, path);
+        observed.push(if name.is_empty() {
+            dest.clone()
+        } else {
+            format!("{name} [{dest}]")
+        });
+        if by_pid.is_none() && bus_pid(&conn, dest) == Some(pid) {
+            by_pid = Some((dest.clone(), path.clone()));
+        }
+        if by_name.is_none() && app_matches(&name, dest, app) {
+            by_name = Some((dest.clone(), path.clone()));
+        }
+    }
+
+    let (dest, path) = match by_pid.or(by_name) {
+        Some(pair) => pair,
+        None => return Err(Error::Capture(no_frame_message(app, title, pid, &observed))),
+    };
+
+    let (_name, _role, _rect, kids) = read_node(&conn, &dest, &path);
+    let frames: Vec<(String, OwnedObjectPath)> = kids
+        .into_iter()
+        .filter(|(fd, fp)| {
+            let (_n, role, _rect, _) = read_node(&conn, fd, fp);
+            TOP_LEVEL_ROLES.contains(&role)
+        })
+        .collect();
+    if frames.is_empty() {
+        return Err(Error::Capture(no_frame_message(app, title, pid, &observed)));
+    }
+    let frame_names: Vec<String> = frames
+        .iter()
+        .map(|(fd, fp)| read_node(&conn, fd, fp).0)
+        .collect();
+    let chosen = resolve_frame(&frame_names, title).map_err(|seen| {
+        Error::Capture(format!(
+            "several AT-SPI frames belong to `{app}` (pid {pid}) and none matches `{title}`: [{}]; pass a more exact title",
+            seen.join(", ")
+        ))
+    })?;
+
+    let (dest, path) = frames[chosen].clone();
+    let mut nodes = Vec::new();
+    let (truncated, _) = walk_from(
+        &conn,
+        vec![(dest, path)],
+        max_nodes,
+        max_depth,
+        &mut |_, node, _, _| {
+            let mut node = node.clone();
+            node.index = nodes.len();
+            nodes.push(node);
+            false
+        },
+    )?;
+    Ok(UiSnapshot { nodes, truncated })
+}
+
+/// The application a window list entry refers to. The window list reports a
+/// process name, the toolkit registers a display name, and the bus reports an
+/// identifier, so any of them may be the one that matches — this is only the
+/// fallback now that a process id can decide it outright.
 fn app_matches(at_spi_name: &str, bus_name: &str, want: &str) -> bool {
     let want = want.to_lowercase();
     if want.is_empty() {
@@ -191,85 +344,6 @@ fn title_matches(at_spi_name: &str, want: &str) -> bool {
     }
     let have = at_spi_name.trim().to_lowercase();
     have == want || have.contains(&want) || want.contains(&have)
-}
-
-/// Snapshot the subtree of the AT-SPI frame that corresponds to one window.
-///
-/// AT-SPI does not expose X11 window ids, so the frame is found by matching the
-/// owning application's name and the frame title — the same two fields the
-/// window list reports. A title match is preferred; an application with exactly
-/// one top level falls back to it, and anything more specific than that is
-/// refused rather than guessed, because acting on the wrong window is worse
-/// than reporting that the mapping is unavailable.
-pub fn snapshot_window(
-    app: &str,
-    title: &str,
-    max_nodes: usize,
-    max_depth: usize,
-) -> Result<UiSnapshot> {
-    let conn = a11y_connection()?;
-    let apps = children(&conn, REGISTRY, ROOT_PATH)?;
-
-    let mut chosen: Option<(String, OwnedObjectPath)> = None;
-    let mut ambiguous = false;
-    for (dest, path) in &apps {
-        let (name, _role, _rect, kids) = read_node(&conn, dest, path);
-        if !app_matches(&name, dest, app) {
-            continue;
-        }
-        let tops: Vec<(String, OwnedObjectPath)> = kids
-            .iter()
-            .filter(|(fd, fp)| {
-                let (_n, role, _rect, _) = read_node(&conn, fd, fp);
-                TOP_LEVEL_ROLES.contains(&role)
-            })
-            .cloned()
-            .collect();
-        if tops.is_empty() {
-            continue;
-        }
-        if let Some(hit) = tops
-            .iter()
-            .find(|(fd, fp)| title_matches(&read_node(&conn, fd, fp).0, title))
-        {
-            chosen = Some(hit.clone());
-            break;
-        }
-        if tops.len() == 1 {
-            chosen = Some(tops[0].clone());
-            break;
-        }
-        ambiguous = true;
-    }
-
-    let (dest, path) = match chosen {
-        Some(pair) => pair,
-        None if ambiguous => {
-            return Err(Error::Capture(format!(
-                "several AT-SPI frames belong to `{app}` and none matches `{title}`; pass a more exact title"
-            )))
-        }
-        None => {
-            return Err(Error::Capture(format!(
-                "no AT-SPI frame matches app `{app}` title `{title}`"
-            )))
-        }
-    };
-
-    let mut nodes = Vec::new();
-    let (truncated, _) = walk_from(
-        &conn,
-        vec![(dest, path)],
-        max_nodes,
-        max_depth,
-        &mut |_, node, _, _| {
-            let mut node = node.clone();
-            node.index = nodes.len();
-            nodes.push(node);
-            false
-        },
-    )?;
-    Ok(UiSnapshot { nodes, truncated })
 }
 
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
@@ -348,9 +422,13 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
             return false;
         }
         if let Ok(editable) = Proxy::new(conn, dest, path, "org.a11y.atspi.EditableText") {
+            // SetTextContents answers with a boolean. Decoding it as nothing
+            // made a call that the toolkit *had* applied look like a control
+            // without the interface, which is the opposite of what the caller
+            // needs to know.
             if editable
-                .call::<_, _, ()>("SetTextContents", &(text,))
-                .is_ok()
+                .call::<_, _, bool>("SetTextContents", &(text,))
+                .unwrap_or(false)
             {
                 hit = Some(node.clone());
                 return true;
@@ -396,5 +474,49 @@ mod tests {
         assert!(title_matches("Settings", "Settings window"));
         assert!(!title_matches("Settings", ""));
         assert!(!title_matches("Settings", "gedit"));
+    }
+
+    #[test]
+    fn a_matching_title_wins_and_an_ambiguous_set_is_refused() {
+        let frames = vec!["Untitled — gedit".to_string(), "Settings".to_string()];
+        assert_eq!(resolve_frame(&frames, "settings"), Ok(1));
+        // One frame needs no title to be identified; several do.
+        assert_eq!(
+            resolve_frame(&["Only".to_string()], "something else"),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_frame(&frames, "").unwrap_err().len(),
+            2,
+            "the refusal must name what was available"
+        );
+        assert!(resolve_frame(&[], "anything").is_err());
+    }
+
+    #[test]
+    fn a_refused_match_says_what_the_bus_actually_show() {
+        let message = no_frame_message(
+            "electron",
+            "My App",
+            4242,
+            &["gedit [:1.7]".to_string(), "Navigator [:1.9]".to_string()],
+        );
+        assert!(
+            message.contains("`My App`"),
+            "keeps the title that was asked for"
+        );
+        assert!(
+            message.contains("pid 4242"),
+            "keeps the owner it was looking for"
+        );
+        assert!(
+            message.contains("gedit [:1.7]"),
+            "reports the names the bus really exposed, not just the request"
+        );
+        assert!(
+            message.contains("accessibility_tree"),
+            "and points at the route that still works"
+        );
+        assert!(no_frame_message("x", "y", 1, &[]).contains("no applications"));
     }
 }

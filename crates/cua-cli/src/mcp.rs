@@ -341,7 +341,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 /// coordinate space is self-describing rather than something the model has to
 /// reconstruct from DPI.
 fn window_capture_meta(cap: &cua_io::WindowCapture) -> Value {
-    json!({
+    let mut meta = json!({
         "id": cap.info.id,
         "pid": cap.info.pid,
         "app": cap.info.app,
@@ -358,7 +358,13 @@ fn window_capture_meta(cap: &cua_io::WindowCapture) -> Value {
         "source": format!("{:?}", cap.source),
         "hash": cap.hash,
         "mapping": "screen = origin + image * image_scale",
-    })
+    });
+    // When the compositor backend was tried and refused, say which stage refused:
+    // `source` alone tells the caller a fallback happened, not why or what to fix.
+    if let Some(stage) = &cap.backend_error {
+        meta["backend_error"] = json!({ "backend": "GraphicsCapture", "stage": stage });
+    }
+    meta
 }
 
 /// Result of resolving a window selector against the live window list.
@@ -1272,6 +1278,7 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     window.id,
                     &window.app,
                     &window.title,
+                    window.pid,
                     max_nodes,
                     depth,
                 ) {
@@ -1310,6 +1317,7 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                                 rel.id,
                                 &rel.app,
                                 &rel.title,
+                                rel.pid,
                                 MAX_POPUP_NODES,
                                 depth,
                             ) {

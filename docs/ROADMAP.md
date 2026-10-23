@@ -19,9 +19,11 @@
 - [x] Hybrid context: `--ui-tree` adds the tree to vision prompts
 - [x] `cua-engine-access`: find/invoke controls by name or AutomationId
 - [x] UIA Invoke/Value patterns and control state (Windows, verified)
-- [x] AT-SPI DoAction/SetTextContents (implemented; live Linux runtime pending)
+- [x] AT-SPI DoAction/SetTextContents (2026-10-23 真机验证：CI 图形会话里 `invoke_control`
+  触发按钮、`set_control_text` 写入 entry，probe 应用自己写回的文本证实两条路径都落地)
 - [x] Linux AT-SPI2 tree + find (verified in WSL with a GTK3 window)
-- [ ] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
+- [x] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
+  （DoAction 见上；workspace 在 ubuntu-24.04 上 fmt/clippy/test/release build 全绿）
 - [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health
 - [ ] Engine fallback on repeated failure
@@ -65,7 +67,27 @@
 - [x] 安全策略对齐四档确认模型（交还用户 / 动作时确认 / 点名预批准 / 无需确认）
 - [x] `then:[…]` 服务端动作链：一次调用按序跑确定性图元动作，只回一份逐步 trace
   加一次观测；步骤继承 `observation_id`/`window`，失败即停在 `stopped_at`，
-  模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 48%）
-- [x] Linux 窗口级 AT-SPI 树的真机验证（2026-10-23 完成：InstaBox 云机 Debian 13 + Xfce 真图形会话，tree 返回 119→151 节点含真实应用窗口，find 按名定位准确；详见 CHANGELOG 的 Unreleased 验证记录）
-- [ ] 观测全面切到 WGC（当前 PrintWindow 为主、WGC 为兜底）
+  模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 55%）
+- [x] Linux 桌面级 AT-SPI 树的真机验证（2026-10-23，InstaBox 云机 Debian 13 + Xfce；
+  `cua-hub tree` 119→151 节点、`find` 按名定位准确。注意口径：那是**桌面级** `snapshot()`，
+  不是窗口级；窗口级与动作路径见下一条）
+- [x] Linux 窗口级 `snapshot_window` + `DoAction` + `SetTextContents` 真机验证
+  —— 2026-10-23 由 `linux-atspi.yml` 结项：Xvfb + openbox + at-spi2-core + GTK3 probe 窗口，
+  MCP 服务在作业里真跑。断言含窗口级树 6 个节点、三个命名控件都在树内、帧内标签证明
+  这不是桌面级整树、截图回来了一张、`set_control_text` 写入 18 字符、`invoke_control`
+  触发按钮，最后由 probe 应用自己写回的文件确认文本真的进了控件。过程中修掉一个真 bug：
+  `SetTextContents` 的回包是 bool，解码成 `()` 会让"应用已经写入"被报成"控件没有该模式"。
+  issue #16 同期解决：`window_state` 先按**进程号**认窗口——AT-SPI 接口本身不报 pid，
+  但每个应用挂在一条总线连接上，`GetConnectionUnixProcessID` 能把总线名换成与窗口列表
+  同一个 pid，因此 WM_CLASS 与无障碍应用名不一致（Python 脚本、Electron 一类）也能命中，
+  名字匹配退为兜底。CI 用 `PROBE_IDENTITY=mismatch` 造出两边名字确实不同的应用并断言
+  树仍然完整（run `39915558784`，0 failed）。
+- [x] 观测主序是否全面切 WGC：**结论是不切**，保留 PrintWindow 为主、WGC 兜底。
+  同一轮交替实测（release 二进制，`capture_window` max_edge 1280）里 WGC 每次都慢
+  2.1~5.8 倍（记事本 147→858ms、Chrome 628→1338ms、微信 211→912ms），
+  而本机五个窗口（含三个 Chromium 合成窗口）PrintWindow 全都不空白，兜底从未触发。
+  慢不在 WGC 本身，而在我们的实现：当前每次捕获都新建 D3D device + frame pool +
+  session，约 0.7~1.2 秒固定开销。真要切主序，先做会话复用再谈。
+  配套改动：WGC 拒绝时把**失败阶段**报出来（观测里新增 `backend_error`），
+  以前 `capture_or_error` 写明了阶段却被调用方丢成 `None`，等于没有诊断。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"

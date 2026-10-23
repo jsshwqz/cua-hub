@@ -16,21 +16,67 @@
 - 链在第一个失败处停止，`stopped_at` / `ran` / `planned` 报告的是**真跑了什么**，
   不是要求跑什么。模型驱动的 `run_task` / `orchestrate` / `browser_task` 不能作为步骤，
   步骤里再带 `then` 会被拒绝——链保持扁平，trace 才能按字面读。
+- **Linux：窗口归属改按进程号判定**（`window_state` 一条路径，issue #16）。
+  `org.a11y.atspi.Application` 本身不报进程号（接口只有 toolkit name、registry 分配的 id
+  和 locale 方法），也不需要：每个应用挂在一条总线连接上，`GetConnectionUnixProcessID`
+  能把那个连接名换成与窗口列表同一个 pid。于是 `WM_CLASS` 与无障碍应用名不一致的常见情况
+  ——Python 应用报脚本文件名、Electron 报 `electron`——也能命中窗口级树，名字匹配退为兜底。
+  匹配不上时的报错也改得能用：列出总线上实际看到的应用名，并指路 `accessibility_tree`。
 
 ### 验证
 
-- 本机真机实测（loopback HTTP + 记事本）：同一个任务分开调用是 5 次 / 94.6 KB，
-  链式调用是 2 次 / 48.8 KB，少 3 个往返、省 48% 字节；墙钟时间持平（约 3.5 秒），
-  因为"动手前观测一次、收尾观测一次"两种做法都要付。
-- 负控：链中第三步参数非法时，`ran=3 stopped_at=2`，前两步确实落地（文字进了文档），
+- 动作链本机真机实测（release 二进制，loopback HTTP + 记事本，同一任务两种写法各跑两轮）：
+  分开调用 5 次 / 1527ms / 109.8 KB，链式调用 2 次 / 1320ms / 49.1 KB——少 3 个往返、
+  省 55% 字节、快 207ms。时延没省更多，是因为"动手前观测一次、收尾观测一次"两边都要付；
+  收益在往返次数与 token 上，链越长越明显。
+- 负控：链中第三步参数非法时 `ran=3 stopped_at=2`，前两步确实落地（文字进了文档），
   第四步的回车没有发出（光标仍在第 1 行第 12 列）。
-- 新增 8 项测试覆盖链的策略面（校验先于执行、失败即停、步数上限、观测窗口归属、
-  trace 只计数不返回图片），workspace 测试数 67 → 75。
-- Linux AT-SPI 窗口树真机验证（补 0.1.3 发布说明「已知边界」第一条）：在一台带真实
-  Xfce 图形会话的云机（InstaBox，Debian 13 / 4 核 8 GB，DISPLAY=:1，AT-SPI 会话在线）
-  上构建并运行 `cua-hub tree`，返回 119 个节点（面板、窗口、按钮含坐标）；打开终端
-  窗口后增至 151 个，含真实应用窗口标题与几何信息；`cua-hub find "Applications"`
-  按名定位与树中坐标一致。此前该项只过了 Linux 目标类型检查与 CI。
+- 这组数字早期是在 debug 二进制上取的（94.6 KB / 48.8 KB、约 3.5 秒），debug 下图像缩放
+  与哈希慢一个数量级，已按 release 复测更正。
+- 新增 11 项测试（链策略面 8 项、捕获的 lossless 归属 1 项、Linux 窗口匹配 2 项），
+  workspace 测试数 **67 → 78**。
+- Linux 窗口级无障碍路径**真机结项**（`linux-atspi.yml`：Xvfb + openbox + at-spi2-core +
+  GTK3 probe 窗口，MCP 服务在作业里真跑）。通过的断言：`list_windows` 看到窗口、
+  `window_state` 返回窗口级树 6 个节点且三个命名控件都在树内、帧内标签证明不是桌面级整树、
+  带回一张截图、`set_control_text` 写入 18 字符、`invoke_control` 触发按钮，
+  并以 probe 应用自己写回的文本作为独立 oracle 确认真的落地。
+  CI 产物：`linux-atspi-evidence`（每次调用的原始响应 + probe 输出）。
+
+### 修复
+
+- Linux：`atspi::set_value` 把 `SetTextContents` 的回包按"无返回值"解码。AT-SPI 实际返回
+  一个 bool，于是**应用侧已经写入成功**的调用被 zbus 报成解码错误，工具回过来说
+  "控件没有 Value/EditableText 模式"——方向完全相反，等于把可用控件判成不可用。
+  现在按 bool 解码，只有 toolkit 说成功才算成功。（这个 bug 只有真机能发现，
+  是上面那个 CI 作业跑出来的第一个成果。）
+- Linux：CI probe 应用此前只在 AT-SPI 侧声明身份，X11 的 WM_CLASS 仍是脚本文件名，
+  `snapshot_window` 的 app 匹配因此落空。现在两侧统一（`set_prgname` +
+  `set_program_class`），而**这类不一致本身也不再是缺口**：窗口归属优先按进程号判定
+  （见上面「Linux：窗口归属改按进程号判定」），CI 用 `PROBE_IDENTITY=mismatch` 跑一个
+  两边名字确实不同的应用来证明它命中 —— issue #16 因此关闭。
+
+### 性能与诊断
+
+- 观测路径不再无条件编 PNG。`frame_from_image` 每次都把未缩放原图编码一份 PNG，
+  而只有视觉循环的运行日志会写这个文件。交错对照（同一台机器、同一时段、两个二进制
+  交替各测 4 轮，取中位数）：Chrome 298→264ms、微信 127→114ms、Qoder 243→231ms、
+  记事本 87→72ms，约省 5~11%。补了一条测试锁住回归：带 `lossless` 的帧必须以 PNG 魔数
+  开头，不带的必须为空。
+- 观测里新增 `backend_error`：WGC 被尝试又拒绝时返回**失败阶段**
+  （`d3d11 device` / `capture item for window` / `no frame within 3000ms` 等）。
+  此前 `capture_or_error` 已经写明阶段，调用方 `capture()` 却 `.ok()` 丢成 `None`，
+  模块注释承诺的"能指出卡在哪一步"没有兑现——强制 WGC 后 `source` 仍是 `WindowSurface`
+  却说不出原因，就是这个缺口造成的。
+- 观测主序**不切** WGC，实测数据与理由记在 `docs/ROADMAP.md`。
+
+### 文档口径
+
+- 「Linux AT-SPI 窗口树真机验证」先改称「桌面级」，再按上面的结项补回窗口级。
+  区分点是原语层的两条分支：`cua-hub tree` / `find` 走 `snapshot()`（registry 根下全部应用），
+  而 `window_state` 走 `snapshot_window()`——按 app 与 title 匹配单个 frame，同一应用多个
+  顶层帧且标题都对不上时故意报错而不是猜。前一次记录只验了前者就勾掉了后者的待办，
+  口径与粒度对不上；现在两者分别有各自的证据（云机一次 + 可重跑的 CI 作业）。
+  另：这条记录与 issue #7 是同一件事的两头——#7 提的是口径问题，本条是补上的证据。
 
 ## 0.1.3 — 2026-10-23
 
