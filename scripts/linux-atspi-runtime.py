@@ -32,6 +32,7 @@ PROBE_TITLE = "cua-atspi-probe"
 
 rpc_id = 0
 failures: list[str] = []
+TAG = "aligned"
 
 
 def call(tool: str, arguments: dict) -> dict:
@@ -73,11 +74,11 @@ def call(tool: str, arguments: dict) -> dict:
         "images": len(images),
         "json": parsed,
     }
-    (EVIDENCE / f"{rpc_id:02d}-{tool}.json").write_text(json.dumps(record, indent=2))
+    (EVIDENCE / f"{rpc_id:02d}-{TAG}-{tool}.json").write_text(json.dumps(record, indent=2))
     if images:
         import base64
 
-        (EVIDENCE / f"{rpc_id:02d}-{tool}.jpg").write_bytes(base64.b64decode(images[0]["data"]))
+        (EVIDENCE / f"{rpc_id:02d}-{TAG}-{tool}.jpg").write_bytes(base64.b64decode(images[0]["data"]))
     return record
 
 
@@ -101,9 +102,6 @@ def wait_for_server(seconds: float) -> bool:
 
 def main() -> int:
     EVIDENCE.mkdir(parents=True, exist_ok=True)
-    result_file = EVIDENCE / "probe_result.txt"
-    if result_file.exists():
-        result_file.unlink()
 
     print(f"== starting {BIN} on port {PORT}")
     server = subprocess.Popen(
@@ -112,53 +110,95 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    # The probe's own output is the difference between "the backend cannot see a
-    # window" and "there was never a window to see", so it goes to a file the
-    # failure path can print rather than into a pipe nobody drains.
-    probe_log = open(EVIDENCE / "probe.log", "w", encoding="utf-8")
-    probe = subprocess.Popen(
-        [sys.executable, str(ROOT / "tests" / "linux_atspi" / "probe_gtk.py"), str(result_file)],
-        stdout=probe_log,
-        stderr=subprocess.STDOUT,
-    )
     try:
         if not wait_for_server(30):
             print("the MCP server never answered /health")
             return 1
         print("  server up")
+        scenario("aligned")
+        # The point of the second run: an application whose X11 class and
+        # accessibility name disagree is ordinary (Python names the class after
+        # the script, Electron reports `electron`), and matching those names is
+        # how the window used to be found.
+        scenario("mismatch")
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
 
-        # --- the window list sees the app -----------------------------------
-        window_id = None
+    print(f"\n{len(failures)} failed check(s); evidence in {EVIDENCE}")
+    return 1 if failures else 0
+
+
+def scenario(identity: str) -> None:
+    """Drive one probe application through observe, write and act.
+
+    `identity` is handed to the application as `PROBE_IDENTITY`: `aligned` makes
+    it declare the same name on X11 and on the accessibility bus, `mismatch`
+    leaves X11 with Python's default (the script filename) so only a process id
+    can connect the window to its frame.
+    """
+    global TAG
+
+    TAG = identity
+    print(f"\n== scenario: {identity}")
+    result_file = EVIDENCE / f"probe_result_{identity}.txt"
+    if result_file.exists():
+        result_file.unlink()
+
+    probe_log = open(EVIDENCE / f"probe_{identity}.log", "w", encoding="utf-8")
+    probe = subprocess.Popen(
+        [sys.executable, str(ROOT / "tests" / "linux_atspi" / "probe_gtk.py"), str(result_file)],
+        stdout=probe_log,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "PROBE_IDENTITY": identity},
+    )
+    try:
+        window = None
         deadline = time.time() + 40
-        while time.time() < deadline and window_id is None:
+        while time.time() < deadline and window is None:
             listed = call("list_windows", {"query": PROBE_TITLE})
             windows = (listed["json"] or {}).get("windows", [])
             if windows:
-                window_id = windows[0]["id"]
+                window = windows[0]
             else:
                 time.sleep(1.0)
-        if window_id is None:
+        if window is None:
             probe_log.flush()
             print("--- the probe application said ---")
             print(Path(probe_log.name).read_text(encoding="utf-8", errors="replace")[:2000])
-        check("list_windows sees the GTK window", window_id is not None, f"id={window_id}")
-        if window_id is None:
-            return 1
+        check(f"[{identity}] list_windows sees the GTK window", window is not None, f"window={window}")
+        if window is None:
+            return
 
-        # --- the window-level AT-SPI tree -----------------------------------
-        state = call("window_state", {"window": window_id, "include_text": True, "max_nodes": 80})
-        tree = ((state["json"] or {}).get("accessibility") or {})
+        reported_app = window.get("app", "")
+        if identity == "mismatch":
+            # Without this the second run could quietly become a repeat of the
+            # first — if X11 ever reports the aligned name, this scenario is
+            # testing nothing and must say so.
+            check(
+                "[mismatch] the window really reports a different app name",
+                reported_app != PROBE_APP,
+                f"window list says app={reported_app!r}, accessibility name is {PROBE_APP!r}",
+            )
+
+        state = call(
+            "window_state", {"window": window["id"], "include_text": True, "max_nodes": 80}
+        )
+        tree = (state["json"] or {}).get("accessibility") or {}
         body = tree.get("tree") or tree.get("diff") or ""
         node_count = tree.get("node_count", 0)
         check(
-            "window_state returns a window-level accessibility tree",
+            f"[{identity}] window_state returns a window-level accessibility tree",
             node_count >= 4 and body != "",
-            f"nodes={node_count} mode={tree.get('mode')}",
+            f"nodes={node_count} mode={tree.get('mode')} {state['text'][:120] if node_count < 4 else ''}",
         )
         for control in ("probe-entry", "probe-submit", "probe-toggle"):
-            check(f"tree contains {control!r}", control in body)
+            check(f"[{identity}] tree contains {control!r}", control in body)
         check(
-            "the tree is scoped to this window, not the whole desktop",
+            f"[{identity}] the tree is scoped to this window, not the whole desktop",
             "type into the entry below" in body,
             "the label only exists inside the probe frame",
         )
@@ -168,17 +208,24 @@ def main() -> int:
         captured = state["images"] >= 1
         announced = bool((state["json"] or {}).get("screenshot_error"))
         check(
-            "the observation reports its screenshot or says why it cannot",
+            f"[{identity}] the observation reports its screenshot or says why it cannot",
             captured or announced,
             f"images={state['images']} announced={announced}",
         )
 
-        # --- write through EditableText, then fire the action ---------------
         written = call("set_control_text", {"name": "probe-entry", "text": "AT-SPI-WRITES-HERE"})
-        check("set_control_text reaches the entry", not written["is_error"], written["text"][:120])
+        check(
+            f"[{identity}] set_control_text reaches the entry",
+            not written["is_error"],
+            written["text"][:120],
+        )
 
         invoked = call("invoke_control", {"name": "probe-submit"})
-        check("invoke_control fires DoAction on the button", not invoked["is_error"], invoked["text"][:160])
+        check(
+            f"[{identity}] invoke_control fires DoAction on the button",
+            not invoked["is_error"],
+            invoked["text"][:160],
+        )
 
         try:
             probe.wait(timeout=15)
@@ -186,29 +233,22 @@ def main() -> int:
             pass
         landed = result_file.read_text() if result_file.exists() else ""
         check(
-            "the text set through accessibility really reached the control",
+            f"[{identity}] the text set through accessibility really reached the control",
             landed == "AT-SPI-WRITES-HERE",
             f"probe app reported {landed!r}",
         )
 
         gone = call("list_windows", {"query": PROBE_TITLE})
         check(
-            "the window is gone after the invoked action",
+            f"[{identity}] the window is gone after the invoked action",
             (gone["json"] or {}).get("count", 1) == 0,
-            f"count={((gone['json'] or {}).get('count'))}",
+            f"count={(gone['json'] or {}).get('count')}",
         )
     finally:
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
         if probe.poll() is None:
             probe.kill()
+            probe.wait(timeout=10)
         probe_log.close()
-
-    print(f"\n{len(failures)} failed check(s); evidence in {EVIDENCE}")
-    return 1 if failures else 0
 
 
 if __name__ == "__main__":

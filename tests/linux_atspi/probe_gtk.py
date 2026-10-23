@@ -6,6 +6,7 @@ target in scripts/linux-atspi-runtime.py, so renaming one must fail that check
 rather than pass silently.
 """
 
+import os
 import sys
 
 import gi
@@ -16,13 +17,16 @@ from gi.repository import GLib, Gdk, Gtk  # noqa: E402
 
 APP_ID = "cua-atspi-probe"
 
-# The window list and the accessibility tree have to agree on who owns this
-# frame: `set_prgname` names the AT-SPI application, `set_program_class` names
-# the X11 WM_CLASS, and Python leaves the latter as the script filename unless
-# something sets it. Matching is only the backend's problem if both sides were
-# allowed to differ, so they do not here.
+# `aligned` declares one identity on both sides — `set_prgname` names the AT-SPI
+# application, `set_program_class` names the X11 WM_CLASS that the window list
+# reports. `mismatch` skips the second, which is what Python does by default and
+# what Electron does on purpose: the accessibility name and the window class
+# disagree, and only a process id connects them.
+IDENTITY = os.environ.get("PROBE_IDENTITY", "aligned")
+
 GLib.set_prgname(APP_ID)
-Gdk.set_program_class(APP_ID)
+if IDENTITY == "aligned":
+    Gdk.set_program_class(APP_ID)
 
 RESULT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/probe_result.txt"
 

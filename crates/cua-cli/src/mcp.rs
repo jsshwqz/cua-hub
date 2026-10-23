@@ -1278,6 +1278,7 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     window.id,
                     &window.app,
                     &window.title,
+                    window.pid,
                     max_nodes,
                     depth,
                 ) {
@@ -1316,6 +1317,7 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                                 rel.id,
                                 &rel.app,
                                 &rel.title,
+                                rel.pid,
                                 MAX_POPUP_NODES,
                                 depth,
                             ) {

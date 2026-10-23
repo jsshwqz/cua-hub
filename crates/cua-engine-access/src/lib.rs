@@ -97,23 +97,25 @@ pub struct ControlState {
 /// window the caller is about to act on rather than the whole desktop.
 ///
 /// On Windows the window id is the HWND. AT-SPI has no window id, so the Linux
-/// backend locates the frame by the app and title the window list reported.
+/// backend matches by process id first — the same `pid` the window list reports —
+/// and falls back to the app and title the window list reported.
 pub fn snapshot_window(
     id: u32,
     app: &str,
     title: &str,
+    pid: u32,
     max_nodes: usize,
     max_depth: usize,
 ) -> Result<UiSnapshot> {
     #[cfg(windows)]
     {
-        let _ = (app, title);
+        let _ = (app, title, pid);
         imp::snapshot_window(id, max_nodes, max_depth)
     }
     #[cfg(not(windows))]
     {
         let _ = id;
-        atspi::snapshot_window(app, title, max_nodes, max_depth)
+        atspi::snapshot_window(app, title, pid, max_nodes, max_depth)
     }
 }
 
