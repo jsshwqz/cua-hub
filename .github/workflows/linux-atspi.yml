@@ -29,7 +29,13 @@ jobs:
       - name: Install a graphical session with accessibility
         run: |
           sudo apt-get update
+          # The same display and input libraries the workspace needs to build,
+          # plus a session the accessibility bus can live in.
           sudo apt-get install -y \
+            libxdo-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev \
+            libxcb-xfixes0-dev libdbus-1-dev libpipewire-0.3-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgbm-dev \
+            libdrm-dev pkg-config \
             xvfb dbus-x11 at-spi2-core libatk-bridge2.0-0 \
             python3-gi gir1.2-gtk-3.0
 
