@@ -4,7 +4,7 @@
 
 | 版本 | 位置 | 定位 | 主要特征 |
 |------|------|------|----------|
-| **cua-hub** | `main` | 主力实现（持续维护） | 五引擎（Vision/Code/Access/Browser/Code-Exec）、跨引擎编排、失败重试/重规划、MCP 22 工具（stdio + HTTP）、回放、Windows/Linux CI |
+| **cua-hub** | `main` | 主力实现（持续维护） | 五引擎（Vision/Code/Access/Browser/Code-Exec）、跨引擎编排、失败重试/重规划、MCP 38 工具（stdio + HTTP）、回放、Windows/Linux CI |
 | **cua-mcp** | `muse-vm-phase0-1` | 独立谱系的运行时实现 | 常驻剪贴板、鼠标/按键按住与释放、screen_info、坐标越界校验、DryRun/Supervised/Autonomous 围栏、cua-web 与 cua-bench 骨架、Windows release 流水线 |
 | **CUA-Forge** | `gemini-cua-forge` 的 `cua-forge/` | Gemini 生成的单文件迷你实现 | xcap + enigo，HTTP `:3030` 与自定义 stdio（非标准 MCP）；仅 move/click/type |
 

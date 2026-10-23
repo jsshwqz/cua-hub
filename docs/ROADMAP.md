@@ -46,3 +46,23 @@
 - [x] Run history and deterministic replay (`runs` / `replay`, MCP tools)
 - [ ] Fine-tune pipeline for a local model (replace API calls for hot paths)
 - [ ] SDK for Rust, Python, TypeScript
+
+## Phase 4 — 观测契约与操控可靠性（2026-10-23，已发布 0.1.3）
+
+- [x] 遮挡窗口整窗捕获：`PrintWindow(PW_RENDERFULLCONTENT)` + 物理矩形 + `source`/`hash` 自证
+- [x] 坐标空间统一：进程启动即 Per-Monitor V2 DPI 感知，UIA 矩形 / 截图 / 输入注入同一物理像素
+- [x] 点击时序：move → 稳定 → press → 保持 → release
+- [x] `window_state` 观测原语：截图 + 窗口内元素树 + `observation_id` 作用域令牌
+- [x] 稳定元素编号（结构签名）+ 无障碍树 unified diff + `baseline_reset` 语义
+- [x] 弹层元素树并入同一次观测（`# related window` 小节、覆盖去重、节点记录所属窗口）
+- [x] 每张图自带 `screenshot_id` 与原点，弹层坐标由服务端换算
+- [x] `perform_secondary_action`（Expand/Collapse/Raise/Scroll/Toggle/Select/Focus/Invoke + 回读状态）
+- [x] `list_apps` / `launch_app`（开始菜单发现、等待窗口、`matched_by` 三级识别）
+- [x] `selected_text` / `document_text` / `selected_elements`（Text 模式多候选探测）
+- [x] Windows.Graphics.Capture 后端（PrintWindow 全黑时降级；`CUA_HUB_CAPTURE_BACKEND=wgc` 强制）
+- [x] 无障碍树深度修复：按层 `FindAllBuildCache`（`TreeScope_Children` 会把树压成一层）
+- [x] 控件状态改读缓存属性（`GetCachedPatternAs` 在真实 provider 上取不到选中/值）
+- [x] 安全策略对齐四档确认模型（交还用户 / 动作时确认 / 点名预批准 / 无需确认）
+- [ ] Linux 窗口级 AT-SPI 树的真机验证（代码与 Linux 目标类型检查已过，无可用图形会话）
+- [ ] 观测全面切到 WGC（当前 PrintWindow 为主、WGC 为兜底）
+- [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"
