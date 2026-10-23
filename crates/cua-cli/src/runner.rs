@@ -370,7 +370,15 @@ pub async fn confirm(
     approver: Option<&Approver>,
 ) -> Result<bool> {
     let risk = action.risk();
-    if risk == Risk::High && !allow_high {
+    if risk == Risk::High {
+        // `allow_high` is the explicit permission for destructive work, so it has
+        // to be sufficient on its own. It used to fall through to the medium-risk
+        // path, which then demanded `--yes` as well — while the error message told
+        // the user to re-run with `--allow-high`. A gate whose stated escape does
+        // not work teaches callers to set every switch at once.
+        if allow_high {
+            return Ok(true);
+        }
         if let Some(approve) = approver {
             if approve(action.clone()).await {
                 return Ok(true);
@@ -385,10 +393,26 @@ pub async fn confirm(
     if risk < Risk::Medium || yes {
         return Ok(true);
     }
+    // Medium without `yes`: ask through whatever channel the caller has. An MCP
+    // client that can answer an elicitation should get one, not an error that
+    // teaches it to send `yes: true` next time — which is how a gate gets trained
+    // out of existence.
+    if let Some(approve) = approver {
+        return if approve(action.clone()).await {
+            Ok(true)
+        } else {
+            bail!(
+                "{} risk action declined by client: {}",
+                risk.as_str(),
+                describe(action)
+            )
+        };
+    }
     if !std::io::stdin().is_terminal() {
         bail!(
-            "{} risk action requires --yes in non-interactive mode",
-            risk.as_str()
+            "{} risk action requires --yes / yes=true, or a client that can answer confirmations: {}",
+            risk.as_str(),
+            describe(action)
         );
     }
     print!(
@@ -455,4 +479,88 @@ fn button_name(b: cua_core::MouseButton) -> &'static str {
 pub fn default_run_dir() -> PathBuf {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     PathBuf::from(".runs").join(stamp.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cua_core::ShellKind;
+
+    fn approver(answer: bool) -> Approver {
+        std::sync::Arc::new(move |_action| {
+            Box::pin(async move { answer })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        })
+    }
+
+    fn command(text: &str) -> Action {
+        Action::RunCommand {
+            command: text.to_string(),
+            shell: ShellKind::Auto,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_needs_no_decision() {
+        assert!(confirm(&command("ls -la"), false, false, None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_command_asks_the_client_when_yes_is_off() {
+        assert!(
+            confirm(&command("cargo build"), false, false, Some(&approver(true)))
+                .await
+                .unwrap()
+        );
+        let declined = confirm(
+            &command("cargo build"),
+            false,
+            false,
+            Some(&approver(false)),
+        )
+        .await;
+        assert!(
+            declined.is_err(),
+            "a declined confirmation must stop the action"
+        );
+    }
+
+    #[tokio::test]
+    async fn yes_does_not_buy_a_destructive_command() {
+        // The bypass chain was: an unrecognised teardown classified as Medium, and
+        // `yes` waved every Medium through. The classifier now calls it High, and
+        // High is never satisfied by `yes` alone.
+        let outcome = confirm(&command("rm -rf /tmp/build"), true, false, None).await;
+        let message = outcome.unwrap_err().to_string();
+        assert!(
+            message.contains("allow-high") || message.contains("allow_high"),
+            "the error has to name the switch that would actually allow it: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destructive_command_needs_an_explicit_decision() {
+        assert!(confirm(
+            &command("rm -rf /tmp/build"),
+            false,
+            false,
+            Some(&approver(true))
+        )
+        .await
+        .unwrap());
+        assert!(confirm(&command("rm -rf /tmp/build"), false, true, None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn no_channel_means_no_run() {
+        // `cargo test` stdin is not a terminal, which is the headless MCP case:
+        // silence is not consent, and there is nothing to ask.
+        assert!(confirm(&command("cargo build"), false, false, None)
+            .await
+            .is_err());
+    }
 }
