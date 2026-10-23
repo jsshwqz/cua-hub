@@ -162,6 +162,10 @@ enum Command {
         /// Show the browser window if a browser step runs.
         #[arg(long)]
         headed: bool,
+        /// Run medium-risk actions without prompting. Without it, a medium-risk
+        /// step needs a typed confirmation (or fails in a non-interactive shell).
+        #[arg(long, env = "CUA_HUB_YES")]
+        yes: bool,
         /// Permit destructive commands planned by the model.
         #[arg(long)]
         allow_high: bool,
@@ -392,6 +396,7 @@ fn main() -> Result<()> {
             max_replans,
             model,
             headed,
+            yes,
             allow_high,
             run_dir,
         } => {
@@ -405,9 +410,11 @@ fn main() -> Result<()> {
                 max_replans,
                 model,
                 headed,
-                yes: true,
+                yes,
                 allow_high,
                 run_dir,
+                // A terminal is the approver here: `confirm` prompts on stdin.
+                approver: None,
             }))?;
             println!("{}", report.summary());
             if !report.success {

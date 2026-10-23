@@ -184,6 +184,25 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 `.runs/<时间戳>/` 下包含 `steps.jsonl`（每步动作与结果）、`step-NN.png`
 （每步截图）和 `outcome.json`，便于复盘与重放。
 
+## 确认与风险分级
+
+命令按形状分成三档，**中间那档是默认**——不是"名单里没有就放行"：
+
+| 级别 | 判定 | 默认行为 |
+|------|------|----------|
+| 只读 | `ls` `cat` `git status` `Get-Content` 这类只读状态的命令 | 直接执行，不打扰 |
+| 未列名 | 其余一切：会写文件、联网、构建、跑脚本 | 需要 `yes=true`，或由能应答的客户端确认（stdio 走 MCP elicitation） |
+| 高危 | 递归或强制删除、`rd /s /q`、`Remove-Item -Recurse`/`-Force`、下载直接管进 shell、`-EncodedCommand`、`reg delete HKLM…`、磁盘与关机类 | 需要 `allow_high=true` 或人工批准；`yes` 买不到这一档 |
+
+- 判定读的是**参数**而不是字面名单：`rm  -rf  /`、`Remove-Item -Force -Recurse C:\`、
+  `rd /s /q D:\data` 与拼写完整的同一条命令同级；`sudo` / `cmd /c` / `sh -c "…"` 这类包装会被剥开再判。
+- 也不误伤散文：`printf "format %s"` 与 `please format the document` 都不算高危，
+  因为只会误伤的"提到就拦"会把人训练成无脑放行。
+- **入口默认**：MCP 的 `run_task` / `start_task` / `orchestrate` 默认 `yes=false`
+  （0.1.4 起，此前是 `true`；`orchestrate` 此前在 MCP 与 CLI 两条路上都硬编码跳过确认）。
+  CLI 用 `--yes` 或 `CUA_HUB_YES=1` 显式放开中危，高危始终需要 `--allow-high`。
+  默认必须是"问"，因为这些命令是大模型写的。
+
 ## 环境变量
 
 | 变量 | 说明 |
@@ -193,7 +212,7 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 | `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | OpenAI 兼容引擎密钥 |
 | `CUA_HUB_OPENAI_BASE_URL` | 默认取 `OPENROUTER_BASE_URL`，否则 `https://api.openai.com/v1` |
 | `CUA_HUB_MODEL` | Anthropic 默认 `claude-sonnet-4-5`；OpenAI 默认取 `OPENROUTER_MODEL` 或 `gpt-4o-mini` |
-| `CUA_HUB_YES` | 设为 1 跳过危险动作确认 |
+| `CUA_HUB_YES` | 设为 1 跳过**中危**确认（CLI 入口）；高危动作始终还要 `--allow-high` |
 | `CUA_HUB_MCP_TOKEN` | HTTP 模式的 Bearer token；设置后强制鉴权 |
 | `CUA_HUB_ALLOW_REMOTE` | 允许无 token 绑定非回环地址（仅限已有前置鉴权） |
 

@@ -35,7 +35,9 @@ pub struct StepExecResult {
     pub artifacts: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+/// Clone, not Debug: the approval hook is a boxed closure, same as in
+/// `runner::RunOptions`.
+#[derive(Clone)]
 pub struct OrchestrateOptions {
     pub task: String,
     pub dry_run: bool,
@@ -50,6 +52,10 @@ pub struct OrchestrateOptions {
     pub yes: bool,
     pub allow_high: bool,
     pub run_dir: Option<PathBuf>,
+    /// Client hook used to confirm medium- and high-risk steps. Without it an
+    /// unconfirmed action can only be refused, which would push callers toward
+    /// `yes: true` as the only working setting.
+    pub approver: Option<runner::Approver>,
 }
 
 impl Default for OrchestrateOptions {
@@ -63,9 +69,12 @@ impl Default for OrchestrateOptions {
             max_replans: 1,
             model: None,
             headed: false,
-            yes: true,
+            // Safe by default: a struct built from `Default` must not run
+            // anything that changes the machine without a decision.
+            yes: false,
             allow_high: false,
             run_dir: None,
+            approver: None,
         }
     }
 }
@@ -320,7 +329,7 @@ async fn execute_step(
                 settle_ms: 600,
                 ui_tree: false,
                 browser_headed: opts.headed,
-                approver: None,
+                approver: opts.approver.clone(),
             })
             .await?;
             let ok = report.is_success();

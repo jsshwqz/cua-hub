@@ -115,7 +115,7 @@ pub(crate) fn run_options_from_args(args: &Value) -> std::result::Result<RunOpti
     Ok(RunOptions {
         task,
         max_steps: args["max_steps"].as_u64().unwrap_or(20) as u32,
-        yes: args["yes"].as_bool().unwrap_or(true),
+        yes: args["yes"].as_bool().unwrap_or(false),
         allow_high: args["allow_high"].as_bool().unwrap_or(false),
         dry_run: args["dry_run"].as_bool().unwrap_or(false),
         engine,
@@ -126,6 +126,32 @@ pub(crate) fn run_options_from_args(args: &Value) -> std::result::Result<RunOpti
         settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
         ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
         browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
+        approver: approver_from_elicitor(),
+    })
+}
+
+/// Mirror of [`run_options_from_args`] for `orchestrate`, so the confirmation
+/// defaults of both entry points are stated in one place and can be tested.
+pub(crate) fn orchestrate_options_from_args(
+    args: &Value,
+) -> std::result::Result<crate::orchestrator::OrchestrateOptions, Value> {
+    Ok(crate::orchestrator::OrchestrateOptions {
+        task: required_str(args, "task")?,
+        dry_run: args["dry_run"].as_bool().unwrap_or(false),
+        max_plan_steps: args["max_plan_steps"].as_u64().unwrap_or(6) as usize,
+        max_steps_per_engine: args["max_steps"].as_u64().unwrap_or(10) as u32,
+        retries_per_step: args["retries"].as_u64().unwrap_or(1) as u32,
+        max_replans: args["max_replans"].as_u64().unwrap_or(1) as usize,
+        model: args["model"].as_str().map(str::to_string),
+        headed: args["headed"].as_bool().unwrap_or(false),
+        // Neither default may be `true`: a caller that lets a model plan commands
+        // must say so explicitly, or be able to answer a confirmation.
+        yes: args["yes"].as_bool().unwrap_or(false),
+        allow_high: args["allow_high"].as_bool().unwrap_or(false),
+        run_dir: None,
+        // The same client that answers an elicitation for `run_task` can answer
+        // one here; without this the only way to orchestrate would be to switch
+        // confirmations off entirely.
         approver: approver_from_elicitor(),
     })
 }
@@ -964,22 +990,9 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             }
         }
         "orchestrate" => {
-            let task = match required_str(args, "task") {
-                Ok(t) => t,
+            let opts = match orchestrate_options_from_args(args) {
+                Ok(o) => o,
                 Err(e) => return e,
-            };
-            let opts = crate::orchestrator::OrchestrateOptions {
-                task,
-                dry_run: args["dry_run"].as_bool().unwrap_or(false),
-                max_plan_steps: args["max_plan_steps"].as_u64().unwrap_or(6) as usize,
-                max_steps_per_engine: args["max_steps"].as_u64().unwrap_or(10) as u32,
-                retries_per_step: args["retries"].as_u64().unwrap_or(1) as u32,
-                max_replans: args["max_replans"].as_u64().unwrap_or(1) as usize,
-                model: args["model"].as_str().map(str::to_string),
-                headed: args["headed"].as_bool().unwrap_or(false),
-                yes: true,
-                allow_high: args["allow_high"].as_bool().unwrap_or(false),
-                run_dir: None,
             };
             match crate::orchestrator::run(opts).await {
                 Ok(report) => {
@@ -2052,7 +2065,7 @@ fn tool_defs() -> Value {
                     "dry_run": { "type": "boolean", "default": false },
                     "engine": { "type": "string", "enum": ["vision", "code", "access", "browser"] },
                     "model": { "type": "string" },
-                    "yes": { "type": "boolean", "default": true },
+                    "yes": { "type": "boolean", "default": false, "description": "Run medium-risk actions without asking. Off by default: an unrecognised command needs a decision." },
                     "allow_high": { "type": "boolean", "default": false },
                     "ui_tree": { "type": "boolean", "default": false },
                     "settle_ms": { "type": "integer", "default": 600 }
@@ -2089,7 +2102,7 @@ fn tool_defs() -> Value {
                     "dry_run": { "type": "boolean", "default": false, "description": "Plan one step without acting" },
                     "engine": { "type": "string", "enum": ["vision", "code", "access", "browser"] },
                     "model": { "type": "string", "description": "Override the model name" },
-                    "yes": { "type": "boolean", "default": true, "description": "Allow medium-risk actions" },
+                    "yes": { "type": "boolean", "default": false, "description": "Run medium-risk actions without asking. Never allows a destructive one: that needs allow_high or a client that can answer." },
                     "allow_high": { "type": "boolean", "default": false, "description": "Allow destructive commands; off by default" },
                     "ui_tree": { "type": "boolean", "default": false, "description": "Attach the accessibility tree to each vision step" },
                     "settle_ms": { "type": "integer", "default": 600 }
@@ -2111,6 +2124,7 @@ fn tool_defs() -> Value {
                     "max_replans": { "type": "integer", "default": 1, "description": "Re-plan attempts after repeated failure" },
                     "model": { "type": "string" },
                     "headed": { "type": "boolean", "default": false },
+                    "yes": { "type": "boolean", "default": false, "description": "Run medium-risk steps without asking. The planner chooses the commands, so this is a real concession." },
                     "allow_high": { "type": "boolean", "default": false }
                 },
                 "required": ["task"]
@@ -2894,5 +2908,32 @@ mod tests {
         assert_eq!(record["detail"], "the tree");
         assert_eq!(record["images_dropped"], 1);
         assert!(serde_json::to_string(&record).unwrap().len() < 200);
+    }
+
+    #[test]
+    fn model_driven_entry_points_default_to_asking() {
+        // Both of these let a model choose the command, so silence cannot mean
+        // consent: a caller has to pass `yes`, or be able to answer a prompt.
+        let run = run_options_from_args(&json!({ "task": "x" })).expect("run options");
+        assert!(!run.yes, "run_task must not default to auto-yes");
+        assert!(!run.allow_high);
+        let orchestrated =
+            orchestrate_options_from_args(&json!({ "task": "x" })).expect("orchestrate options");
+        assert!(
+            !orchestrated.yes,
+            "orchestrate must not default to auto-yes"
+        );
+        assert!(!orchestrated.allow_high);
+    }
+
+    #[test]
+    fn consent_is_honoured_when_it_is_given() {
+        let run = run_options_from_args(&json!({ "task": "x", "yes": true, "allow_high": true }))
+            .expect("run options");
+        assert!(run.yes);
+        assert!(run.allow_high);
+        let orchestrated = orchestrate_options_from_args(&json!({ "task": "x", "yes": true }))
+            .expect("orchestrate options");
+        assert!(orchestrated.yes);
     }
 }
