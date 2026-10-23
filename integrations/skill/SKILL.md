@@ -16,7 +16,7 @@ Perception
 - `window_state {window, include_screenshot?, include_text?, disable_diffing?, max_nodes?, depth?}` — **the observation to act on**: the window's screenshot(s) and/or its in-window accessibility tree with `element_index` values, plus `focused_element`. Returns an `observation_id`; indexes and screenshot pixels are only valid with it. Element indexes are **stable per window**, so after the first observation the tree returns as a unified diff (`mode: "diff"`, `-` lines retired, `+` lines new, ` ` lines unchanged); `mode: "unchanged"` means your mapping still applies; `mode: "baseline_reset"` (or `disable_diffing: true`) means every index you hold for that window is invalid and must be re-picked from the returned full tree. Menus and dialogs appear **inside the tree** with their own indexes, and also as extra bounded images carrying their own `screenshot_id` and origin. With `include_text` the result also reports `selected_text`, `document_text` and `selected_elements` when the app exposes a Text pattern (Chromium, WordPad, Office do; legacy Win32 edit controls and Win11 Notepad do not).
 - `list_apps {include_all?}` — apps grouped with the windows they own and a launchable id (exe path); `include_all` adds Start Menu entries for apps that are not running.
 - `launch_app {app, timeout_ms?}` — start an app and wait for its window; an app that is already running is returned with its windows instead of being started twice. `ready: false` means no window appeared in time: run `list_windows` before retrying, never launch the same app again.
-- `capture_window {window, max_edge?, quality?}` — one window as its own surface, so content hidden behind another window still appears; reports `origin`, `image_scale`, `source` (`WindowSurface` / `GraphicsCapture` / `ScreenRegion`) and a `hash`. Hardware-composited or DRM surfaces that render black through GDI are captured through Windows.Graphics.Capture automatically.
+- `capture_window {window, max_edge?, quality?}` — one window as its own surface, so content hidden behind another window still appears; reports `origin`, `image_scale`, `source` (`WindowSurface` / `GraphicsCapture` / `ScreenRegion`) and a `hash`. Hardware-composited or DRM surfaces that render black through GDI are captured through Windows.Graphics.Capture automatically. When that fallback was tried and refused, the response also carries `backend_error.stage` (`capture item for window`, `no frame within 3000ms`, …): `source` says what you got, the stage says what to fix.
 - `wait_for_change {window, observation_id?, timeout_ms?}` — block until the window (or one of its popups) actually changes. This is how an action is verified instead of assumed.
 - `capture_screen` — primary display as a JPEG plus dimensions.
 - `list_windows {query?, include_minimized?}` — top-level windows with id, app, title, bounds, focus state.
@@ -120,11 +120,12 @@ step that omits them, so one observation drives the whole batch. `settle_ms`
 - `observe` controls the state that comes back: default reads `window_state`
   once (diffed, no screenshot); `false` returns the trace only; an object is
   passed straight to `window_state`, e.g. `{ "include_screenshot": true }`.
-- Measured on this machine over loopback HTTP, same task, both shapes:
-  **5 calls / 94.6 KB** sent separately versus **2 calls / 48.8 KB** chained —
-  three fewer round trips and 48% less payload. Wall time was the same
-  (~3.5 s), because one observation before acting and one after are paid for in
-  both; the saving is in round trips and tokens, and it grows with chain length.
+- Measured on this machine (release binary, loopback HTTP, same task, both shapes,
+  two rounds each): **5 calls / 1527 ms / 109.8 KB** sent separately versus
+  **2 calls / 1320 ms / 49.1 KB** chained — three fewer round trips, 55% less
+  payload, 207 ms faster. The time saving stays modest because one observation
+  before acting and one after are paid for in both; the win is round trips and
+  tokens, and it grows with chain length.
 
 ## Industrial software
 
