@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -92,10 +92,103 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-async fn wait_for_debugger(port: u16) -> Result<()> {
+/// Create a private profile directory that no earlier run can still be holding.
+///
+/// `create_dir` rather than `create_dir_all`: an exclusive create fails on a
+/// collision instead of quietly reusing a directory. That matters because a
+/// profile carries page state, cookies and the signed-in session, so reusing one
+/// turns "isolated profile" into "whatever the last crashed run left behind".
+fn unique_profile_dir() -> Result<PathBuf> {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..8 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = base.join(format!("cua-hub-browser-{pid}-{nanos}-{attempt}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!(
+        "could not create a private browser profile directory in {}",
+        base.display()
+    )
+}
+
+/// Owns a spawned browser until a `BrowserSession` can take it over.
+///
+/// `launch` has three failure points after `spawn` — the debugger never comes
+/// up, no page target, the websocket refuses — and a `std::process::Child` that
+/// is simply dropped does **not** kill its process. Without this guard every
+/// failed launch leaves a Chromium holding a debug port plus a profile directory
+/// on disk, and the next run would reuse that profile.
+struct LaunchGuard {
+    child: Option<Child>,
+    profile_dir: Option<PathBuf>,
+}
+
+impl LaunchGuard {
+    fn new(child: Child, profile_dir: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            profile_dir: Some(profile_dir),
+        }
+    }
+
+    /// Hand the process and directory to the session that now owns them.
+    fn disarm(&mut self) -> (Child, PathBuf) {
+        (
+            self.child.take().expect("guard used twice"),
+            self.profile_dir.take().expect("guard used twice"),
+        )
+    }
+
+    /// Kill, reap, and delete the profile. Returns the exit status when a
+    /// process was actually waited on, which is how the test proves the child
+    /// was reaped rather than orphaned.
+    fn cleanup(&mut self) -> Option<std::process::ExitStatus> {
+        let status = self.child.take().and_then(|mut child| {
+            let _ = child.kill();
+            child.wait().ok()
+        });
+        if let Some(dir) = self.profile_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        status
+    }
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Everything that has to succeed once the browser process exists.
+///
+/// Split out from [`launch`] so a test can drive the failure path against a port
+/// with nothing behind it, instead of waiting ten seconds for a real Chromium.
+async fn attach(port: u16, attempts: usize) -> Result<(String, Ws)> {
+    wait_for_debugger(port, attempts).await?;
+    let (target_id, ws_url) = first_page_target(port).await?;
+    let (ws, _resp) = connect_async(&ws_url)
+        .await
+        .with_context(|| format!("failed to connect to {ws_url}"))?;
+    Ok((target_id, ws))
+}
+
+/// Attempts to keep polling the devtools endpoint before giving up: 80 × 125 ms
+/// is about ten seconds, which covers a cold Chromium on a slow disk.
+const DEBUGGER_ATTEMPTS: usize = 80;
+
+async fn wait_for_debugger(port: u16, attempts: usize) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/json/version");
-    for _ in 0..80 {
+    for _ in 0..attempts {
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
                 return Ok(());
@@ -125,9 +218,7 @@ pub async fn launch(opts: LaunchOptions) -> Result<BrowserSession> {
         anyhow!("no Chrome/Edge found; set CUA_HUB_BROWSER to the executable path")
     })?;
     let port = free_port()?;
-    let profile_dir =
-        std::env::temp_dir().join(format!("cua-hub-browser-{}-{}", std::process::id(), port));
-    std::fs::create_dir_all(&profile_dir)?;
+    let profile_dir = unique_profile_dir()?;
 
     let start_url = opts
         .start_url
@@ -154,11 +245,11 @@ pub async fn launch(opts: LaunchOptions) -> Result<BrowserSession> {
     let child = cmd
         .spawn()
         .with_context(|| format!("failed to launch {}", binary.display()))?;
-    wait_for_debugger(port).await?;
-    let (target_id, ws_url) = first_page_target(port).await?;
-    let (ws, _resp) = connect_async(&ws_url)
-        .await
-        .with_context(|| format!("failed to connect to {ws_url}"))?;
+    // Ownership moves to the guard here: any `?` below kills the browser and
+    // deletes the profile before the error reaches the caller.
+    let mut guard = LaunchGuard::new(child, profile_dir);
+    let (target_id, ws) = attach(port, DEBUGGER_ATTEMPTS).await?;
+    let (child, profile_dir) = guard.disarm();
 
     Ok(BrowserSession {
         child,
@@ -553,4 +644,77 @@ fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process that will never serve CDP, so the handshake fails fast.
+    fn slow_dummy_browser() -> Child {
+        if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn dummy browser")
+        } else {
+            Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn dummy browser")
+        }
+    }
+
+    #[test]
+    fn profile_directories_are_never_reused() {
+        let first = unique_profile_dir().expect("first profile dir");
+        let second = unique_profile_dir().expect("second profile dir");
+        assert_ne!(first, second, "two launches must not share a profile");
+        assert!(first.is_dir() && second.is_dir());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_kills_the_process_and_deletes_the_profile() {
+        let child = slow_dummy_browser();
+        let profile_dir = unique_profile_dir().expect("profile dir");
+        let mut guard = LaunchGuard::new(child, profile_dir.clone());
+
+        // Nothing is listening on this port, so the debugger never appears.
+        let port = free_port().expect("free port");
+        let failed = attach(port, 1).await;
+        assert!(failed.is_err(), "attach should have refused");
+
+        let reaped = guard.cleanup();
+        assert!(
+            reaped.is_some(),
+            "the browser process was never waited on, so it would outlive the failure"
+        );
+        assert!(
+            !profile_dir.exists(),
+            "profile directory {} survived a failed launch",
+            profile_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_guard_cleans_up_too() {
+        let child = slow_dummy_browser();
+        let profile_dir = unique_profile_dir().expect("profile dir");
+        {
+            let _guard = LaunchGuard::new(child, profile_dir.clone());
+        }
+        assert!(
+            !profile_dir.exists(),
+            "Drop must clean up: {} still exists",
+            profile_dir.display()
+        );
+    }
 }

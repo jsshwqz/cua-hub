@@ -4,6 +4,25 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
+## 未发布
+
+### 修复：浏览器 launch 失败不再泄漏进程与 profile（issue #10）
+
+`launch()` 在 spawn 之后有三处可能失败（devtools 端点没起来、拿不到 page target、
+websocket 连不上），原先直接 `?` 返回——`std::process::Child` 被 drop **不会**杀进程，
+于是每次失败都留下一个占着调试端口的 Chromium 和一个 profile 目录；而清理逻辑原先只在
+`BrowserSession::Drop` 里，失败路径根本构造不出 session。
+
+- 新增 `LaunchGuard`：spawn 之后所有权交给它，任何错误路径返回前都会 kill + wait 子进程并删除
+  profile 目录；成功时 `disarm()` 把两者交给 `BrowserSession`。
+- profile 目录改为**独占创建**且带纳秒后缀（`create_dir` 而非 `create_dir_all`）：
+  旧名 `cua-hub-browser-{pid}-{port}` 可预测且会复用已存在目录，等于把"隔离 profile"
+  变成"沿用上次崩溃留下的页面状态/Cookie/登录态"。
+- `wait_for_debugger` 的尝试次数改为参数，握手逻辑抽出为 `attach(port, attempts)`，
+  因此失败路径可以用 1 次尝试在测试里真实跑一遍，而不是等 10 秒的真 Chromium。
+- 测试 3 项：两次 profile 目录不重复；握手失败后进程被回收且目录被删；guard 被 drop 时同样清理。
+  做过负控——把 `cleanup()` 掏空后，两项清理断言立刻失败。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。
