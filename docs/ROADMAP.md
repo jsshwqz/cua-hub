@@ -19,9 +19,11 @@
 - [x] Hybrid context: `--ui-tree` adds the tree to vision prompts
 - [x] `cua-engine-access`: find/invoke controls by name or AutomationId
 - [x] UIA Invoke/Value patterns and control state (Windows, verified)
-- [x] AT-SPI DoAction/SetTextContents (implemented; live Linux runtime pending)
+- [x] AT-SPI DoAction/SetTextContents (2026-10-23 真机验证：CI 图形会话里 `invoke_control`
+  触发按钮、`set_control_text` 写入 entry，probe 应用自己写回的文本证实两条路径都落地)
 - [x] Linux AT-SPI2 tree + find (verified in WSL with a GTK3 window)
-- [ ] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
+- [x] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
+  （DoAction 见上；workspace 在 ubuntu-24.04 上 fmt/clippy/test/release build 全绿）
 - [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health
 - [ ] Engine fallback on repeated failure
@@ -69,9 +71,13 @@
 - [x] Linux 桌面级 AT-SPI 树的真机验证（2026-10-23，InstaBox 云机 Debian 13 + Xfce；
   `cua-hub tree` 119→151 节点、`find` 按名定位准确。注意口径：那是**桌面级** `snapshot()`，
   不是窗口级；窗口级与动作路径见下一条）
-- [ ] Linux 窗口级 `snapshot_window` + `DoAction` + `SetTextContents` 真机验证
-  （由 `linux-atspi.yml` 作业收口：Xvfb + openbox + at-spi2 + GTK3 probe 窗口，
-  oracle 是 probe 应用自己写回的文件，见 issue #7）
+- [x] Linux 窗口级 `snapshot_window` + `DoAction` + `SetTextContents` 真机验证
+  （2026-10-23 由 `linux-atspi.yml` 结项：Xvfb + openbox + at-spi2-core + GTK3 probe 窗口，
+  MCP 服务在作业里真跑。断言含窗口级树 6 个节点、三个命名控件都在树内、帧内标签证明
+  这不是桌面级整树、截图回来了一张、`set_control_text` 写入 18 字符、`invoke_control`
+  触发按钮，最后由 probe 应用自己写回的文件确认文本真的进了控件。过程中修掉一个真 bug：
+  `SetTextContents` 的回包是 bool，解码成 `()` 会让"应用已经写入"被报成"控件没有该模式"。
+  边界见 issue #16：WM_CLASS 与 AT-SPI 应用名不一致的应用仍只能走桌面级树）
 - [x] 观测主序是否全面切 WGC：**结论是不切**，保留 PrintWindow 为主、WGC 兜底。
   同一轮交替实测（release 二进制，`capture_window` max_edge 1280）里 WGC 每次都慢
   2.1~5.8 倍（记事本 147→858ms、Chrome 628→1338ms、微信 211→912ms），

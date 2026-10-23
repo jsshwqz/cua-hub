@@ -19,8 +19,6 @@
 
 ### 验证
 
-### 验证
-
 - 动作链本机真机实测（release 二进制，loopback HTTP + 记事本，同一任务两种写法各跑两轮）：
   分开调用 5 次 / 1527ms / 109.8 KB，链式调用 2 次 / 1320ms / 49.1 KB——少 3 个往返、
   省 55% 字节、快 207ms。时延没省更多，是因为"动手前观测一次、收尾观测一次"两边都要付；
@@ -30,6 +28,24 @@
 - 这组数字早期是在 debug 二进制上取的（94.6 KB / 48.8 KB、约 3.5 秒），debug 下图像缩放
   与哈希慢一个数量级，已按 release 复测更正。
 - 新增 9 项测试（链策略面 8 项、捕获的 lossless 归属 1 项）。
+- Linux 窗口级无障碍路径**真机结项**（`linux-atspi.yml`：Xvfb + openbox + at-spi2-core +
+  GTK3 probe 窗口，MCP 服务在作业里真跑）。通过的断言：`list_windows` 看到窗口、
+  `window_state` 返回窗口级树 6 个节点且三个命名控件都在树内、帧内标签证明不是桌面级整树、
+  带回一张截图、`set_control_text` 写入 18 字符、`invoke_control` 触发按钮，
+  并以 probe 应用自己写回的文本作为独立 oracle 确认真的落地。
+  CI 产物：`linux-atspi-evidence`（每次调用的原始响应 + probe 输出）。
+
+### 修复
+
+- Linux：`atspi::set_value` 把 `SetTextContents` 的回包按"无返回值"解码。AT-SPI 实际返回
+  一个 bool，于是**应用侧已经写入成功**的调用被 zbus 报成解码错误，工具回过来说
+  "控件没有 Value/EditableText 模式"——方向完全相反，等于把可用控件判成不可用。
+  现在按 bool 解码，只有 toolkit 说成功才算成功。（这个 bug 只有真机能发现，
+  是上面那个 CI 作业跑出来的第一个成果。）
+- Linux：CI probe 应用此前只在 AT-SPI 侧声明身份，X11 的 WM_CLASS 仍是脚本文件名，
+  `snapshot_window` 的 app 匹配因此落空。现在两侧统一（`set_prgname` +
+  `set_program_class`）。顺带记下真实缺口：WM_CLASS 与无障碍应用名不一致的应用
+  （Python 脚本应用、Electron 等）今天在 Linux 上只有桌面级树可用 —— issue #16。
 
 ### 性能与诊断
 
@@ -47,11 +63,12 @@
 
 ### 文档口径
 
-- 「Linux AT-SPI 窗口树真机验证」改称「桌面级」。上一次记录跑的是 `cua-hub tree` /
-  `find`，走 `snapshot()`（registry 根下全部应用）；而 `window_state` 在 Linux 走的是
-  `snapshot_window()`——按 app 与 title 匹配单个 frame，同一应用多个顶层帧且标题都对不上时
-  故意报错而不是猜。窗口级路径与 `DoAction` / `SetTextContents` 由 `linux-atspi.yml`
-  作业收口（见 issue #7）。原先那次验证有效，只是结项粒度和原语层的分支对不上。
+- 「Linux AT-SPI 窗口树真机验证」先改称「桌面级」，再按上面的结项补回窗口级。
+  区分点是原语层的两条分支：`cua-hub tree` / `find` 走 `snapshot()`（registry 根下全部应用），
+  而 `window_state` 走 `snapshot_window()`——按 app 与 title 匹配单个 frame，同一应用多个
+  顶层帧且标题都对不上时故意报错而不是猜。前一次记录只验了前者就勾掉了后者的待办，
+  口径与粒度对不上；现在两者分别有各自的证据（云机一次 + 可重跑的 CI 作业）。
+  另：这条记录与 issue #7 是同一件事的两头——#7 提的是口径问题，本条是补上的证据。
 
 ## 0.1.3 — 2026-10-23
 
