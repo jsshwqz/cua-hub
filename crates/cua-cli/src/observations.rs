@@ -45,6 +45,9 @@ pub struct Observation {
     pub shots: Vec<Shot>,
     /// Indexed controls, in the order the caller saw them.
     pub nodes: Vec<cua_engine_access::UiNode>,
+    /// The window each node lives in, parallel to `nodes`. Differs from
+    /// `window_id` for nodes that came from a popup's tree.
+    pub node_windows: Vec<u32>,
 }
 
 /// How many observations stay resolvable.
@@ -116,6 +119,22 @@ pub fn shot_ids(observation: &Observation) -> Vec<String> {
     observation.shots.iter().map(|s| s.id.clone()).collect()
 }
 
+/// The node at an index together with the window it lives in. Acting on a popup
+/// node must not activate the owner window — that dismisses the popup — so
+/// callers need to know which window an index belongs to.
+pub fn node_at(
+    observation: &Observation,
+    index: usize,
+) -> Option<(cua_engine_access::UiNode, u32)> {
+    let pos = observation.nodes.iter().position(|n| n.index == index)?;
+    let window = observation
+        .node_windows
+        .get(pos)
+        .copied()
+        .unwrap_or(observation.window_id);
+    Some((observation.nodes[pos].clone(), window))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +151,7 @@ mod tests {
             value: String::new(),
             actions: Vec::new(),
             focused: false,
+            selected: false,
         }
     }
 
@@ -169,6 +189,7 @@ mod tests {
                 hash: 1,
             }],
             nodes: vec![node(0)],
+            node_windows: vec![7],
         });
         let found = get(&id).expect("observation should be resolvable");
         assert_eq!(
@@ -193,6 +214,7 @@ mod tests {
             hash: None,
             shots: Vec::new(),
             nodes: vec![node(0)],
+            node_windows: vec![8],
         });
         let found = get(&id).expect("observation should be resolvable");
         assert!(point_in(&found, None, 1.0, 1.0).is_none());
@@ -209,9 +231,20 @@ mod tests {
                 shot("obs:s0", 100, "target", (100, 100), (400, 300)),
                 shot("obs:s1", 200, "related", (500, 250), (183, 54)),
             ],
-            nodes: Vec::new(),
+            nodes: vec![node(0), node(1)],
+            node_windows: vec![100, 200],
         });
         let found = get(&id).expect("observation should be resolvable");
+
+        // An index resolves to the window the node actually lives in, so acting
+        // on a popup node never activates the owner window.
+        let (popup_node, popup_window) = node_at(&found, 1).expect("popup node");
+        assert_eq!(popup_window, 200);
+        assert_eq!(popup_node.index, 1);
+        let (owner_node, owner_window) = node_at(&found, 0).expect("owner node");
+        assert_eq!(owner_window, 100);
+        assert_eq!(owner_node.name, "button 0");
+        assert!(node_at(&found, 9).is_none());
 
         // Same image pixels, different windows: the physical points differ.
         let (target_shot, target_point) =

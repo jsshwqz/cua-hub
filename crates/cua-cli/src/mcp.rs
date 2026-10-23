@@ -429,6 +429,32 @@ fn window_arg_id(value: &Value) -> Option<u32> {
 /// reports "nothing changed" when a menu opens.
 const MAX_RELATED: usize = 3;
 
+/// Node budget for one popup's tree. Popups are small; the cap only protects
+/// against a pathological owner that spawns a huge owned window.
+const MAX_POPUP_NODES: usize = 120;
+
+/// True when a popup's area is already represented in the observed tree, i.e.
+/// one node covers at least 60% of it. Menus and their shadows come back as
+/// separate HWNDs a few pixels larger than the UIA node for the same content,
+/// so exact rectangle equality is not enough to avoid duplicating them.
+fn covered_by(nodes: &[(i32, i32, i32, i32)], popup: (i32, i32, i32, i32)) -> bool {
+    let (px, py, pw, ph) = popup;
+    let area = pw as i64 * ph as i64;
+    if area <= 0 {
+        return true;
+    }
+    nodes.iter().any(|(x, y, w, h)| {
+        let left = (*x).max(px);
+        let top = (*y).max(py);
+        let right = (*x + *w).min(px + pw);
+        let bottom = (*y + *h).min(py + ph);
+        if right <= left || bottom <= top {
+            return false;
+        }
+        (right - left) as i64 * (bottom - top) as i64 * 10 >= area * 6
+    })
+}
+
 /// Combined hash of a window and the popups its process currently owns.
 fn window_state_hash(window: &cua_io::WindowInfo) -> std::result::Result<u64, Value> {
     let cap = cua_io::capture_window(&window.id.to_string(), 640, 60).map_err(tool_err)?;
@@ -550,29 +576,48 @@ fn selector_for_node(node: &cua_engine_access::UiNode) -> Option<String> {
     }
 }
 
+/// An indexed node resolved against the observation it was read from.
+struct ResolvedNode {
+    node: cua_engine_access::UiNode,
+    /// The window the node lives in. Differs from the observed window for nodes
+    /// that came from a popup's tree.
+    node_window: Option<u32>,
+    /// The window to activate before acting, if any. Activating the owner of an
+    /// open menu dismisses the menu, so popup nodes carry `None` here.
+    focus_window: Option<u32>,
+}
+
 /// Resolve an element index, preferring the observation it was read from so the
 /// index cannot drift onto a different control. Falls back to a fresh desktop
 /// snapshot only when the caller did not pass an observation at all.
-fn resolve_indexed_node(
-    args: &Value,
-    index: usize,
-    tool: &str,
-) -> std::result::Result<(cua_engine_access::UiNode, Option<u32>), Value> {
+fn resolve_indexed_node(args: &Value, index: usize, tool: &str) -> Result<ResolvedNode, Value> {
     if let Some(id) = args["observation_id"].as_str() {
         let Some(obs) = observations::get(id) else {
             return Err(stale_err(format!(
                 "{tool} was given observation `{id}` which is no longer held; re-run window_state"
             )));
         };
-        let Some(node) = obs.nodes.iter().find(|n| n.index == index) else {
+        let Some((node, node_window)) = observations::node_at(&obs, index) else {
             return Err(stale_err(format!(
                 "observation {id} has no element_index {index}; re-run window_state with include_text"
             )));
         };
-        return Ok((node.clone(), Some(obs.window_id)));
+        let focus_window = (node_window == obs.window_id).then_some(obs.window_id);
+        return Ok(ResolvedNode {
+            node,
+            node_window: Some(node_window),
+            focus_window,
+        });
     }
     match cua_engine_access::node_at(index, 400, 8) {
-        Ok(Some(node)) => Ok((node, window_arg_id(&args["window"]))),
+        Ok(Some(node)) => {
+            let window = window_arg_id(&args["window"]);
+            Ok(ResolvedNode {
+                node,
+                node_window: window,
+                focus_window: window,
+            })
+        }
         Ok(None) => Err(tool_err(format!(
             "no control at index {index}; re-read accessibility_tree or pass observation_id"
         ))),
@@ -850,6 +895,12 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let mut shots: Vec<observations::Shot> = Vec::new();
             let observation_id = observations::next_id();
 
+            // Menus, tooltips and dialogs are separate windows owned by the same
+            // process. They are observed together with the target so a popup can
+            // be read — and clicked by index — as part of one observation.
+            let related =
+                cua_io::related_windows(window.pid, window.id, MAX_RELATED).unwrap_or_default();
+
             if include_screenshot {
                 match cua_io::capture_window(&window.id.to_string(), max_edge, quality) {
                     Ok(cap) => {
@@ -874,54 +925,45 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                             "data": encode_base64(&cap.frame.observation.image),
                             "mimeType": cap.frame.observation.media_type,
                         }));
-                        // Menus, tooltips and dialogs are their own windows, so
-                        // the target window alone cannot show that one opened.
                         // Each popup image carries its own id and origin: a
                         // coordinate read off a menu is not a coordinate in the
                         // window that owns it.
                         let mut composite = cap.hash;
-                        if let Ok(related) =
-                            cua_io::related_windows(window.pid, window.id, MAX_RELATED)
-                        {
-                            let mut related_meta = Vec::new();
-                            for (n, rel) in related.iter().enumerate() {
-                                if let Ok(rel_cap) =
-                                    cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
-                                {
-                                    let rel_shot_id = format!("{observation_id}:s{}", n + 1);
-                                    composite =
-                                        composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
-                                    let mut meta = window_capture_meta(&rel_cap);
-                                    if let Some(map) = meta.as_object_mut() {
-                                        map.insert("role".into(), json!("related"));
-                                        map.insert("screenshot_id".into(), json!(rel_shot_id));
-                                    }
-                                    shots.push(observations::Shot {
-                                        id: rel_shot_id,
-                                        window_id: rel.id,
-                                        role: "related",
-                                        origin: (rel_cap.info.x, rel_cap.info.y),
-                                        scale: rel_cap.frame.scale,
-                                        size: (
-                                            rel_cap.frame.observation.width,
-                                            rel_cap.frame.observation.height,
-                                        ),
-                                        hash: rel_cap.hash,
-                                    });
-                                    related_meta.push(meta);
-                                    content.push(json!({
-                                        "type": "image",
-                                        "data": encode_base64(&rel_cap.frame.observation.image),
-                                        "mimeType": rel_cap.frame.observation.media_type,
-                                    }));
+                        let mut related_meta = Vec::new();
+                        for (n, rel) in related.iter().enumerate() {
+                            if let Ok(rel_cap) =
+                                cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
+                            {
+                                let rel_shot_id = format!("{observation_id}:s{}", n + 1);
+                                composite = composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
+                                let mut meta = window_capture_meta(&rel_cap);
+                                if let Some(map) = meta.as_object_mut() {
+                                    map.insert("role".into(), json!("related"));
+                                    map.insert("screenshot_id".into(), json!(rel_shot_id));
                                 }
+                                shots.push(observations::Shot {
+                                    id: rel_shot_id,
+                                    window_id: rel.id,
+                                    role: "related",
+                                    origin: (rel_cap.info.x, rel_cap.info.y),
+                                    scale: rel_cap.frame.scale,
+                                    size: (
+                                        rel_cap.frame.observation.width,
+                                        rel_cap.frame.observation.height,
+                                    ),
+                                    hash: rel_cap.hash,
+                                });
+                                related_meta.push(meta);
+                                content.push(json!({
+                                    "type": "image",
+                                    "data": encode_base64(&rel_cap.frame.observation.image),
+                                    "mimeType": rel_cap.frame.observation.media_type,
+                                }));
                             }
-                            if !related_meta.is_empty() {
-                                if let Some(map) =
-                                    screenshot.as_mut().and_then(Value::as_object_mut)
-                                {
-                                    map.insert("related".into(), json!(related_meta));
-                                }
+                        }
+                        if !related_meta.is_empty() {
+                            if let Some(map) = screenshot.as_mut().and_then(Value::as_object_mut) {
+                                map.insert("related".into(), json!(related_meta));
                             }
                         }
                         hash = Some(composite);
@@ -939,23 +981,108 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             }
 
             let mut nodes: Vec<cua_engine_access::UiNode> = Vec::new();
+            let mut node_windows: Vec<u32> = Vec::new();
             let mut accessibility: Option<Value> = None;
             if include_text {
-                match cua_engine_access::snapshot_window(window.id, max_nodes, depth) {
+                match cua_engine_access::snapshot_window(
+                    window.id,
+                    &window.app,
+                    &window.title,
+                    max_nodes,
+                    depth,
+                ) {
                     Ok(mut snap) => {
-                        // Indexes come from a per-window registry, so the same
-                        // control keeps its number and only the changed lines
-                        // need to be sent back.
-                        let view = elements::observe(window.id, &mut snap, disable_diffing);
+                        // Popups contribute their own tree section under a header
+                        // line, sharing one index namespace with the target, so an
+                        // element_index is unambiguous across the observation.
+                        let mut related_snaps: Vec<(
+                            cua_io::WindowInfo,
+                            cua_engine_access::UiSnapshot,
+                        )> = Vec::new();
+                        // UIA already parents most popups inside the owning
+                        // window's logical tree. Re-reading those through their
+                        // own HWND would duplicate every menu item under a second
+                        // index, so a popup only gets its own section when the
+                        // target tree does not already show that area. Overlap,
+                        // not equality: a menu's HWND is a few pixels larger than
+                        // the UIA node for the same menu, and its drop shadow
+                        // larger again.
+                        let shown: Vec<(i32, i32, i32, i32)> =
+                            snap.nodes.iter().map(|n| n.rect).collect();
+                        let target_area = window.width as i64 * window.height as i64;
+                        for rel in &related {
+                            // A popup is smaller than the window it belongs to.
+                            // Something bigger is the owner: observing a modal
+                            // dialog should not drag the whole parent window's
+                            // tree — and therefore a copy of the dialog — along.
+                            if rel.width as i64 * rel.height as i64 > target_area {
+                                continue;
+                            }
+                            let popup = (rel.x, rel.y, rel.width as i32, rel.height as i32);
+                            if covered_by(&shown, popup) {
+                                continue;
+                            }
+                            if let Ok(rel_snap) = cua_engine_access::snapshot_window(
+                                rel.id,
+                                &rel.app,
+                                &rel.title,
+                                MAX_POPUP_NODES,
+                                depth,
+                            ) {
+                                related_snaps.push((rel.clone(), rel_snap));
+                            }
+                        }
+                        let mut parts: Vec<elements::TreePart> =
+                            Vec::with_capacity(1 + related_snaps.len());
+                        parts.push(elements::TreePart {
+                            window_id: window.id,
+                            title: window.title.clone(),
+                            related: false,
+                            snapshot: &mut snap,
+                        });
+                        for (rel, rel_snap) in related_snaps.iter_mut() {
+                            parts.push(elements::TreePart {
+                                window_id: rel.id,
+                                title: rel.title.clone(),
+                                related: true,
+                                snapshot: rel_snap,
+                            });
+                        }
+                        // observe_group takes the parts by value, so the borrows
+                        // end with the call and the snapshots are readable again.
+                        let view = elements::observe_group(window.id, parts, disable_diffing);
                         nodes = snap.nodes.clone();
+                        node_windows = vec![window.id; snap.nodes.len()];
+                        let mut truncated = snap.truncated;
+                        for (rel, rel_snap) in &related_snaps {
+                            nodes.extend(rel_snap.nodes.iter().cloned());
+                            node_windows.extend(std::iter::repeat_n(rel.id, rel_snap.nodes.len()));
+                            truncated |= rel_snap.truncated;
+                        }
                         accessibility = Some(json!({
                             "mode": view.mode.as_str(),
                             "tree": view.text,
                             "node_count": view.node_count,
                             "changed_lines": view.changed_lines,
-                            "truncated": snap.truncated,
+                            "truncated": truncated,
                             "notice": view.notice,
                         }));
+                        // Selection and document text save a second observation
+                        // when the task is "what is selected / what does it say".
+                        let text_ctx =
+                            cua_engine_access::text_context(window.id).unwrap_or_default();
+                        let selected_lines = snap.selected_lines();
+                        if let Some(map) = accessibility.as_mut().and_then(Value::as_object_mut) {
+                            if let Some(selected) = text_ctx.selected_text {
+                                map.insert("selected_text".into(), json!(selected));
+                            }
+                            if let Some(document) = text_ctx.document_text {
+                                map.insert("document_text".into(), json!(document));
+                            }
+                            if !selected_lines.is_empty() {
+                                map.insert("selected_elements".into(), json!(selected_lines));
+                            }
+                        }
                     }
                     Err(e) => return tool_err(e),
                 }
@@ -968,6 +1095,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 hash,
                 shots,
                 nodes,
+                node_windows,
             });
             let observation_id = recorded;
 
@@ -1173,17 +1301,17 @@ async fn call_tool(name: &str, args: &Value) -> Value {
         }
         "invoke_element" => {
             let index = args["index"].as_u64().unwrap_or(u64::MAX) as usize;
-            let (node, focus_target) = match resolve_indexed_node(args, index, "invoke_element") {
-                Ok(pair) => pair,
+            let resolved = match resolve_indexed_node(args, index, "invoke_element") {
+                Ok(r) => r,
                 Err(e) => return e,
             };
-            if let Some(id) = focus_target {
+            if let Some(id) = resolved.focus_window {
                 if let Err(e) = cua_engine_access::focus_window(id) {
                     return tool_err(e);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(60));
             }
-            let Some(selector) = selector_for_node(&node) else {
+            let Some(selector) = selector_for_node(&resolved.node) else {
                 return tool_err(format!(
                     "control at index {index} has no accessible name or automation id"
                 ));
@@ -1194,7 +1322,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                     invoked.control_type, invoked.name
                 )),
                 Ok(None) => {
-                    let (x, y, w, h) = node.rect;
+                    let (x, y, w, h) = resolved.node.rect;
                     if w <= 0 || h <= 0 {
                         return tool_err(format!(
                             "control at index {index} has no usable rectangle"
@@ -1208,8 +1336,8 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                     match cua_io::apply(&action, 1.0) {
                         Ok(()) => tool_ok(format!(
                             "clicked {} \"{}\" at ({},{})",
-                            node.control_type,
-                            node.name,
+                            resolved.node.control_type,
+                            resolved.node.name,
                             x + w / 2,
                             y + h / 2
                         )),
@@ -1227,7 +1355,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             };
             let (node, focus_target) = match resolve_indexed_node(args, index, "set_element_value")
             {
-                Ok(pair) => pair,
+                Ok(r) => (r.node, r.focus_window),
                 Err(e) => return e,
             };
             if let Some(id) = focus_target {
@@ -1261,11 +1389,11 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 Ok(v) => v,
                 Err(e) => return e,
             };
-            let (node, focus_target) =
-                match resolve_indexed_node(args, index, "perform_secondary_action") {
-                    Ok(pair) => pair,
-                    Err(e) => return e,
-                };
+            let resolved = match resolve_indexed_node(args, index, "perform_secondary_action") {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let node = resolved.node;
             // The signature is what makes the target unambiguous, and only nodes
             // that came from a window observation carry one.
             if node.signature.is_empty() {
@@ -1281,7 +1409,12 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                     }
                 }));
             }
-            let Some(window_id) = focus_target.or_else(|| window_arg_id(&args["window"])) else {
+            // A popup node is looked up inside the popup's own tree; activating
+            // the owner window first would dismiss the popup.
+            let Some(window_id) = resolved
+                .node_window
+                .or_else(|| window_arg_id(&args["window"]))
+            else {
                 return tool_err(
                     "perform_secondary_action needs the window the element belongs to; pass observation_id from window_state",
                 );
@@ -1310,11 +1443,14 @@ async fn call_tool(name: &str, args: &Value) -> Value {
                 }));
             }
 
-            // Most patterns only work on the window that owns the foreground.
-            if let Err(e) = cua_engine_access::focus_window(window_id) {
-                return tool_err(e);
+            // Most patterns only work on the window that owns the foreground; a
+            // popup is already up, so leave the foreground alone for its nodes.
+            if let Some(id) = resolved.focus_window {
+                if let Err(e) = cua_engine_access::focus_window(id) {
+                    return tool_err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(60));
             }
-            std::thread::sleep(std::time::Duration::from_millis(60));
 
             match cua_engine_access::secondary_action(window_id, &node.signature, requested) {
                 Ok(outcome) => tool_ok(json!({
@@ -1379,22 +1515,17 @@ async fn call_tool(name: &str, args: &Value) -> Value {
             let element_index = args["element_index"].as_u64();
             let target_window: Option<u32>;
             let point: (i32, i32) = if let Some(index) = element_index {
-                let Some(obs) = observation_id.and_then(observations::get) else {
-                    return stale_err(
-                        "element_index needs the observation_id it was read from; re-run window_state",
-                    );
+                let resolved = match resolve_indexed_node(args, index as usize, "click") {
+                    Ok(r) => r,
+                    Err(e) => return e,
                 };
-                let Some(node) = obs.nodes.iter().find(|n| n.index == index as usize) else {
-                    return stale_err(format!(
-                        "observation {} has no element_index {index}",
-                        obs.id
-                    ));
-                };
-                let (x, y, w, h) = node.rect;
+                let (x, y, w, h) = resolved.node.rect;
                 if w <= 0 || h <= 0 {
                     return stale_err(format!("element_index {index} has no usable rectangle"));
                 }
-                target_window = Some(obs.window_id);
+                // A node inside a popup must not trigger activation of the
+                // owner window: that closes the menu before the click lands.
+                target_window = resolved.focus_window;
                 (x + w / 2, y + h / 2)
             } else if let (Some(x), Some(y)) = (args["x"].as_f64(), args["y"].as_f64()) {
                 let shot_id = args["screenshot_id"].as_str();
@@ -1766,7 +1897,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "window_state",
-            "description": "The observation to act on: one call returns the window's screenshot and/or its in-window accessibility tree with element indexes, plus which element has keyboard focus. Element indexes are stable for a given window, so after the first observation the tree comes back as a unified diff (mode=diff) instead of a full listing; mode=unchanged means your mapping still applies, and mode=baseline_reset means every index you hold is invalid. Returns an observation_id; every element_index or screenshot coordinate you act with must cite it, and a rejected stale_observation means you must re-observe rather than retry.",
+            "description": "The observation to act on: one call returns the window's screenshot and/or its in-window accessibility tree with element indexes, plus which element has keyboard focus, what text is selected, and the selected controls. Element indexes are stable for a given window, so after the first observation the tree comes back as a unified diff (mode=diff) instead of a full listing; mode=unchanged means your mapping still applies, and mode=baseline_reset means every index you hold is invalid. Menus and dialogs appear in the tree with their own indexes; images that are not the target window carry their own screenshot_id and origin. Returns an observation_id; every element_index or screenshot coordinate you act with must cite it, and a rejected stale_observation means you must re-observe rather than retry.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2214,6 +2345,23 @@ mod tests {
         assert!(names.contains(&"list_apps".to_string()));
         assert!(names.contains(&"launch_app".to_string()));
         assert!(names.contains(&"perform_secondary_action".to_string()));
+    }
+
+    #[test]
+    fn a_popup_already_shown_in_the_tree_is_not_read_twice() {
+        // The UIA node for an open menu, and the popup HWNDs for the same menu
+        // plus its shadow.
+        let shown = [(863, 210, 183, 54), (730, 148, 808, 729)];
+        assert!(covered_by(&shown, (863, 210, 183, 54)), "identical rect");
+        assert!(
+            covered_by(&shown, (863, 210, 188, 59)),
+            "menu with its shadow border"
+        );
+        assert!(
+            !covered_by(&shown, (40, 40, 300, 200)),
+            "an unrelated window"
+        );
+        assert!(covered_by(&shown, (0, 0, 0, 0)), "an empty rect");
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct UiNode {
     /// True when this control owns keyboard focus.
     #[serde(default, skip_serializing_if = "is_false")]
     pub focused: bool,
+    /// True when this control is currently selected (list items, tabs, rows).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selected: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -92,17 +95,25 @@ pub struct ControlState {
 
 /// Snapshot the control tree rooted at one window, so indexes are scoped to the
 /// window the caller is about to act on rather than the whole desktop.
-pub fn snapshot_window(id: u32, max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
+///
+/// On Windows the window id is the HWND. AT-SPI has no window id, so the Linux
+/// backend locates the frame by the app and title the window list reported.
+pub fn snapshot_window(
+    id: u32,
+    app: &str,
+    title: &str,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<UiSnapshot> {
     #[cfg(windows)]
     {
+        let _ = (app, title);
         imp::snapshot_window(id, max_nodes, max_depth)
     }
     #[cfg(not(windows))]
     {
-        let _ = (id, max_nodes, max_depth);
-        Err(cua_core::Error::InvalidAction(
-            "window-scoped accessibility is only implemented on Windows".into(),
-        ))
+        let _ = id;
+        atspi::snapshot_window(app, title, max_nodes, max_depth)
     }
 }
 
@@ -164,6 +175,31 @@ impl std::fmt::Display for UnsupportedAction {
     }
 }
 
+/// Text a window's focused document exposes: what the user has selected and the
+/// document body. Both are capped — they exist to save a second observation, not
+/// to ship an entire file through a tool result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_text: Option<String>,
+}
+
+/// Read the selection and document text of the control that owns focus inside
+/// one window. Windows only; other platforms report nothing rather than failing.
+pub fn text_context(window_id: u32) -> Result<TextContext> {
+    #[cfg(windows)]
+    {
+        imp::text_context(window_id)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window_id;
+        Ok(TextContext::default())
+    }
+}
+
 /// Perform a secondary accessibility action on the control identified by its
 /// structural signature inside one window: expand a disclosure, raise a window,
 /// scroll a pane, toggle a checkbox, select a list item, focus or invoke.
@@ -206,6 +242,9 @@ impl UiSnapshot {
             if n.focused {
                 out.push_str(" FOCUSED");
             }
+            if n.selected {
+                out.push_str(" SELECTED");
+            }
             if !n.actions.is_empty() {
                 out.push_str(&format!(" actions={}", n.actions.join(",")));
             }
@@ -219,6 +258,24 @@ impl UiSnapshot {
             out.push_str("... (truncated)\n");
         }
         out
+    }
+
+    /// Tree-formatted lines for the controls that are currently selected, so a
+    /// caller can see a list's or tab strip's selection without scanning the
+    /// whole tree.
+    pub fn selected_lines(&self) -> Vec<String> {
+        let selected: Vec<UiNode> = self.nodes.iter().filter(|n| n.selected).cloned().collect();
+        if selected.is_empty() {
+            return Vec::new();
+        }
+        UiSnapshot {
+            nodes: selected,
+            truncated: false,
+        }
+        .to_text()
+        .lines()
+        .map(str::to_string)
+        .collect()
     }
 }
 
@@ -698,6 +755,107 @@ mod imp {
             .map(|el| element_to_node(&el)))
     }
 
+    /// Selection and document text via the Text pattern.
+    ///
+    /// The focused element is tried first, then the window root, then a handful
+    /// of text-bearing controls from the tree: providers disagree about which
+    /// element owns the pattern (Chromium answers on the root, document editors
+    /// usually only on the nested Document control), so stopping after two probes
+    /// would report "no text" for most apps.
+    pub fn text_context(window_id: u32) -> Result<super::TextContext> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::Accessibility::IUIAutomation;
+
+        const SELECTION_MAX: i32 = 4_000;
+        const DOCUMENT_MAX: i32 = 8_000;
+
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
+
+        let mut candidates: Vec<IUIAutomationElement> = Vec::new();
+        candidates.extend(unsafe { automation.GetFocusedElement() }.ok());
+        candidates.extend(unsafe { automation.ElementFromHandle(HWND(window_id as *mut _)) }.ok());
+
+        if let Some(context) = read_text(&candidates, SELECTION_MAX, DOCUMENT_MAX) {
+            return Ok(context);
+        }
+
+        // Bounded, and only reached when the cheap probes missed: walking the
+        // tree again costs a second UIA round trip per level.
+        candidates = text_candidates(window_id)?;
+        Ok(read_text(&candidates, SELECTION_MAX, DOCUMENT_MAX).unwrap_or_default())
+    }
+
+    /// The first element among `candidates` that answers the Text pattern with
+    /// something worth returning.
+    fn read_text(
+        candidates: &[IUIAutomationElement],
+        selection_max: i32,
+        document_max: i32,
+    ) -> Option<super::TextContext> {
+        use windows::Win32::UI::Accessibility::{IUIAutomationTextPattern, UIA_TextPatternId};
+
+        for element in candidates {
+            let Ok(pattern) = (unsafe {
+                element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+            }) else {
+                continue;
+            };
+            let selected_text = first_selection_text(&pattern, selection_max);
+            let document_text = unsafe { pattern.DocumentRange() }
+                .ok()
+                .and_then(|range| unsafe { range.GetText(document_max) }.ok())
+                .map(|b| super::truncate(&b.to_string(), document_max as usize));
+            if selected_text.is_none() && document_text.is_none() {
+                continue;
+            }
+            return Some(super::TextContext {
+                selected_text,
+                document_text,
+            });
+        }
+        None
+    }
+
+    /// Text-bearing controls worth probing for the Text pattern, in document
+    /// order, capped at a few per window.
+    fn text_candidates(window_id: u32) -> Result<Vec<IUIAutomationElement>> {
+        let mut found = Vec::new();
+        walk(Root::Window(window_id), 400, 16, |node, element| {
+            if matches!(
+                node.control_type.as_str(),
+                "Document" | "Edit" | "Text" | "ComboBox" | "List" | "Table"
+            ) {
+                found.push(element.clone());
+                if found.len() >= 6 {
+                    return true;
+                }
+            }
+            false
+        })?;
+        Ok(found)
+    }
+
+    /// The first range of the current selection, as text.
+    fn first_selection_text(
+        pattern: &windows::Win32::UI::Accessibility::IUIAutomationTextPattern,
+        max: i32,
+    ) -> Option<String> {
+        let array = unsafe { pattern.GetSelection() }.ok()?;
+        if unsafe { array.Length() }.unwrap_or(0) <= 0 {
+            return None;
+        }
+        let range = unsafe { array.GetElement(0) }.ok()?;
+        let text = unsafe { range.GetText(max) }.ok()?.to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(super::truncate(&text, max as usize))
+        }
+    }
+
     pub fn find(name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
         Ok(find_element(name)?
             .map(|el| element_to_node(&el))
@@ -884,6 +1042,10 @@ mod imp {
     }
 
     fn element_to_node(el: &IUIAutomationElement) -> UiNode {
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId,
+        };
+
         UiNode {
             index: 0,
             depth: 0,
@@ -912,6 +1074,15 @@ mod imp {
             focused: unsafe { el.CurrentHasKeyboardFocus() }
                 .map(|b| b.as_bool())
                 .unwrap_or(false),
+            selected: unsafe {
+                el.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                    UIA_SelectionItemPatternId,
+                )
+            }
+            .ok()
+            .and_then(|p| unsafe { p.CurrentIsSelected().ok() })
+            .map(|b| b.as_bool())
+            .unwrap_or(false),
         }
     }
 
@@ -959,17 +1130,33 @@ mod imp {
         value
     }
 
+    /// Read a cached integer property the same way.
+    ///
+    /// Pattern *state* is read through properties rather than
+    /// `GetCachedPatternAs`: on real providers (Explorer's list items, Notepad's
+    /// edit) the cached pattern interface comes back empty even when the state
+    /// property is populated, which silently turned every `selected` and
+    /// expanded-state read into "false".
+    fn cached_int(el: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> Option<i32> {
+        use windows::Win32::System::Variant::{VariantClear, VariantToInt32};
+        let Ok(mut variant) = (unsafe { el.GetCachedPropertyValue(property) }) else {
+            return None;
+        };
+        let value = unsafe { VariantToInt32(&variant) }.ok();
+        let _ = unsafe { VariantClear(&mut variant) };
+        value
+    }
+
     /// Secondary actions from cached pattern-availability flags. Probing patterns
     /// live costs one cross-process COM call each, which turns a 200-node walk
     /// into seconds; the availability flags arrive with the children.
     fn cached_actions(el: &IUIAutomationElement) -> Vec<String> {
         use windows::Win32::UI::Accessibility::{
-            ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
-            IUIAutomationExpandCollapsePattern, IUIAutomationScrollPattern,
-            UIA_ExpandCollapsePatternId, UIA_IsExpandCollapsePatternAvailablePropertyId,
-            UIA_IsInvokePatternAvailablePropertyId, UIA_IsScrollPatternAvailablePropertyId,
-            UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
-            UIA_IsWindowPatternAvailablePropertyId, UIA_ScrollPatternId,
+            UIA_ExpandCollapseExpandCollapseStatePropertyId,
+            UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsInvokePatternAvailablePropertyId,
+            UIA_IsScrollPatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
+            UIA_IsTogglePatternAvailablePropertyId, UIA_IsWindowPatternAvailablePropertyId,
+            UIA_ScrollHorizontallyScrollablePropertyId, UIA_ScrollVerticallyScrollablePropertyId,
         };
 
         let mut actions = Vec::new();
@@ -977,18 +1164,13 @@ mod imp {
             actions.push("Invoke".to_string());
         }
         if cached_flag(el, UIA_IsExpandCollapsePatternAvailablePropertyId) {
-            let state = unsafe {
-                el.GetCachedPatternAs::<IUIAutomationExpandCollapsePattern>(
-                    UIA_ExpandCollapsePatternId,
-                )
-            }
-            .ok()
-            .and_then(|p| unsafe { p.CachedExpandCollapseState().ok() });
-            match state {
-                Some(s) if s == ExpandCollapseState_Expanded => {
-                    actions.push("Collapse".to_string())
-                }
-                Some(s) if s == ExpandCollapseState_Collapsed => actions.push("Expand".to_string()),
+            // ExpandCollapseState: 0 collapsed, 1 expanded, 2 partially
+            // expanded, 3 leaf node. Only the direction that is actually
+            // available is advertised, so the caller never asks to collapse
+            // something that is already closed.
+            match cached_int(el, UIA_ExpandCollapseExpandCollapseStatePropertyId) {
+                Some(0) => actions.push("Expand".to_string()),
+                Some(1) => actions.push("Collapse".to_string()),
                 _ => {
                     actions.push("Expand".to_string());
                     actions.push("Collapse".to_string());
@@ -996,25 +1178,11 @@ mod imp {
             }
         }
         if cached_flag(el, UIA_IsScrollPatternAvailablePropertyId) {
-            let pattern =
-                unsafe { el.GetCachedPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId) }
-                    .ok();
-            let vertical = pattern
-                .as_ref()
-                .and_then(|p| unsafe { p.CachedVerticallyScrollable().ok() })
-                .is_some_and(|b| b.as_bool());
-            let horizontal = pattern
-                .as_ref()
-                .and_then(|p| unsafe { p.CachedHorizontallyScrollable().ok() })
-                .is_some_and(|b| b.as_bool());
-            // When the pattern does not answer, advertise both axes: a missing
-            // label hides a working action, while an extra one only costs a
-            // clear error.
-            if vertical || pattern.is_none() {
+            if cached_flag(el, UIA_ScrollVerticallyScrollablePropertyId) {
                 actions.push("Scroll Up".to_string());
                 actions.push("Scroll Down".to_string());
             }
-            if horizontal || pattern.is_none() {
+            if cached_flag(el, UIA_ScrollHorizontallyScrollablePropertyId) {
                 actions.push("Scroll Left".to_string());
                 actions.push("Scroll Right".to_string());
             }
@@ -1124,6 +1292,13 @@ mod imp {
         value: String,
         actions: Vec<String>,
         focused: bool,
+        selected: bool,
+    }
+
+    /// Whether a control is part of the current selection, from the cache.
+    fn cached_selected(el: &IUIAutomationElement) -> bool {
+        use windows::Win32::UI::Accessibility::UIA_SelectionItemIsSelectedPropertyId;
+        cached_flag(el, UIA_SelectionItemIsSelectedPropertyId)
     }
 
     fn cached_facts(el: &IUIAutomationElement) -> Facts {
@@ -1147,6 +1322,7 @@ mod imp {
             focused: unsafe { el.CachedHasKeyboardFocus() }
                 .map(|b| b.as_bool())
                 .unwrap_or(false),
+            selected: cached_selected(el),
         }
     }
 
@@ -1160,6 +1336,7 @@ mod imp {
             value: node.value,
             actions: node.actions,
             focused: node.focused,
+            selected: node.selected,
         }
     }
 
@@ -1184,12 +1361,14 @@ mod imp {
         use windows::Win32::UI::Accessibility::{
             IUIAutomation, IUIAutomationCacheRequest, TreeScope_Children, TreeScope_Element,
             UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
-            UIA_ExpandCollapsePatternId, UIA_HasKeyboardFocusPropertyId, UIA_IsEnabledPropertyId,
-            UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsInvokePatternAvailablePropertyId,
-            UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
-            UIA_IsScrollPatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
-            UIA_IsTogglePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
-            UIA_IsWindowPatternAvailablePropertyId, UIA_NamePropertyId,
+            UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_HasKeyboardFocusPropertyId,
+            UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
+            UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
+            UIA_IsOffscreenPropertyId, UIA_IsScrollPatternAvailablePropertyId,
+            UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
+            UIA_IsValuePatternAvailablePropertyId, UIA_IsWindowPatternAvailablePropertyId,
+            UIA_NamePropertyId, UIA_ScrollHorizontallyScrollablePropertyId,
+            UIA_ScrollVerticallyScrollablePropertyId, UIA_SelectionItemIsSelectedPropertyId,
         };
 
         // One cache request batches every property fetch into the COM call that
@@ -1224,7 +1403,10 @@ mod imp {
                 .and_then(|_| cache.AddProperty(UIA_IsSelectionItemPatternAvailablePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsWindowPatternAvailablePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsValuePatternAvailablePropertyId))
-                .and_then(|_| cache.AddPattern(UIA_ExpandCollapsePatternId))
+                .and_then(|_| cache.AddProperty(UIA_ExpandCollapseExpandCollapseStatePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_ScrollVerticallyScrollablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_ScrollHorizontallyScrollablePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_SelectionItemIsSelectedPropertyId))
                 .and_then(|_| cache.SetTreeScope(TreeScope_Element))
                 .map_err(|e| Error::Capture(format!("UIA cache setup: {e}")))?;
         }
@@ -1296,6 +1478,7 @@ mod imp {
                     value: facts.value,
                     actions: facts.actions,
                     focused: facts.focused,
+                    selected: facts.selected,
                 };
                 if visit(&node, &element) {
                     return Ok((truncated, true));

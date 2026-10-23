@@ -103,29 +103,67 @@ fn key_for(node: &UiNode) -> String {
     }
 }
 
-/// Assign stable indexes to a snapshot and produce the text the caller should
-/// see. `disable_diffing` forces a full tree and rebuilds the numbering.
-pub fn observe(window_id: u32, snapshot: &mut UiSnapshot, disable_diffing: bool) -> TreeView {
+/// One window's tree inside a grouped observation.
+pub struct TreePart<'a> {
+    pub window_id: u32,
+    pub title: String,
+    /// True for popups owned by the observed window's process.
+    pub related: bool,
+    pub snapshot: &'a mut UiSnapshot,
+}
+
+fn render_part(part: &TreePart<'_>) -> String {
+    let mut out = String::new();
+    if part.related {
+        out.push_str(&format!(
+            "# related window {} \"{}\"\n",
+            part.window_id, part.title
+        ));
+    }
+    out.push_str(&part.snapshot.to_text());
+    out
+}
+
+/// Assign stable indexes to one or more trees that belong to the same
+/// observation and produce the single text the caller should see.
+///
+/// The target window comes first; related popups follow under a header line, so
+/// a menu opening or closing shows up in the diff like any other change. All
+/// parts share one index namespace, which is what makes an `element_index`
+/// unambiguous across the whole observation — including indexes that point into
+/// a popup.
+pub fn observe_group(
+    scope_id: u32,
+    mut parts: Vec<TreePart<'_>>,
+    disable_diffing: bool,
+) -> TreeView {
+    let node_count: usize = parts.iter().map(|p| p.snapshot.nodes.len()).sum();
     let Ok(mut guard) = registry().lock() else {
         // A poisoned registry must not take the tool down with it: hand back a
         // full tree with sequential indexes.
-        for (i, node) in snapshot.nodes.iter_mut().enumerate() {
-            node.index = i;
+        let mut text = String::new();
+        let mut next = 0usize;
+        for part in parts.iter_mut() {
+            for node in &mut part.snapshot.nodes {
+                node.index = next;
+                next += 1;
+            }
+            text.push_str(&render_part(part));
         }
         return TreeView {
             mode: TreeMode::BaselineReset,
-            text: snapshot.to_text(),
+            text,
             notice: Some(RESET_NOTICE.to_string()),
-            node_count: snapshot.nodes.len(),
-            changed_lines: snapshot.nodes.len(),
+            node_count,
+            changed_lines: node_count,
         };
     };
 
     if disable_diffing {
-        guard.remove(&window_id);
+        guard.remove(&scope_id);
     }
     // Evict the least recently used window when the registry is full.
-    if !guard.contains_key(&window_id) && guard.len() >= MAX_WINDOWS {
+    if !guard.contains_key(&scope_id) && guard.len() >= MAX_WINDOWS {
         if let Some(oldest) = guard
             .iter()
             .min_by_key(|(_, entry)| entry.last_used)
@@ -137,7 +175,7 @@ pub fn observe(window_id: u32, snapshot: &mut UiSnapshot, disable_diffing: bool)
 
     let tick = tick();
     let mut reset = false;
-    let entry = guard.entry(window_id).or_default();
+    let entry = guard.entry(scope_id).or_default();
     entry.last_used = tick;
 
     if entry.indexes.len() > MAX_INDEXES {
@@ -149,20 +187,26 @@ pub fn observe(window_id: u32, snapshot: &mut UiSnapshot, disable_diffing: bool)
         reset = true;
     }
 
-    let mut current: HashSet<String> = HashSet::with_capacity(snapshot.nodes.len());
-    for node in &mut snapshot.nodes {
-        let key = key_for(node);
-        let index = match entry.indexes.get(&key) {
-            Some(index) => *index as usize,
-            None => {
-                let next = entry.next_index;
-                entry.next_index += 1;
-                entry.indexes.insert(key.clone(), next);
-                next as usize
-            }
-        };
-        node.index = index;
-        current.insert(key);
+    let mut current: HashSet<String> = HashSet::with_capacity(node_count);
+    let mut text = String::new();
+    for part in parts.iter_mut() {
+        // The window id is part of the key: the same-shaped control in a popup
+        // and in the owner window must not share an index.
+        for node in &mut part.snapshot.nodes {
+            let key = format!("{}|{}", part.window_id, key_for(node));
+            let index = match entry.indexes.get(&key) {
+                Some(index) => *index as usize,
+                None => {
+                    let next = entry.next_index;
+                    entry.next_index += 1;
+                    entry.indexes.insert(key.clone(), next);
+                    next as usize
+                }
+            };
+            node.index = index;
+            current.insert(key);
+        }
+        text.push_str(&render_part(part));
     }
 
     // Retire signatures that have been gone for two observations, so the map
@@ -173,7 +217,6 @@ pub fn observe(window_id: u32, snapshot: &mut UiSnapshot, disable_diffing: bool)
     entry.previous = std::mem::take(&mut entry.alive);
     entry.alive = current;
 
-    let text = snapshot.to_text();
     let baseline = entry.baseline.take();
     entry.baseline = Some(text.clone());
 
@@ -215,7 +258,7 @@ pub fn observe(window_id: u32, snapshot: &mut UiSnapshot, disable_diffing: bool)
         mode,
         text: out,
         notice,
-        node_count: snapshot.nodes.len(),
+        node_count,
         changed_lines: changed,
     }
 }
@@ -393,6 +436,7 @@ mod tests {
             value: String::new(),
             actions: vec!["Invoke".into()],
             focused: false,
+            selected: false,
         }
     }
 
@@ -408,6 +452,19 @@ mod tests {
             nodes,
             truncated: false,
         }
+    }
+
+    fn observe(window: u32, snap: &mut UiSnapshot, disable: bool) -> TreeView {
+        observe_group(
+            window,
+            vec![TreePart {
+                window_id: window,
+                title: String::new(),
+                related: false,
+                snapshot: snap,
+            }],
+            disable,
+        )
     }
 
     /// A window big enough that a diff is genuinely smaller than the tree, which
@@ -580,6 +637,64 @@ mod tests {
             !diff.contains("line15"),
             "far-away context leaked in: {diff}"
         );
+    }
+
+    #[test]
+    fn grouped_observation_shares_one_index_namespace() {
+        let window = 9006;
+        let popup = 9007;
+        let mut target = snapshot(vec![typed("/0:Window", "Window", "Notepad", 0)]);
+        let mut menu = snapshot(vec![
+            typed("/0:Menu", "Menu", "格式(O)", 0),
+            typed("/0:Menu/1:MenuItem", "MenuItem", "字体(F)...", 1),
+        ]);
+        let view = observe_group(
+            window,
+            vec![
+                TreePart {
+                    window_id: window,
+                    title: "Notepad".into(),
+                    related: false,
+                    snapshot: &mut target,
+                },
+                TreePart {
+                    window_id: popup,
+                    title: String::new(),
+                    related: true,
+                    snapshot: &mut menu,
+                },
+            ],
+            false,
+        );
+        assert_eq!(view.mode, TreeMode::Full);
+        // Target first, then the popup under its header, one shared numbering.
+        assert_eq!(target.nodes[0].index, 0);
+        assert_eq!(menu.nodes[0].index, 1);
+        assert_eq!(menu.nodes[1].index, 2);
+        assert!(
+            view.text.contains(&format!("# related window {popup}")),
+            "{}",
+            view.text
+        );
+
+        // The popup closing removes its lines; on a tree this small the diff is
+        // not shorter than the full text, so a full tree without the popup is
+        // the honest answer.
+        let mut target2 = snapshot(vec![typed("/0:Window", "Window", "Notepad", 0)]);
+        let view2 = observe_group(
+            window,
+            vec![TreePart {
+                window_id: window,
+                title: "Notepad".into(),
+                related: false,
+                snapshot: &mut target2,
+            }],
+            false,
+        );
+        assert_ne!(view2.mode, TreeMode::Unchanged);
+        assert!(!view2.text.contains("# related window"), "{}", view2.text);
+        assert!(!view2.text.contains("MenuItem"), "{}", view2.text);
+        assert_eq!(target2.nodes[0].index, 0);
     }
 
     #[test]

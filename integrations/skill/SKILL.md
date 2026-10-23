@@ -13,10 +13,10 @@ coordinates or writing OS scripts when a task involves a GUI.
 
 Perception
 
-- `window_state {window, include_screenshot?, include_text?, disable_diffing?, max_nodes?, depth?}` — **the observation to act on**: the window's screenshot(s) and/or its in-window accessibility tree with `element_index` values, plus `focused_element`. Returns an `observation_id`; indexes and screenshot pixels are only valid with it. Element indexes are **stable per window**, so after the first observation the tree returns as a unified diff (`mode: "diff"`, `-` lines retired, `+` lines new, ` ` lines unchanged); `mode: "unchanged"` means your mapping still applies; `mode: "baseline_reset"` (or `disable_diffing: true`) means every index you hold for that window is invalid and must be re-picked from the returned full tree. Menus and dialogs appear **inside the tree** with their own indexes, and also as extra bounded images carrying their own `screenshot_id` and origin.
+- `window_state {window, include_screenshot?, include_text?, disable_diffing?, max_nodes?, depth?}` — **the observation to act on**: the window's screenshot(s) and/or its in-window accessibility tree with `element_index` values, plus `focused_element`. Returns an `observation_id`; indexes and screenshot pixels are only valid with it. Element indexes are **stable per window**, so after the first observation the tree returns as a unified diff (`mode: "diff"`, `-` lines retired, `+` lines new, ` ` lines unchanged); `mode: "unchanged"` means your mapping still applies; `mode: "baseline_reset"` (or `disable_diffing: true`) means every index you hold for that window is invalid and must be re-picked from the returned full tree. Menus and dialogs appear **inside the tree** with their own indexes, and also as extra bounded images carrying their own `screenshot_id` and origin. With `include_text` the result also reports `selected_text`, `document_text` and `selected_elements` when the app exposes a Text pattern (Chromium, WordPad, Office do; legacy Win32 edit controls and Win11 Notepad do not).
 - `list_apps {include_all?}` — apps grouped with the windows they own and a launchable id (exe path); `include_all` adds Start Menu entries for apps that are not running.
 - `launch_app {app, timeout_ms?}` — start an app and wait for its window; an app that is already running is returned with its windows instead of being started twice. `ready: false` means no window appeared in time: run `list_windows` before retrying, never launch the same app again.
-- `capture_window {window, max_edge?, quality?}` — one window as its own surface, so content hidden behind another window still appears; reports `origin`, `image_scale`, `source` (`WindowSurface` / `ScreenRegion`) and a `hash`.
+- `capture_window {window, max_edge?, quality?}` — one window as its own surface, so content hidden behind another window still appears; reports `origin`, `image_scale`, `source` (`WindowSurface` / `GraphicsCapture` / `ScreenRegion`) and a `hash`. Hardware-composited or DRM surfaces that render black through GDI are captured through Windows.Graphics.Capture automatically.
 - `wait_for_change {window, observation_id?, timeout_ms?}` — block until the window (or one of its popups) actually changes. This is how an action is verified instead of assumed.
 - `capture_screen` — primary display as a JPEG plus dimensions.
 - `list_windows {query?, include_minimized?}` — top-level windows with id, app, title, bounds, focus state.
@@ -93,6 +93,12 @@ Tasks and browser
 9. **Web tasks**: use `browser_task` (headless by default) rather than clicking a
    desktop browser. **Long tasks**: `start_task` + `task_status`; cancel with
    `task_cancel`.
+10. **Read text from the observation, not from the picture**: when the task is
+    "what does this field/document say", use `value=` in the tree,
+    `selected_text`, `document_text` and `control_state` before reaching for a
+    screenshot — and remember some apps (legacy Win32 edits, Win11 Notepad)
+    expose no Text pattern or report a partial value, which is when the image
+    earns its keep.
 
 ## Industrial software
 

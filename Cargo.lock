@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "cua-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "cua-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "cua-engine-access"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cua-core",
  "serde",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "cua-engine-browser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "cua-engine-code"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cua-core",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "cua-engine-vision"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cua-core",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "cua-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "cua-core",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "cua-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cua-core",
  "serde",

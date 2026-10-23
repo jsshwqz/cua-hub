@@ -30,8 +30,30 @@
   手工换算，且不会先去激活宿主窗口（那会关掉菜单）。
 - 菜单与对话框进入窗口树：菜单栏项、菜单项、模态框按钮都有 `element_index`，
   可以按编号展开菜单、点菜单项、点"不保存"。
+- 弹层元素树合并：同进程的弹层若未被宿主逻辑树包含，会作为独立小节
+  （`# related window <id> "<title>"`）并入同一次观测，共用一套编号；
+  已被覆盖或比宿主更大的窗口不再重复纳入。实测观测记事本菜单：菜单项只出现一次、
+  无多余小节。
+- `accessibility` 新增 `selected_text` / `document_text` / `selected_elements`：
+  焦点元素、窗口根、再到树内文本类控件依次探测 Text 模式；选中的列表项/选项卡
+  在树里带 `SELECTED` 标记并单列出来。实测写字板输入后全选，
+  `selected_text` 与 `document_text` 均正确返回。
+- 截图新增 Windows.Graphics.Capture 后端：PrintWindow 渲染成全黑的硬件合成/受保护
+  表面自动改走合成器捕获，`source=GraphicsCapture`；`CUA_HUB_CAPTURE_BACKEND=wgc`
+  可强制用于诊断。实测同一窗口两条后端得到相同平均哈希（内容一致、坐标契约不变）。
+- Linux（AT-SPI）窗口级无障碍树：按应用名与窗口标题定位 frame 后只走该子树，
+  多个顶层且标题不匹配时报错而不是猜。
+- 诊断样例：`cargo run -p cua-io --example wgc_probe -- <hwnd> <w> <h>` 打印 WGC
+  失败在哪一步；`cargo run -p cua-engine-access --example text_probe` 打印焦点控件
+  到底有没有 Text/Value 模式。
 
 ### 修复
+
+- 控件状态读取整体走错接口：`GetCachedPatternAs` 在真实 provider 上返回空，
+  导致选中状态恒为假、展开状态不准。改为读缓存属性（VARIANT 转换），
+  实测资源管理器点击文件后 `SELECTED` 与 `selected_elements` 正确出现。
+- 动作标注不再"猜不准就全给"：Expand/Collapse 按当前展开状态只给可用方向，
+  Scroll 按横/纵可滚动标志给出，不再对不可滚动的编辑框谎报四个方向。
 
 - 无障碍树只有一层深度的缺陷：UIA 缓存请求使用 `TreeScope_Children` 时深层节点
   的 `GetCachedChildren` 返回空数组，导致菜单栏/资源管理器内容不可见；改为按层

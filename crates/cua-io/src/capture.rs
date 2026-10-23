@@ -3,6 +3,9 @@
 use cua_core::{Error, Observation, Result};
 use image::{codecs::jpeg::JpegEncoder, RgbaImage};
 
+#[cfg(windows)]
+use crate::wgc;
+
 /// A captured primary display, in physical pixels.
 #[derive(Debug, Clone)]
 pub struct Captured {
@@ -112,6 +115,10 @@ pub enum CaptureSource {
     /// The window's own surface (PrintWindow with PW_RENDERFULLCONTENT).
     /// Occluding windows are not included.
     WindowSurface,
+    /// The compositor's output for the window (Windows.Graphics.Capture). Used
+    /// when GDI cannot see the surface: hardware-composited video, DRM content,
+    /// GPU-only games. Also occlusion-proof.
+    GraphicsCapture,
     /// A rectangle grabbed from the screen: correct coordinates, but occluded
     /// pixels show the covering window.
     ScreenRegion,
@@ -258,6 +265,38 @@ pub fn capture_window(selector: &str, max_edge: u32, jpeg_quality: u8) -> Result
 /// Grab the window's own pixels. On Windows this prefers the window surface, so
 /// a window hidden behind another one still comes back complete; the returned
 /// rectangle in `info` is updated to match the image exactly.
+/// Pick the best window-surface backend, in order of trustworthiness.
+///
+/// PrintWindow is first because it is cheap and exact; a blank result means the
+/// window composites on the GPU, where Windows.Graphics.Capture sees what GDI
+/// cannot. A screen region is the last resort: correct pixels, but whatever
+/// covers the window shows through. `CUA_HUB_CAPTURE_BACKEND=wgc` forces the
+/// compositor path first, for diagnostics.
+#[cfg(windows)]
+fn surface_backends(
+    hwnd: windows::Win32::Foundation::HWND,
+    info: &WindowInfo,
+) -> Option<(RgbaImage, CaptureSource)> {
+    let forced = std::env::var("CUA_HUB_CAPTURE_BACKEND")
+        .map(|v| v.eq_ignore_ascii_case("wgc"))
+        .unwrap_or(false);
+    if forced {
+        if let Some(image) = wgc::capture(info.id, info.width, info.height) {
+            return Some((image, CaptureSource::GraphicsCapture));
+        }
+    }
+    if let Some(image) = win::print_window(hwnd, info.width, info.height) {
+        if !win::is_blank(&image) {
+            return Some((image, CaptureSource::WindowSurface));
+        }
+    }
+    if let Some(image) = wgc::capture(info.id, info.width, info.height) {
+        return Some((image, CaptureSource::GraphicsCapture));
+    }
+    win::screen_region(info.x, info.y, info.width as i32, info.height as i32)
+        .map(|image| (image, CaptureSource::ScreenRegion))
+}
+
 #[cfg(windows)]
 fn window_surface(
     window: &xcap::Window,
@@ -268,11 +307,8 @@ fn window_surface(
     // process would come back in logical pixels instead, so the rectangle from
     // `info` is what the image is sized and positioned against.
     let hwnd = windows::Win32::Foundation::HWND(info.id as *mut _);
-    if let Some(image) = win::print_window(hwnd, info.width, info.height) {
-        return Ok((image, CaptureSource::WindowSurface));
-    }
-    if let Some(image) = win::screen_region(info.x, info.y, info.width as i32, info.height as i32) {
-        return Ok((image, CaptureSource::ScreenRegion));
+    if let Some(pair) = surface_backends(hwnd, info) {
+        return Ok(pair);
     }
     let image = window
         .capture_image()
@@ -294,13 +330,7 @@ fn window_surface(
 #[cfg(windows)]
 fn capture_hwnd(info: WindowInfo, max_edge: u32, jpeg_quality: u8) -> Result<WindowCapture> {
     let hwnd = windows::Win32::Foundation::HWND(info.id as *mut _);
-    let (image, source) = if let Some(image) = win::print_window(hwnd, info.width, info.height) {
-        (image, CaptureSource::WindowSurface)
-    } else if let Some(image) =
-        win::screen_region(info.x, info.y, info.width as i32, info.height as i32)
-    {
-        (image, CaptureSource::ScreenRegion)
-    } else {
+    let Some((image, source)) = surface_backends(hwnd, &info) else {
         return Err(Error::Capture(format!(
             "cannot capture window {} (`{}`)",
             info.id, info.title
@@ -499,7 +529,7 @@ mod win {
     /// A capture where every pixel is black means the window refused to render
     /// (hardware-composited surfaces sometimes do); treat it as a failure so the
     /// caller can fall back instead of handing the model a black frame.
-    fn is_blank(image: &RgbaImage) -> bool {
+    pub fn is_blank(image: &RgbaImage) -> bool {
         image.pixels().all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
     }
 }

@@ -5,6 +5,8 @@ pub mod capture;
 pub mod clipboard;
 pub mod exec;
 pub mod input;
+#[cfg(windows)]
+pub mod wgc;
 
 pub use apps::{launch_app, list_apps, AppInfo, AppSource, AppWindow, LaunchOutcome};
 pub use capture::{

@@ -56,6 +56,20 @@
   - 启动已运行进程的新窗口（资源管理器、浏览器）不会带来新 pid：`launch_app`
     先认新 pid，再认名字匹配的新窗口，最后只在"恰好一个像样的新窗口"时兜底，
     并在结果里用 `matched_by` 说明依据。
+  - **`GetCachedPatternAs` 在真实 provider 上不可靠**：资源管理器列表项的
+    `CachedIsSelected`、记事本编辑框的 `CachedValue` 都取不到，导致选中状态永远
+    为假、输入内容看不见。控件状态一律走 `GetCachedPropertyValue` + VARIANT 转换
+    （`VariantToBooleanWithDefault` / `VariantToInt32`），值走实时读取。
+  - TextPattern 的覆盖面比想象窄：遗留 Win32 EDIT（含记事本字体对话框的编辑框）
+    与 Win11 记事本主编辑区都不提供；写字板、Chromium 提供。取文本优先
+    `value=` / `selected_text` / `document_text`，取不到再回到截图。
+  - Win11 记事本的 ValuePattern 只返回**部分**文本（实测输入 43 字符只回后半段），
+    不要把它当作文档全文来校验。
+  - WGC 冷启动第一帧可能慢于 1.5s（实测热态 <0.6s），所以只在 PrintWindow 渲染成全黑
+    时才走它；`CUA_HUB_CAPTURE_BACKEND=wgc` 可强制用于诊断，`source` 字段会写
+    `GraphicsCapture`。
+  - 观测一个模态框时不要把宿主窗口的树拖进来：只有比目标窗口**小**的同进程顶层窗口
+    才算弹层，否则模态框的观测会把整个父窗口树复制一遍。
 - 已验证的只读命令：
 
 ```python

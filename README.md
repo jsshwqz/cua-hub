@@ -127,8 +127,8 @@ export OPENROUTER_API_KEY=sk-or-...
 | `list_windows` | 列出可捕获的顶层窗口（标题、应用、坐标、焦点、最小化） |
 | `list_apps` | 按进程分组的应用清单（含各自窗口与可启动的 exe 路径）；`include_all` 追加开始菜单里未运行的程序 |
 | `launch_app` | 启动应用并等待其窗口出现；已在运行的直接返回现有窗口；`ready=false` 表示超时内没等到窗口 |
-| `window_state` | 观测原语：一次返回窗口截图（含菜单/对话框等独立弹层，每张图带自己的 `screenshot_id`/原点）与窗口内 UIA 元素树 + `element_index` + 焦点元素，并给出 `observation_id` 作为作用域令牌。元素编号在同一窗口内保持稳定，因此第二次起默认返回 unified diff（`mode=diff`），`unchanged` 表示映射仍有效，`baseline_reset` 表示旧编号全部作废 |
-| `capture_window` | 抓取窗口自身表面（被遮挡也完整），返回 `origin`/`image_scale`/`source`/`hash`，坐标换算由服务端完成 |
+| `window_state` | 观测原语：一次返回窗口截图（含菜单/对话框等独立弹层，每张图带自己的 `screenshot_id`/原点）与窗口内 UIA 元素树 + `element_index` + 焦点元素，并给出 `observation_id` 作为作用域令牌。元素编号在同一窗口内保持稳定，因此第二次起默认返回 unified diff（`mode=diff`），`unchanged` 表示映射仍有效，`baseline_reset` 表示旧编号全部作废。树里同时给出控件当前值、可用动作与选中/焦点标记；`accessibility` 还带 `selected_text`、`document_text`、`selected_elements`（支持 Text 模式的控件） |
+| `capture_window` | 抓取窗口自身表面（被遮挡也完整），返回 `origin`/`image_scale`/`source`/`hash`，坐标换算由服务端完成；PrintWindow 渲染成全黑的硬件合成分布式表面会自动改用 Windows.Graphics.Capture（`source=GraphicsCapture`），也可用 `CUA_HUB_CAPTURE_BACKEND=wgc` 强制 |
 | `wait_for_change` | 阻塞等待窗口或其弹层真的发生变化，用来验证动作是否生效 |
 | `perform_secondary_action` | 调用控件除点击之外的无障碍动作：Expand/Collapse/Raise/Scroll Up·Down·Left·Right/Toggle/Select/Focus/Invoke；只接受该控件在树里 `actions=` 列出的名字，猜错返回 `unsupported_action` 与真实清单，执行后回读状态供验证 |
 | `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |

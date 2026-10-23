@@ -103,10 +103,22 @@ fn walk(
 ) -> Result<(bool, bool)> {
     let conn = a11y_connection()?;
     let root_kids = children(&conn, REGISTRY, ROOT_PATH)?;
+    walk_from(&conn, root_kids, max_nodes, max_depth, visit)
+}
 
+/// Walk a subtree rooted at the given accessible objects. Shared by the
+/// desktop-wide snapshot and by a window-scoped one, which starts at a single
+/// frame instead of at every application.
+fn walk_from(
+    conn: &Connection,
+    starts: Vec<(String, OwnedObjectPath)>,
+    max_nodes: usize,
+    max_depth: usize,
+    visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
+) -> Result<(bool, bool)> {
     let mut truncated = false;
     let mut visited = 0usize;
-    let mut stack: Vec<(String, String, usize)> = root_kids
+    let mut stack: Vec<(String, String, usize)> = starts
         .into_iter()
         .rev()
         .map(|(dest, path)| (dest, path.to_string(), 0usize))
@@ -122,7 +134,7 @@ fn walk(
             continue;
         }
 
-        let (name, role, rect, kids) = read_node(&conn, &dest, &path);
+        let (name, role, rect, kids) = read_node(conn, &dest, &path);
         if name.is_empty() && rect.2 == 0 && kids.is_empty() {
             continue;
         }
@@ -141,8 +153,9 @@ fn walk(
             value: String::new(),
             actions: Vec::new(),
             focused: false,
+            selected: false,
         };
-        if visit(&conn, &node, &dest, &path) {
+        if visit(conn, &node, &dest, &path) {
             return Ok((truncated, true));
         }
 
@@ -155,6 +168,108 @@ fn walk(
     }
 
     Ok((truncated, false))
+}
+
+/// Roles that own a window on screen: frame, dialog and window.
+const TOP_LEVEL_ROLES: [u32; 3] = [23, 16, 69];
+
+fn app_matches(at_spi_name: &str, bus_name: &str, want: &str) -> bool {
+    let want = want.to_lowercase();
+    if want.is_empty() {
+        return false;
+    }
+    let candidates = [at_spi_name.to_lowercase(), bus_name.to_lowercase()];
+    candidates
+        .iter()
+        .any(|c| *c == want || c.contains(&want) || want.contains(c.as_str()))
+}
+
+fn title_matches(at_spi_name: &str, want: &str) -> bool {
+    let want = want.trim().to_lowercase();
+    if want.is_empty() {
+        return false;
+    }
+    let have = at_spi_name.trim().to_lowercase();
+    have == want || have.contains(&want) || want.contains(&have)
+}
+
+/// Snapshot the subtree of the AT-SPI frame that corresponds to one window.
+///
+/// AT-SPI does not expose X11 window ids, so the frame is found by matching the
+/// owning application's name and the frame title — the same two fields the
+/// window list reports. A title match is preferred; an application with exactly
+/// one top level falls back to it, and anything more specific than that is
+/// refused rather than guessed, because acting on the wrong window is worse
+/// than reporting that the mapping is unavailable.
+pub fn snapshot_window(
+    app: &str,
+    title: &str,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<UiSnapshot> {
+    let conn = a11y_connection()?;
+    let apps = children(&conn, REGISTRY, ROOT_PATH)?;
+
+    let mut chosen: Option<(String, OwnedObjectPath)> = None;
+    let mut ambiguous = false;
+    for (dest, path) in &apps {
+        let (name, _role, _rect, kids) = read_node(&conn, dest, path);
+        if !app_matches(&name, dest, app) {
+            continue;
+        }
+        let tops: Vec<(String, OwnedObjectPath)> = kids
+            .iter()
+            .filter(|(fd, fp)| {
+                let (_n, role, _rect, _) = read_node(&conn, fd, fp);
+                TOP_LEVEL_ROLES.contains(&role)
+            })
+            .cloned()
+            .collect();
+        if tops.is_empty() {
+            continue;
+        }
+        if let Some(hit) = tops
+            .iter()
+            .find(|(fd, fp)| title_matches(&read_node(&conn, fd, fp).0, title))
+        {
+            chosen = Some(hit.clone());
+            break;
+        }
+        if tops.len() == 1 {
+            chosen = Some(tops[0].clone());
+            break;
+        }
+        ambiguous = true;
+    }
+
+    let (dest, path) = match chosen {
+        Some(pair) => pair,
+        None if ambiguous => {
+            return Err(Error::Capture(format!(
+                "several AT-SPI frames belong to `{app}` and none matches `{title}`; pass a more exact title"
+            )))
+        }
+        None => {
+            return Err(Error::Capture(format!(
+                "no AT-SPI frame matches app `{app}` title `{title}`"
+            )))
+        }
+    };
+
+    let mut nodes = Vec::new();
+    let (truncated, _) = walk_from(
+        &conn,
+        vec![(dest, path)],
+        max_nodes,
+        max_depth,
+        &mut |_, node, _, _| {
+            let mut node = node.clone();
+            node.index = nodes.len();
+            nodes.push(node);
+            false
+        },
+    )?;
+    Ok(UiSnapshot { nodes, truncated })
 }
 
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
@@ -261,5 +376,25 @@ mod tests {
         assert_eq!(control_type_name(43), "Button"); // push button
         assert_eq!(control_type_name(61), "Text");
         assert_eq!(control_type_name(75), "Application");
+    }
+
+    #[test]
+    fn apps_match_by_name_or_bus_id() {
+        // The window list reports a process name; AT-SPI reports a display name
+        // and the bus name reports the identifier. Either may be the match.
+        assert!(app_matches("gedit", ":1.42", "gedit"));
+        assert!(app_matches("Firefox", "org.mozilla.firefox", "firefox"));
+        assert!(app_matches("org.gnome.Nautilus", ":1.7", "nautilus"));
+        assert!(!app_matches("Firefox", ":1.2", ""));
+        assert!(!app_matches("Firefox", ":1.2", "gedit"));
+    }
+
+    #[test]
+    fn titles_match_exactly_before_loosely() {
+        assert!(title_matches("Untitled — gedit", "Untitled — gedit"));
+        assert!(title_matches("Untitled - Notepad", "notepad"));
+        assert!(title_matches("Settings", "Settings window"));
+        assert!(!title_matches("Settings", ""));
+        assert!(!title_matches("Settings", "gedit"));
     }
 }
