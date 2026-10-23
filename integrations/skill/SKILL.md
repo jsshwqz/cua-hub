@@ -100,6 +100,32 @@ Tasks and browser
     expose no Text pattern or report a partial value, which is when the image
     earns its keep.
 
+## Chaining several actions into one call
+
+`then: [{ "do": "<tool>", ...that tool's arguments }]` on any primitive runs the
+actions in order on this machine and returns **one** result: a per-step trace,
+then a single fresh `window_state`. `observation_id` and `window` carry into any
+step that omits them, so one observation drives the whole batch. `settle_ms`
+(default 120) sets the pause between steps.
+
+- Use it for the predictable middle of a task — click a field, type into it,
+  press Tab — and end the chain where the screen is expected to change shape.
+- It is not a plan. No model runs inside a chain; `run_task`, `orchestrate` and
+  `browser_task` are refused as steps, and a step that carries its own `then` is
+  refused, because a flat chain is one whose trace can be read literally.
+- The chain stops at the first failure and says so: `stopped_at`, `ran` and
+  `planned` describe what actually happened, not what was asked. On a live
+  Notepad, a chain of click → type → missing-argument → Return came back
+  `ran: 3, stopped_at: 2` with the text on screen and the Return not fired.
+- `observe` controls the state that comes back: default reads `window_state`
+  once (diffed, no screenshot); `false` returns the trace only; an object is
+  passed straight to `window_state`, e.g. `{ "include_screenshot": true }`.
+- Measured on this machine over loopback HTTP, same task, both shapes:
+  **5 calls / 94.6 KB** sent separately versus **2 calls / 48.8 KB** chained —
+  three fewer round trips and 48% less payload. Wall time was the same
+  (~3.5 s), because one observation before acting and one after are paid for in
+  both; the saving is in round trips and tokens, and it grows with chain length.
+
 ## Industrial software
 
 CAD, PLC/HMI, simulation and instrument software often expose no useful UIA

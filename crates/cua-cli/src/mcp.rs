@@ -197,7 +197,7 @@ pub async fn handle_request(request: Value) -> Option<Value> {
                     "name": "cua-hub",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Tools to see and control this desktop. Prefer accessibility_tree + invoke_control for precise work; use run_task for natural-language goals."
+                "instructions": "Tools to see and control this desktop. Prefer accessibility_tree + invoke_control for precise work; use run_task for natural-language goals. Read a window with window_state, then act on the element_index values it returned. Several deterministic actions can be sent at once with then:[{\"do\":\"<tool>\"}]: the chain stops at the first failure and returns one trace plus one fresh observation instead of a round trip per action."
             }),
         ),
         "ping" => success_response(id, json!({})),
@@ -625,7 +625,291 @@ fn resolve_indexed_node(args: &Value, index: usize, tool: &str) -> Result<Resolv
     }
 }
 
+/// Model-driven and task-lifecycle tools. They plan with a model, can run for
+/// minutes, and are what a chain is meant to replace: letting one of them be a
+/// step would hide a whole agent loop inside a single call, with no intermediate
+/// state left for the caller to see or stop.
+const NON_CHAINABLE: [&str; 8] = [
+    "run_task",
+    "orchestrate",
+    "browser_task",
+    "start_task",
+    "task_status",
+    "task_cancel",
+    "replay_run",
+    "list_runs",
+];
+
+/// A longer sequence belongs in a planned task. Past this many actions the
+/// caller has almost certainly lost track of what the screen looks like.
+const MAX_CHAIN_STEPS: usize = 12;
+
+/// Pause between steps, so the previous action has landed before the next one
+/// is aimed at it. A click that has to bring a window forward already waits for
+/// the activation itself, so this stays short.
+const DEFAULT_SETTLE_MS: u64 = 120;
+const MAX_SETTLE_MS: u64 = 5_000;
+
+/// Bind a step back to the observation the caller already read. The whole chain
+/// is planned against one screen state, so repeating the token on every step
+/// would only give it more chances to be mistyped.
+const INHERITED_KEYS: [&str; 2] = ["observation_id", "window"];
+
+fn chainable(tool: &str) -> bool {
+    !NON_CHAINABLE.contains(&tool)
+}
+
+/// A validated `then` sequence. Validation happens before anything runs, so a
+/// typo in step seven costs the machine nothing instead of performing six
+/// actions and then failing.
+struct ChainPlan {
+    /// Head tool arguments, with the chain controls removed.
+    head: Value,
+    steps: Vec<(String, Value)>,
+    settle_ms: u64,
+    /// `Some(object)` is sent to `window_state` after the chain; `None` means
+    /// the caller asked for the trace only.
+    observe: Option<Value>,
+}
+
+fn plan_chain(name: &str, args: &Value) -> std::result::Result<ChainPlan, Value> {
+    if !chainable(name) {
+        return Err(tool_err(format!(
+            "`{name}` plans with a model and can run for minutes, so it cannot carry `then`. \
+             Chain primitives instead, or call it on its own."
+        )));
+    }
+    let Some(steps) = args["then"].as_array() else {
+        return Err(tool_err(
+            "`then` must be an array of objects shaped { \"do\": \"<tool>\", ...that tool's arguments }",
+        ));
+    };
+    if steps.len() > MAX_CHAIN_STEPS {
+        return Err(tool_err(format!(
+            "`then` allows at most {MAX_CHAIN_STEPS} steps, got {}; split the work or use run_task",
+            steps.len()
+        )));
+    }
+    let known: Vec<String> = tool_defs()
+        .as_array()
+        .map(|defs| {
+            defs.iter()
+                .filter_map(|d| d["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut parsed = Vec::with_capacity(steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        let Some(tool) = step["do"].as_str() else {
+            return Err(tool_err(format!(
+                "chain step {i} needs a string `do` naming the tool to run"
+            )));
+        };
+        if !known.iter().any(|name| name == tool) {
+            return Err(tool_err(format!(
+                "chain step {i} names `{tool}`, which is not a tool; check tools/list"
+            )));
+        }
+        if !chainable(tool) {
+            return Err(tool_err(format!(
+                "chain step {i} is `{tool}`, which plans with a model and can run for minutes; \
+                 it cannot be a step"
+            )));
+        }
+        if step.get("then").is_some() {
+            return Err(tool_err(format!(
+                "chain step {i} (`{tool}`) carries its own `then`; a chain is flat, so list the \
+                 actions in order instead"
+            )));
+        }
+        let Some(mut map) = step.as_object().cloned() else {
+            return Err(tool_err(format!("chain step {i} must be an object")));
+        };
+        map.remove("do");
+        parsed.push((tool.to_string(), Value::Object(map)));
+    }
+
+    let mut head = args.as_object().cloned().unwrap_or_default();
+    head.remove("then");
+    head.remove("settle_ms");
+    head.remove("observe");
+
+    let observe = match &args["observe"] {
+        Value::Bool(false) => None,
+        Value::Object(object) => Some(Value::Object(object.clone())),
+        _ => Some(json!({})),
+    };
+    Ok(ChainPlan {
+        head: Value::Object(head),
+        steps: parsed,
+        settle_ms: args["settle_ms"]
+            .as_u64()
+            .unwrap_or(DEFAULT_SETTLE_MS)
+            .min(MAX_SETTLE_MS),
+        observe,
+    })
+}
+
+fn inherit_from(step: &mut Value, head: &Value) {
+    let Some(map) = step.as_object_mut() else {
+        return;
+    };
+    for key in INHERITED_KEYS {
+        if map.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = head.get(key).filter(|v| !v.is_null()) {
+            map.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+/// The window to re-read once the chain is done: the last one any part of the
+/// chain named, directly or through the observation token it referenced.
+fn chain_window(parts: impl IntoIterator<Item = Value>) -> Option<u32> {
+    parts.into_iter().fold(None, |found, args| {
+        if let Some(id) = window_arg_id(&args["window"]) {
+            return Some(id);
+        }
+        match args["observation_id"].as_str().and_then(observations::get) {
+            Some(obs) => Some(obs.window_id),
+            None => found,
+        }
+    })
+}
+
+/// One line of the consolidated answer: text kept, images counted and dropped.
+/// The caller reads the screen once, at the end of the chain — that is the round
+/// trip this saves.
+fn step_record(tool: &str, result: &Value) -> Value {
+    let mut texts = Vec::new();
+    let mut images = 0usize;
+    if let Some(parts) = result["content"].as_array() {
+        for part in parts {
+            match part["type"].as_str() {
+                Some("text") => {
+                    if let Some(text) = part["text"].as_str() {
+                        texts.push(text.to_string());
+                    }
+                }
+                Some("image") => images += 1,
+                _ => {}
+            }
+        }
+    }
+    let mut record = json!({
+        "do": tool,
+        "ok": !result["isError"].as_bool().unwrap_or(false),
+        "detail": texts.join("\n"),
+    });
+    if images > 0 {
+        record["images_dropped"] = json!(images);
+    }
+    record
+}
+
+/// Dispatch a tool call. Without `then` this is exactly the single tool, so no
+/// existing caller changes behaviour. With `then`, the head action and every
+/// step run in order on this machine and one consolidated result comes back:
+/// a per-step trace, then a single observation of where things ended up.
+///
+/// The chain never re-observes between steps: element indices stay valid across
+/// observations of the same window by construction, and a chain that stopped to
+/// look after every action would buy back none of the round trips it saves.
 async fn call_tool(name: &str, args: &Value) -> Value {
+    if args.get("then").is_none() {
+        return call_tool_single(name, args).await;
+    }
+    let plan = match plan_chain(name, args) {
+        Ok(plan) => plan,
+        Err(e) => return e,
+    };
+
+    let mut trace: Vec<Value> = Vec::with_capacity(plan.steps.len() + 1);
+    let mut failure: Option<(usize, String)> = None;
+
+    let head = call_tool_single(name, &plan.head).await;
+    trace.push(step_record(name, &head));
+    if head["isError"].as_bool().unwrap_or(false) {
+        failure = Some((0, error_text(&head)));
+    }
+
+    for (i, (tool, step_args)) in plan.steps.iter().enumerate() {
+        if failure.is_some() {
+            break;
+        }
+        if plan.settle_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(plan.settle_ms)).await;
+        }
+        let mut step_args = step_args.clone();
+        inherit_from(&mut step_args, &plan.head);
+        let result = call_tool_single(tool, &step_args).await;
+        trace.push(step_record(tool, &result));
+        if result["isError"].as_bool().unwrap_or(false) {
+            failure = Some((i + 1, error_text(&result)));
+        }
+    }
+
+    let planned = plan.steps.len() + 1;
+    let mut summary = json!({
+        "ok": failure.is_none(),
+        "ran": trace.len(),
+        "planned": planned,
+        // 0 is the tool named in this call; steps are numbered from 1.
+        "stopped_at": failure.as_ref().map(|(at, _)| *at),
+        "chain": trace,
+    });
+    if let Some((_, message)) = &failure {
+        summary["error"] = json!(message);
+        summary["next"] = json!(
+            "the actions before stopped_at really happened; read the observation below before retrying"
+        );
+    }
+
+    let mut content = vec![json!({ "type": "text", "text": summary.to_string() })];
+    if let Some(obs_args) = &plan.observe {
+        let window = chain_window(
+            std::iter::once(plan.head.clone())
+                .chain(plan.steps.iter().map(|(_, args)| args.clone())),
+        );
+        match window {
+            Some(id) => {
+                let mut args = obs_args.clone();
+                let map = args.as_object_mut();
+                if let Some(map) = map {
+                    map.entry("window".to_string()).or_insert(json!(id));
+                    map.entry("include_screenshot".to_string())
+                        .or_insert(json!(false));
+                    map.entry("include_text".to_string()).or_insert(json!(true));
+                }
+                let observation = call_tool_single("window_state", &args).await;
+                if let Some(parts) = observation["content"].as_array() {
+                    content.extend(parts.iter().cloned());
+                }
+            }
+            None => content.push(json!({
+                "type": "text",
+                "text": json!({
+                    "observation_skipped": "this chain named no window and no observation_id, \
+                                            so there is nothing to re-read; pass one of them, or \
+                                            set observe:false"
+                })
+                .to_string(),
+            })),
+        }
+    }
+    json!({ "content": content, "isError": failure.is_some() })
+}
+
+fn error_text(result: &Value) -> String {
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("action failed")
+        .to_string()
+}
+
+async fn call_tool_single(name: &str, args: &Value) -> Value {
     match name {
         "start_task" => {
             let opts = match run_options_from_args(args) {
@@ -1748,7 +2032,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
 }
 
 fn tool_defs() -> Value {
-    json!([
+    let mut defs = json!([
         {
             "name": "start_task",
             "description": "Start a task in the background and return a job_id immediately. Poll with task_status; cancel with task_cancel. Arguments match run_task.",
@@ -2222,7 +2506,66 @@ fn tool_defs() -> Value {
                 "required": ["combo"]
             }
         }
-    ])
+    ]);
+    add_chain_controls(&mut defs);
+    defs
+}
+
+/// Advertise the chain controls on every chainable tool. Declared once here
+/// rather than copied into 30 schemas: a tool added later is chainable by
+/// default, and the schema cannot drift out of step with the executor.
+fn add_chain_controls(defs: &mut Value) {
+    let then_schema = json!({
+        "type": "array",
+        "maxItems": MAX_CHAIN_STEPS,
+        "description": "Deterministic actions to run right after this one, in order, without another round trip: [{\"do\":\"<tool>\", ...its arguments}]. `observation_id` and `window` carry into any step that omits them. The chain stops at the first failure and still returns the trace plus the resulting state, so what comes back is what actually ran. Model-driven tools (run_task, orchestrate, browser_task) cannot be steps.",
+        "items": {
+            "type": "object",
+            "properties": { "do": { "type": "string", "description": "Tool to run as this step" } },
+            "required": ["do"]
+        }
+    });
+    let observe_schema = json!({
+        "description": "State returned after the chain: true (default) reads window_state once, diffed and without a screenshot; false returns the trace only; an object is passed straight to window_state, e.g. {\"include_screenshot\":true} to also get the image.",
+        "oneOf": [ { "type": "boolean" }, { "type": "object" } ]
+    });
+    let settle_schema = json!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": MAX_SETTLE_MS,
+        "default": DEFAULT_SETTLE_MS,
+        "description": "Milliseconds to wait between chain steps, so the previous action has landed. Only used with `then`."
+    });
+
+    let Some(tools) = defs.as_array_mut() else {
+        return;
+    };
+    for tool in tools.iter_mut() {
+        let Some(tool) = tool.as_object_mut() else {
+            continue;
+        };
+        let name = tool["name"].as_str().unwrap_or_default();
+        if !chainable(name) {
+            continue;
+        }
+        let Some(schema) = tool
+            .entry("inputSchema")
+            .or_insert_with(|| json!({ "type": "object" }))
+            .as_object_mut()
+        else {
+            continue;
+        };
+        let Some(properties) = schema
+            .entry("properties")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        else {
+            continue;
+        };
+        properties.insert("then".to_string(), then_schema.clone());
+        properties.insert("observe".to_string(), observe_schema.clone());
+        properties.insert("settle_ms".to_string(), settle_schema.clone());
+    }
 }
 
 #[cfg(test)]
@@ -2390,5 +2733,158 @@ mod tests {
             );
             assert_eq!(tool["inputSchema"]["type"], "object", "{name} schema");
         }
+    }
+
+    fn first_json_text(result: &Value) -> Value {
+        let text = result["content"][0]["text"].as_str().expect("a text block");
+        serde_json::from_str(text).expect("the chain summary should be JSON")
+    }
+
+    #[test]
+    fn chain_controls_are_advertised_on_primitives_only() {
+        for tool in tool_defs().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            let has_then = tool["inputSchema"]["properties"]["then"].is_object();
+            assert_eq!(
+                has_then,
+                chainable(name),
+                "{name} should advertise `then` exactly when it can chain"
+            );
+        }
+        assert!(!chainable("run_task"));
+        assert!(chainable("click"));
+    }
+
+    #[tokio::test]
+    async fn initialize_tells_the_caller_chains_exist() {
+        let response = handle_request(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize"
+        }))
+        .await
+        .expect("initialize gets a response");
+        let instructions = response["result"]["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("then:"),
+            "the server should state that actions can be chained"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_validates_the_whole_sequence_before_running_anything() {
+        // The head would fail anyway, but the point is that the answer names the
+        // bad step: an invalid step seven must not perform actions one to six.
+        let result = call_tool(
+            "invoke_control",
+            &json!({ "then": [{ "do": "run_task", "task": "x" }] }),
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("step 0") && text.contains("run_task"),
+            "should blame the step, got {text}"
+        );
+        assert!(
+            !text.contains("no control"),
+            "the head must not have run, got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_rejects_a_nested_then_instead_of_nesting() {
+        let result = call_tool(
+            "invoke_control",
+            &json!({ "then": [{ "do": "invoke_control", "then": [] }] }),
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("flat"));
+    }
+
+    #[tokio::test]
+    async fn chain_stops_at_the_first_failing_action() {
+        // `type_text` without text fails before touching the keyboard, so this
+        // asserts the stop behaviour without driving the machine.
+        let result = call_tool(
+            "type_text",
+            &json!({
+                "observe": false,
+                "then": [{ "do": "key", "combo": "Return" }]
+            }),
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        let summary = first_json_text(&result);
+        assert_eq!(summary["ok"], false);
+        assert_eq!(summary["ran"], 1);
+        assert_eq!(summary["planned"], 2);
+        assert_eq!(summary["stopped_at"], 0);
+        assert_eq!(summary["chain"].as_array().unwrap().len(), 1);
+        assert!(summary["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing string argument"));
+    }
+
+    #[tokio::test]
+    async fn chain_step_limit_is_enforced() {
+        let steps: Vec<Value> = (0..MAX_CHAIN_STEPS + 1)
+            .map(|_| json!({ "do": "key", "combo": "Return" }))
+            .collect();
+        let result = call_tool("key", &json!({ "then": steps })).await;
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("at most"));
+    }
+
+    #[test]
+    fn chain_observation_follows_the_last_window_named() {
+        let observed = observations::record(observations::Observation {
+            id: observations::next_id(),
+            window_id: 9_999,
+            hash: None,
+            shots: Vec::new(),
+            nodes: Vec::new(),
+            node_windows: Vec::new(),
+        });
+        let head = json!({ "observation_id": observed });
+        let last = json!({ "window": 4321u32 });
+        assert_eq!(
+            chain_window(vec![head, json!({ "window": 7u32 }), last]),
+            Some(4321),
+            "a step that names its own window decides where to look next"
+        );
+        assert_eq!(
+            chain_window(vec![json!({}), json!({ "observation_id": observed })]),
+            Some(9_999),
+            "otherwise the observed window is the one to re-read"
+        );
+        assert_eq!(chain_window(vec![json!({})]), None);
+    }
+
+    #[test]
+    fn step_record_counts_images_without_returning_them() {
+        let record = step_record(
+            "window_state",
+            &json!({
+                "content": [
+                    { "type": "image", "data": "AAAA", "mimeType": "image/jpeg" },
+                    { "type": "text", "text": "the tree" }
+                ],
+                "isError": false
+            }),
+        );
+        assert_eq!(record["do"], "window_state");
+        assert_eq!(record["ok"], true);
+        assert_eq!(record["detail"], "the tree");
+        assert_eq!(record["images_dropped"], 1);
+        assert!(serde_json::to_string(&record).unwrap().len() < 200);
     }
 }
