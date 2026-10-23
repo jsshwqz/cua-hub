@@ -1,0 +1,63 @@
+name: Linux AT-SPI runtime
+
+# The accessibility backend for Linux is dispatched only on that platform, so
+# the workspace CI proves it compiles, not that it works. This job runs the real
+# thing: Xvfb, a session bus with the GNOME accessibility service activatable, a
+# GTK3 window, and the MCP server driving it. It is manual by default and runs
+# automatically when the backend itself changes, so an ordinary push does not
+# spend the quota on a graphical session.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/cua-engine-access/src/atspi.rs"
+      - "crates/cua-engine-access/src/lib.rs"
+      - "scripts/linux-atspi-runtime.py"
+      - "tests/linux_atspi/**"
+      - ".github/workflows/linux-atspi.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install a graphical session with accessibility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb dbus-x11 at-spi2-core libatk-bridge2.0-0 \
+            python3-gi gir1.2-gtk-3.0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the CLI
+        run: cargo build --release --bin cua-hub
+
+      - name: Drive a real AT-SPI session
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 > /tmp/xvfb.log 2>&1 &
+          sleep 3
+          export DISPLAY=:99
+          export NO_AT_BRIDGE=0
+          dbus-run-session -- python3 scripts/linux-atspi-runtime.py
+
+      - name: Show the display log when it fails
+        if: failure()
+        run: |
+          echo "--- Xvfb ---"; cat /tmp/xvfb.log
+          echo "--- a11y bus ---"; ls /usr/libexec/at-spi* 2>/dev/null || true
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-atspi-evidence
+          path: atspi-evidence/
+          if-no-files-found: warn

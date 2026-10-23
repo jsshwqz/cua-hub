@@ -3,3 +3,7 @@
 **/*.rs.bk
 .runs/
 .DS_Store
+
+# Python bytecode from the Linux runtime harness
+__pycache__/
+*.pyc
