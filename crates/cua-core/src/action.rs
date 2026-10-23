@@ -265,6 +265,13 @@ fn is_destructive(text: &str) -> bool {
         "invoke-expression",
         "of=/dev/sd",
         ">/dev/sd",
+        // Turning off the protection that would catch everything above is not a
+        // configuration tweak: it is the step before the destructive one.
+        "-disablerealtimemonitoring",
+        "set-mppreference",
+        "netsh advfirewall set",
+        "set-netfirewallprofile",
+        "mpclearprivatedelete",
     ];
     if ANYWHERE.iter().any(|p| text.contains(p)) {
         return true;
@@ -463,6 +470,9 @@ mod tests {
             "Get-Process | Invoke-Expression",
             "DROP DATABASE production",
             "sqlcmd -Q \"delete from users\"",
+            "Set-MpPreference -DisableRealtimeMonitoring $true",
+            "netsh advfirewall set allprofiles state off",
+            "chmod -R 777 /",
         ] {
             assert_eq!(
                 risk_of(command),
@@ -505,6 +515,26 @@ mod tests {
             "git push origin main",
         ] {
             assert_eq!(risk_of(command), Risk::Medium, "{command:?}");
+        }
+    }
+
+    /// The classifier reads shapes, not intent. Pinning what it does *not* catch
+    /// keeps that honest: these need a decision (`Medium`), which is the safe
+    /// default, but they are not flagged as destructive the way a `rm -rf` is.
+    #[test]
+    fn known_shape_limits() {
+        for command in [
+            // A container escape, but no rule recognises `-v /:/host chroot`.
+            "docker run --rm -v /:/host chroot /host",
+            // Destructive to a repository, not to the machine.
+            "git push --force origin main",
+            "history -c",
+        ] {
+            assert_eq!(
+                risk_of(command),
+                Risk::Medium,
+                "{command:?} must still ask, and must not pretend to be classified"
+            );
         }
     }
 
