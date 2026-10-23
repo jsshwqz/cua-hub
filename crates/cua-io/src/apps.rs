@@ -185,9 +185,9 @@ pub fn launch_app(app: &str, timeout_ms: u64) -> Result<LaunchOutcome> {
     #[cfg(not(windows))]
     {
         let _ = timeout_ms;
-        return Err(Error::InvalidAction(
+        Err(Error::InvalidAction(
             "launch_app is only implemented on Windows".into(),
-        ));
+        ))
     }
 
     #[cfg(windows)]
