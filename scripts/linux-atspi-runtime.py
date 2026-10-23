@@ -185,14 +185,25 @@ def scenario(identity: str) -> None:
             )
 
         state = call(
-            "window_state", {"window": window["id"], "include_text": True, "max_nodes": 80}
+            "window_state",
+            {
+                "window": window["id"],
+                "include_text": True,
+                "max_nodes": 80,
+                # Each scenario starts from a clean baseline: the second run reuses
+                # the same X11 window id and the same AT-SPI object paths, so the
+                # diffing layer is entitled to answer "unchanged" — which is about
+                # the mapping, not about whether the frame could be matched at all.
+                # This scenario tests the match, so it asks for the full tree.
+                "disable_diffing": True,
+            },
         )
         tree = (state["json"] or {}).get("accessibility") or {}
         body = tree.get("tree") or tree.get("diff") or ""
         node_count = tree.get("node_count", 0)
         check(
             f"[{identity}] window_state returns a window-level accessibility tree",
-            node_count >= 4 and body != "",
+            node_count >= 4 and body != "" and tree.get("mode") == "full",
             f"nodes={node_count} mode={tree.get('mode')} {state['text'][:120] if node_count < 4 else ''}",
         )
         for control in ("probe-entry", "probe-submit", "probe-toggle"):
