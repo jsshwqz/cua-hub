@@ -26,7 +26,7 @@ pub enum MouseButton {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellKind {
-    /// PowerShell on Windows, `/bin/sh` elsewhere.
+    /// PowerShell on Windows, bash elsewhere (`bash -lc`).
     #[default]
     Auto,
     PowerShell,
@@ -87,10 +87,19 @@ pub enum Action {
 
 impl Action {
     /// True for actions that change the machine state.
+    ///
+    /// The reporting and observation variants are excluded: `Screenshot` only
+    /// looks, `Move` only points, `Wait` pauses, and `Done`/`Fail` are how an
+    /// engine ends its turn — none of them touch the machine, and a run that
+    /// fails must not be counted as one that modified it.
     pub fn is_mutating(&self) -> bool {
         !matches!(
             self,
-            Action::Screenshot | Action::Move { .. } | Action::Wait { .. } | Action::Done { .. }
+            Action::Screenshot
+                | Action::Move { .. }
+                | Action::Wait { .. }
+                | Action::Done { .. }
+                | Action::Fail { .. }
         )
     }
 
@@ -592,6 +601,32 @@ mod tests {
         ] {
             assert_eq!(risk_of(command), Risk::High, "{command:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_run_did_not_modify_the_machine() {
+        // `is_mutating` used to exclude only `Done`, so a run that ended in
+        // `Fail` counted as one that changed the machine — the opposite of what
+        // the audit log needs to say about it.
+        assert!(!Action::Fail {
+            reason: "no such window".to_string()
+        }
+        .is_mutating());
+        assert!(!Action::Screenshot.is_mutating());
+        assert!(!Action::Done {
+            summary: "ok".to_string()
+        }
+        .is_mutating());
+        assert!(Action::Type {
+            text: "x".to_string(),
+            interval_ms: 0
+        }
+        .is_mutating());
+        assert!(Action::RunCommand {
+            command: "dir".to_string(),
+            shell: ShellKind::Auto,
+        }
+        .is_mutating());
     }
 
     #[test]
