@@ -37,7 +37,7 @@ jobs:
             libxcb-xfixes0-dev libdbus-1-dev libpipewire-0.3-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgbm-dev \
             libdrm-dev pkg-config \
-            xvfb dbus-x11 at-spi2-core libatk-bridge2.0-0 x11-utils \
+            xvfb dbus-x11 at-spi2-core libatk-bridge2.0-0 x11-utils openbox \
             python3-gi gir1.2-gtk-3.0
 
       - uses: dtolnay/rust-toolchain@stable
@@ -57,16 +57,19 @@ jobs:
           sleep 3
           export DISPLAY=:99
           export NO_AT_BRIDGE=0
-          dbus-run-session -- python3 scripts/linux-atspi-runtime.py
+          # A window manager, so the session looks like a desktop: managed
+          # windows carry the properties a window list reads.
+          openbox > /tmp/openbox.log 2>&1 &
+          sleep 2
+          dbus-run-session -- bash scripts/linux-atspi-session.sh
 
       - name: Show what the display and the bus looked like
         if: failure()
         run: |
-          echo "--- Xvfb ---"; cat /tmp/xvfb.log || true
+          echo "--- Xvfb ---"; tail -5 /tmp/xvfb.log || true
+          echo "--- openbox ---"; tail -5 /tmp/openbox.log || true
           echo "--- X windows ---"
-          DISPLAY=:99 xwininfo -root -tree 2>&1 | head -30 || true
-          echo "--- accessibility bus ---"
-          DISPLAY=:99 dbus-run-session -- busctl --user list 2>&1 | head -20 || true
+          DISPLAY=:99 xwininfo -root -tree 2>&1 | head -20 || true
 
       - name: Upload the evidence
         if: always()
