@@ -185,5 +185,21 @@ pub fn capture_or_error(hwnd: u32, width: u32, height: u32) -> Result<RgbaImage,
 /// Capture one window's compositor output. `None` means "unavailable, use
 /// another backend"; [`capture_or_error`] carries the reason.
 pub fn capture(hwnd: u32, width: u32, height: u32) -> Option<RgbaImage> {
-    capture_or_error(hwnd, width, height).ok()
+    let result = capture_or_error(hwnd, width, height);
+    let reason = result.as_ref().err().cloned();
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = reason;
+    });
+    result.ok()
+}
+
+/// Why the last WGC attempt on this thread refused, if it did. A fallback that
+/// fails silently teaches the caller nothing, and the stage that refused is the
+/// actionable half of the diagnosis — see the module docs.
+pub fn take_error() -> Option<String> {
+    LAST_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
