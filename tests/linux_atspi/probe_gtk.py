@@ -6,17 +6,18 @@ target in scripts/linux-atspi-runtime.py, so renaming one must fail that check
 rather than pass silently.
 """
 
-import GLib
+import sys
+
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
 
 # WM_CLASS and the AT-SPI application name both come from the program name, so
 # the window list and the accessibility tree agree on which app owns this frame.
 GLib.set_prgname("cua-atspi-probe")
 
-RESULT = __import__("sys").argv[1] if len(__import__("sys").argv) > 1 else "/tmp/probe_result.txt"
+RESULT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/probe_result.txt"
 
 
 class Probe(Gtk.Window):

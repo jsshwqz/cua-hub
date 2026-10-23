@@ -30,23 +30,28 @@ jobs:
         run: |
           sudo apt-get update
           # The same display and input libraries the workspace needs to build,
-          # plus a session the accessibility bus can live in.
+          # plus a session the accessibility bus can live in. x11-utils is only
+          # there so a failure can say whether X saw the window at all.
           sudo apt-get install -y \
             libxdo-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev \
             libxcb-xfixes0-dev libdbus-1-dev libpipewire-0.3-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgbm-dev \
             libdrm-dev pkg-config \
-            xvfb dbus-x11 at-spi2-core libatk-bridge2.0-0 \
+            xvfb dbus-x11 at-spi2-core libatk-bridge2.0-0 x11-utils \
             python3-gi gir1.2-gtk-3.0
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
+      # Debug, not release: this job proves the backend works against a live
+      # accessibility bus. Compilation speed is the bottleneck here, not capture.
       - name: Build the CLI
-        run: cargo build --release --bin cua-hub
+        run: cargo build --bin cua-hub
 
       - name: Drive a real AT-SPI session
+        env:
+          CUA_HUB_BIN: ${{ github.workspace }}/target/debug/cua-hub
         run: |
           Xvfb :99 -screen 0 1280x800x24 > /tmp/xvfb.log 2>&1 &
           sleep 3
@@ -54,11 +59,14 @@ jobs:
           export NO_AT_BRIDGE=0
           dbus-run-session -- python3 scripts/linux-atspi-runtime.py
 
-      - name: Show the display log when it fails
+      - name: Show what the display and the bus looked like
         if: failure()
         run: |
-          echo "--- Xvfb ---"; cat /tmp/xvfb.log
-          echo "--- a11y bus ---"; ls /usr/libexec/at-spi* 2>/dev/null || true
+          echo "--- Xvfb ---"; cat /tmp/xvfb.log || true
+          echo "--- X windows ---"
+          DISPLAY=:99 xwininfo -root -tree 2>&1 | head -30 || true
+          echo "--- accessibility bus ---"
+          DISPLAY=:99 dbus-run-session -- busctl --user list 2>&1 | head -20 || true
 
       - name: Upload the evidence
         if: always()

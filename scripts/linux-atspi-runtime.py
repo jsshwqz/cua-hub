@@ -112,11 +112,14 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         text=True,
     )
+    # The probe's own output is the difference between "the backend cannot see a
+    # window" and "there was never a window to see", so it goes to a file the
+    # failure path can print rather than into a pipe nobody drains.
+    probe_log = open(EVIDENCE / "probe.log", "w", encoding="utf-8")
     probe = subprocess.Popen(
         [sys.executable, str(ROOT / "tests" / "linux_atspi" / "probe_gtk.py"), str(result_file)],
-        stdout=subprocess.PIPE,
+        stdout=probe_log,
         stderr=subprocess.STDOUT,
-        text=True,
     )
     try:
         if not wait_for_server(30):
@@ -134,6 +137,10 @@ def main() -> int:
                 window_id = windows[0]["id"]
             else:
                 time.sleep(1.0)
+        if window_id is None:
+            probe_log.flush()
+            print("--- the probe application said ---")
+            print(Path(probe_log.name).read_text(encoding="utf-8", errors="replace")[:2000])
         check("list_windows sees the GTK window", window_id is not None, f"id={window_id}")
         if window_id is None:
             return 1
@@ -189,6 +196,7 @@ def main() -> int:
             server.kill()
         if probe.poll() is None:
             probe.kill()
+        probe_log.close()
 
     print(f"\n{len(failures)} failed check(s); evidence in {EVIDENCE}")
     return 1 if failures else 0
