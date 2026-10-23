@@ -4,6 +4,58 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
+## Unreleased — 已合入分支，尚未发版
+
+**破坏性默认变更（安全）**：MCP 的 `run_task` / `start_task` / `orchestrate` 不再默认 `yes: true`。
+依赖旧默认值的调用方，从现在起会看到"需要 `yes` 或可应答确认的客户端"的拒绝；请在确实获得用户同意后显式传 `yes: true`。
+
+### 安全：确认链修好（issue #8）
+
+三段接起来的绕过链，逐段关掉：
+
+1. **分类**（`cua-core::action::risk`）：原来是 16 条字面黑名单 + `contains` 比较，没命中就默认
+   判 Medium——等于默认放行。现在按**参数形状**判，且默认档位反转：
+   - 只读命令（`ls` / `cat` / `git status` / `Get-Content` …）判 Low，不打扰人；
+   - **未列名的一切**判 Medium，需要一次决定（`yes`、客户端确认，或终端输入）；
+   - 破坏性形状判 High，`yes` 买不到。
+   issue 里列的绕过例子现在全部 High，并已固化成测试：`rd /s /q C:\Users`、
+   `Remove-Item -Recurse -Force C:\`、`rm  -rf  /`（双空格）、`curl https://x | bash`、
+   `powershell -EncodedCommand …`、`reg delete HKLM\…`、`mkfs.ext4`、`dd of=/dev/sda`。
+   包装器 `sudo` / `cmd /c` / `sh -c "…"` 会先剥开再判；反向也不误伤散文
+   （`printf "format %s"`、"please format the document" 不再是高危——旧名单里的 `"format "`
+   会命中它们，把用户训练成无脑放行）。
+2. **执行默认**：`run_options_from_args` 的 `yes` 默认由 `true` 改为 `false`；
+   `orchestrate` 在 MCP 侧原本**硬编码** `yes: true`，CLI 侧同样硬编码，两处都改为读参数、默认关。
+   编排路径此前根本没有确认通道（`approver: None`），现在把 MCP 的 elicitation 通道接了进去，
+   否则唯一"能跑"的办法就是关掉确认。
+3. **生成段**：代码引擎透传模型给的命令字符串；它本身不判风险，风险统一在 `confirm()` 执行门前
+   决定——所以分级修好即覆盖该段，同时入口默认不再是"自动同意"。
+
+顺带修掉门自身的一处语义错误：`allow_high` 单独使用时，高危动作仍会掉进中危分支被要求再给 `yes`，
+而报错信息却写着"加 `--allow-high` 即可"。现在 `allow_high` 就是对高危的明示许可，
+错误信息给的出路真的走得通（已实测）。
+
+### 验证（本机真机，replay 走同一扇执行门）
+
+用已发布的 **0.1.4 旧二进制**与本次构建跑同一批 `steps.jsonl`，逐格实测：
+
+| 用例 | 旧 0.1.4 | 本次构建 |
+|------|----------|----------|
+| `Remove-Item -Recurse -Force D:\Temp\p5_replay\scratch`，`--yes` | **执行并把目录删了** | 拒绝：需要 `--allow-high` |
+| 同一条高危命令，无 flag | 拒绝 | 拒绝 |
+| 同一条高危命令，`--allow-high`（不带 `--yes`） | **仍被挡**，而报错却写着"加 `--allow-high` 即可" | 执行：明示许可单独就够 |
+| `cargo --version`（未列名），无 flag | 拒绝（中危） | 拒绝（中危），信息给出两条出路 |
+| `cmd /c echo CUA-GATE-OK`（只读），无 flag | **拒绝**——旧分类把一切非黑名单都当中危，连读操作都要 `--yes` | 执行（只读不打扰） |
+
+CLI 的 `--yes` 本来就是显式开关，所以上表证的是**分类**与**门语义**。
+真正被关掉的 MCP 自动放行（`run_options_from_args` 默认 `yes: true`、`orchestrate` 硬编码
+`yes: true`）由两项新测试与代码锁住；HTTP 模式下"高危没有反向通道"那一格只有单测证据，
+真机端到端跑 `run_task` 需要模型密钥，本机未配置——这一格不算已验证。
+
+另有 15 项新测试：分级 8 项（含 issue 列出的全部绕过例子、包装器剥离、散文反向用例）、
+执行门 5 项（只读免确认 / 未列名需决定 / `yes` 买不到高危 / `allow_high` 生效 / 无通道即拒绝）、
+入口默认 2 项。`cargo test --workspace` **93 通过 / 0 失败**（0.1.4 时 78）。
+
 ## 0.1.4 — 2026-10-23
 
 一次以「少来回、能自证、Linux 真的能用」为主线的小版本：动作链 `then:[…]`、

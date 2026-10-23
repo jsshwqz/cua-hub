@@ -65,6 +65,12 @@
 - [x] 无障碍树深度修复：按层 `FindAllBuildCache`（`TreeScope_Children` 会把树压成一层）
 - [x] 控件状态改读缓存属性（`GetCachedPatternAs` 在真实 provider 上取不到选中/值）
 - [x] 安全策略对齐四档确认模型（交还用户 / 动作时确认 / 点名预批准 / 无需确认）
+- [x] 确认链闭合（issue #8，0.1.4 之后）：命令分级改为"只读免打扰 / 未列名需决定 / 高危要明示许可"，
+  MCP 的 `run_task`、`start_task`、`orchestrate` 不再默认 `yes: true`，编排路径接上确认通道；
+  绕过例子（`rd /s /q`、`Remove-Item -Force -Recurse`、双空格、`curl … | bash`、`-EncodedCommand`）
+  全部成为测试，并用旧二进制做过逐格对照
+- [ ] 风险分级仍基于形状而非意图：`allow_high` 是一把大开关，一旦给出就不区分具体命令；
+  下一步可做成按命令前缀的点名预批准（对齐四档模型里的"点名预批准"那一档）
 - [x] `then:[…]` 服务端动作链：一次调用按序跑确定性图元动作，只回一份逐步 trace
   加一次观测；步骤继承 `observation_id`/`window`，失败即停在 `stopped_at`，
   模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 55%）

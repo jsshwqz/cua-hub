@@ -181,10 +181,22 @@ in this todo") are never blanket pre-approval.
 Typing sensitive data into a form **is** transmitting it: confirm right before
 the keystrokes, and say what data goes where and why.
 
-- Medium-risk actions run with the default `yes: true`; destructive commands
-  (delete, format, shutdown, registry) are blocked unless `allow_high: true`.
-- Over stdio the server asks for approval via MCP elicitation; over HTTP there is
-  no reverse channel, so high-risk calls must be explicit.
+- Commands fall into three tiers, and the middle one is the default. A **read**
+  (`ls`, `cat`, `git status`, `Get-Content`) runs without asking. Anything the
+  classifier does not recognise as a read — builds, writes, network, scripts —
+  needs `yes: true` or a confirmation from a client that can answer one. A
+  **destructive shape** (`rm -rf`, `rd /s /q`, `del /s`, `Remove-Item -Recurse`
+  or `-Force`, `curl … | bash`, `-EncodedCommand`, `reg delete HKLM…`) needs
+  `allow_high: true`: `yes` never buys it. Rewording does not help — arguments
+  are read, so `rm  -rf  /` and `Remove-Item -Force -Recurse C:\` classify the
+  same as the spelled-out form.
+- Silence is not consent: `run_task`, `start_task` and `orchestrate` default to
+  asking, because a model chose the command. Say plainly which tier you need and
+  let the user grant it, instead of switching everything to `yes` to make an
+  error go away.
+- Over stdio the server asks through MCP elicitation; over HTTP there is no
+  reverse channel, so an unconfirmed action fails rather than running — pass
+  `yes` or `allow_high` explicitly when that is what was agreed.
 - Never enter credentials or submit payments unless the user explicitly asked.
 - Clipboard is global to the user's session: do not overwrite it without reason.
 - The server declares per-monitor DPI awareness, so **every** coordinate in every
