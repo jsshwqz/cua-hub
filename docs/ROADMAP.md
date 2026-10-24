@@ -126,5 +126,14 @@
   序号表照 at-spi2-core 的 `atspi-constants.h` 数出来：第一份文档给的 VISIBLE/HORIZONTAL
   各差一位，而这种错位不会报错，只会把一个状态读成另一个。probe 因此让 GTK 自己写
   `toggled` 信号当独立 oracle——总线的数字不等于控件的真相。
-  **还差**：遍历超时与错误上报、`invoke` 后的效果校验、`invoke`/`set_value` 写死的 600/10 上限。
+  **还差**：`invoke` 后的效果校验、`invoke`/`set_value` 写死的 600/10 上限。
+- [x] AT-SPI 读不到时不再无声（issue #11 第 6 项，契约定为**带诊断的部分成功**）：
+  `UiSnapshot` 多一本 `unreadable` 账（bus + 对象路径 + 哪几个读没应答），
+  `accessibility_tree` 树尾点名（最多 6 条再给计数）、`window_state` 里条件性出现
+  `accessibility.unreadable`；单次调用超时 1200ms（zbus 5 `method_timeout`，不是 4 的
+  `general_timeout`）。关键是**把"没人答"和"这控件没这接口"分开**——
+  `UnknownInterface`/`UnknownProperty`/`NotSupported` 不记账，否则每个 panel 都是"故障"，
+  真装死的应用反倒被淹。CI 图形作业新增一个阶段：起两个 probe、`SIGSTOP` 一个、取桌面树，
+  断言"活着的还在树里 + 说不出读不到的不行 + 整体 <10s"；修复前第一条就过、后两条红，
+  这正是原 bug 的形状（观测"成功"，只是静默少了一块）。UIA 侧没做同一本账，恒空并注明原因。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"

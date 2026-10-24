@@ -61,6 +61,10 @@ Tasks and browser
    could not be read at all (non-Windows hosts): that is missing information, not
    an empty focus, so confirm the typed target by re-reading the window after the
    click instead of trusting a pre-flight.
+   Likewise, when `accessibility.unreadable` is present the tree is **shorter than
+   the window**, not complete: it names which AT-SPI subtrees never answered. Do
+   not conclude a control is absent from a tree that says part of it was not read —
+   re-observe, or reach that application by window and coordinate instead.
 2. **Keep the mapping, apply the diff**: after the first observation of a window
    the tree comes back as a unified diff. Apply removals first, then additions;
    unchanged lines keep their index. An index that appeared on a `-` line is

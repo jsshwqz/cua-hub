@@ -451,6 +451,7 @@ mod tests {
         UiSnapshot {
             nodes,
             truncated: false,
+            unreadable: Vec::new(),
         }
     }
 

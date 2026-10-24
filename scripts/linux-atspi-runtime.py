@@ -194,7 +194,20 @@ def hung_application() -> None:
     # A generous HTTP timeout on purpose: before the fix the walk burns the ~25s
     # D-Bus default per unanswered call, and that has to show up as a slow but
     # *returned* observation, not as this script crashing.
-    tree = call("accessibility_tree", {"max_nodes": 200, "depth": 6}, timeout=180)
+    #
+    # And if it does not come back at all, that belongs in the PASS/FAIL table --
+    # measured 2026-10-24 on run 40115985180, where the pre-fix read exceeded even
+    # 180s and killed the harness with a socket timeout instead of reporting.
+    try:
+        tree = call("accessibility_tree", {"max_nodes": 200, "depth": 6}, timeout=180)
+    except (urllib.error.URLError, OSError) as exc:
+        elapsed = time.time() - started
+        check(
+            "[hung] the tree comes back at all while an application is frozen",
+            False,
+            f"no reply after {elapsed:.1f}s: {exc}",
+        )
+        tree = {"is_error": True, "json": None, "text": "", "images": 0}
     elapsed = time.time() - started
     body = tree["text"]
 
