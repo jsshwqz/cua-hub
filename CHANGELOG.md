@@ -4,6 +4,49 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
+## Unreleased — 已合入分支，尚未发版
+
+### 修复：Anthropic 会话被解析失败的 tool_use 毒化（issue #9）
+
+一个不支持的动作原本会**让整个任务必死**。`computer_20250124` 的
+`left_mouse_down` / `left_mouse_up` 等没有对应的 `Action`，走 `Err` 分支时只打一条
+`warn` 就丢弃——但含它的 assistant 消息已经进了历史，Anthropic 要求
+**每个 `tool_use` 必须有配对的 `tool_result`**，于是下一步的请求必然 400，
+而 400 不在重试白名单里，此后每一步都带病发送。
+
+现在把"链是否完整"变成结构不变量，而不是散在各分支里的 if：
+
+- 一轮 assistant 内容被分成三个桶——可执行的（取第一个跑）、同轮多余的要**确认但不执行**、
+  不能执行的要**回错误结果**（`is_error: true` + 写明是哪个动作不支持，模型据此自我纠正）。
+  三个桶覆盖全部 id，不存在"被丢掉的 tool_use"这个状态。
+- 回填时截图仍然附上：默认挂在被执行的结果上，若这一轮什么都没跑成则挂在第一条错误结果上——
+  否则模型是"闭着眼睛"重复同一个错误。
+- **被拒绝的动作优先于 `TASK_COMPLETE`**：同轮里既有被拒的 tool_use 又有完成文本时，
+  先把历史补合法，不能直接结束任务留下残缺链。
+- `take_ack` 现在只要"有东西要答"就触发（原来必须有已执行的动作才回填，
+  整轮全是解析失败时连触发点都没有）。
+
+### 测试与验证
+
+- Anthropic 侧 `parse_tool_input` **此前零测试**（OpenAI 侧有 4 个），补 7 项：
+  各动作映射（含 `double_click`→`double`、scroll 方向与符号）、**缺参数必须拒**
+  （`left_click` 无坐标不能退化成点屏幕左上角）、不支持的动作报错里要带动作名、
+  以及上面那条链完整性不变量的三种情形（混轮 / 整轮全拒 / 被拒与 TASK_COMPLETE 同轮）。
+- workspace 测试 **95 → 102**。
+- **端到端复现不需要 API key**：`tests/anthropic-pairing/stub.cjs` 是一个本地桩，
+  它按官方规则校验每个请求——请求里有未配对的 `tool_use` 就回 400。
+  `./tests/anthropic-pairing/check.sh <cua-hub 路径>` 会跑一次任务并打印每轮的配对情况与裁决，
+  两向都实测过：
+
+  | 传给 check.sh 的二进制 | 结果 |
+  |--------|------|
+  | 已发布的 0.1.5（`dist/cua-hub.exe`） | exit 1：`WARN ignoring unparsable tool call` → 下一步 `HTTP 400 … each tool_use block must have a corresponding tool_result`，桩日志 `unanswered=["tu_down_1"]`，裁决 "issue #9 present" |
+  | 本次修复 | exit 0：`WARN no executable tool call this turn; answering the rejected ones next step` → 第二个请求 `paired=["tu_down_1"] unanswered=[]`，任务完成，裁决 "issue #9 fixed" |
+
+  **真实模型那一格仍未验证**（本机无 `ANTHROPIC_API_KEY`）；桩只保证消息形状符合 API 的校验规则，
+  不能证明真实模型在同一情形下的行为完全一致。
+- #15（关键路径测试缺口）里的"vision 侧解析零覆盖"这一项随之关闭。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。

@@ -77,6 +77,17 @@ impl Engine for VisionEngine {
     }
 }
 
+/// What an assistant turn asks of us.
+enum Turn {
+    /// Run this action and answer its tool use with the next observation.
+    Act(Action),
+    /// The turn produced nothing runnable but did produce tool uses we rejected;
+    /// their error results go out next step.
+    Acknowledge,
+    /// Text only: completion markers, or nothing usable.
+    Report { texts: Vec<String> },
+}
+
 /// Stateful Anthropic Messages API client implementing the computer tool loop.
 pub struct AnthropicProvider {
     http: reqwest::Client,
@@ -87,6 +98,9 @@ pub struct AnthropicProvider {
     pending: VecDeque<(String, Action)>,
     /// Extra tool_use ids from the same turn that we intentionally skip.
     skipped: Vec<String>,
+    /// Tool uses we cannot execute, as (tool_use_id, why). They still owe the
+    /// API a `tool_result`, so they are queued as error results rather than dropped.
+    failed: Vec<(String, String)>,
     /// Result note for the tool use we just executed.
     pending_note: Option<String>,
     started: bool,
@@ -105,6 +119,7 @@ impl AnthropicProvider {
             display: (0, 0),
             pending: VecDeque::new(),
             skipped: Vec::new(),
+            failed: Vec::new(),
             pending_note: None,
             started: false,
         }
@@ -128,27 +143,7 @@ impl AnthropicProvider {
             self.messages
                 .push(json!({ "role": "user", "content": content }));
             self.started = true;
-        } else if let Some((tool_use_id, _)) = self.pending.pop_front() {
-            // Attach the screenshot and any execution note to the tool result,
-            // and acknowledge any tool uses we deliberately skipped.
-            let note = self.pending_note.take().unwrap_or_else(|| "done".into());
-            let mut result_content = vec![json!({ "type": "text", "text": note })];
-            if let Some(block) = tree_block(obs) {
-                result_content.push(block);
-            }
-            result_content.push(image_block(obs));
-            let mut blocks = vec![json!({
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": result_content
-            })];
-            for id in self.skipped.drain(..) {
-                blocks.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": id,
-                    "content": "skipped: only one action per step is executed"
-                }));
-            }
+        } else if let Some(blocks) = self.take_ack(obs) {
             self.messages
                 .push(json!({ "role": "user", "content": blocks }));
         } else if matches!(
@@ -173,20 +168,69 @@ impl AnthropicProvider {
             .clone();
 
         self.messages
-            .push(json!({ "role": "assistant", "content": content }));
+            .push(json!({ "role": "assistant", "content": content.clone() }));
 
-        // Parse all tool uses, queue them, and execute the first.
-        let mut tool_uses = Vec::new();
+        match self.record_assistant_turn(&content) {
+            Turn::Act(action) => Ok(action),
+            Turn::Acknowledge => {
+                tracing::warn!(
+                    "no executable tool call this turn; answering the rejected ones next step"
+                );
+                Ok(Action::Wait { ms: 200 })
+            }
+            Turn::Report { texts } => {
+                let joined = texts.join("\n");
+                if let Some(rest) = joined.split("TASK_COMPLETE").nth(1) {
+                    let summary = rest.trim_start_matches([':', ' ']).trim().to_string();
+                    return Ok(Action::Done {
+                        summary: if summary.is_empty() {
+                            "task complete".into()
+                        } else {
+                            summary
+                        },
+                    });
+                }
+                if let Some(rest) = joined.split("TASK_FAILED").nth(1) {
+                    let reason = rest.trim_start_matches([':', ' ']).trim().to_string();
+                    return Ok(Action::Fail {
+                        reason: if reason.is_empty() {
+                            "model reported failure".into()
+                        } else {
+                            reason
+                        },
+                    });
+                }
+                tracing::warn!("model returned no tool call; nudging");
+                Ok(Action::Wait { ms: 500 })
+            }
+        }
+    }
+
+    /// Sort one assistant turn's tool uses into what can run, what must be
+    /// acknowledged without running, and what cannot be executed at all.
+    ///
+    /// The third bucket is the one that used to be dropped with a warning. The
+    /// assistant message carrying it is already in history, and the API rejects
+    /// any request where a `tool_use` has no matching `tool_result` — a 400 that
+    /// is not retryable, so one unsupported action (the computer tool's
+    /// `left_mouse_down`, for instance) poisoned every later step of the task.
+    fn record_assistant_turn(&mut self, content: &[Value]) -> Turn {
+        let mut executable: std::collections::VecDeque<(String, Action)> = Default::default();
         let mut texts = Vec::new();
-        for block in &content {
+        for block in content {
             match block["type"].as_str() {
                 Some("tool_use") => {
                     let id = block["id"].as_str().unwrap_or_default().to_string();
-                    let input = &block["input"];
-                    match parse_tool_input(input) {
-                        Ok(action) => tool_uses.push((id, action)),
+                    match parse_tool_input(&block["input"]) {
+                        Ok(action) => executable.push_back((id, action)),
                         Err(e) => {
-                            tracing::warn!(error = %e, "ignoring unparsable tool call");
+                            tracing::warn!(
+                                tool_use_id = %id,
+                                error = %e,
+                                "unsupported tool call; answering it with an error result"
+                            );
+                            self.failed
+                                .push((id, format!("cua-hub cannot execute this action: {e}")));
                         }
                     }
                 }
@@ -199,40 +243,104 @@ impl AnthropicProvider {
             }
         }
 
-        // Completion markers win when the model stopped calling tools.
-        if tool_uses.is_empty() {
-            let joined = texts.join("\n");
-            if let Some(rest) = joined.split("TASK_COMPLETE").nth(1) {
-                let summary = rest.trim_start_matches([':', ' ']).trim().to_string();
-                return Ok(Action::Done {
-                    summary: if summary.is_empty() {
-                        "task complete".into()
-                    } else {
-                        summary
-                    },
-                });
-            }
-            if let Some(rest) = joined.split("TASK_FAILED").nth(1) {
-                let reason = rest.trim_start_matches([':', ' ']).trim().to_string();
-                return Ok(Action::Fail {
-                    reason: if reason.is_empty() {
-                        "model reported failure".into()
-                    } else {
-                        reason
-                    },
-                });
-            }
-            tracing::warn!("model returned no tool call; nudging");
-            return Ok(Action::Wait { ms: 500 });
+        if let Some((id, action)) = executable.pop_front() {
+            // The rest of the turn is acknowledged but not executed: one action
+            // per step keeps the screenshot that answers it honest.
+            self.skipped
+                .extend(executable.into_iter().map(|(id, _)| id));
+            self.pending.push_back((id, action.clone()));
+            return Turn::Act(action);
+        }
+        if !self.failed.is_empty() {
+            // Rejected calls outrank a `TASK_COMPLETE` in the same turn: the
+            // history still has to be made valid before anything else can work.
+            return Turn::Acknowledge;
+        }
+        Turn::Report { texts }
+    }
+
+    /// The user message that answers the previous turn, or `None` when nothing
+    /// is owed. Every pending, skipped and failed tool use contributes exactly
+    /// one `tool_result`; the current screenshot rides along on one of them so
+    /// the model can see what its rejected action did not do.
+    fn take_ack(&mut self, obs: &Observation) -> Option<Vec<Value>> {
+        let executed = self.pending.pop_front();
+        let skipped = std::mem::take(&mut self.skipped);
+        let failed = std::mem::take(&mut self.failed);
+        if executed.is_none() && skipped.is_empty() && failed.is_empty() {
+            return None;
         }
 
-        let mut queued = tool_uses.into_iter();
-        let (first_id, first_action) = queued.next().expect("non-empty");
-        // Extra tool uses in the same turn are acknowledged in the next user
-        // message so the conversation stays valid; they are not executed.
-        self.skipped.extend(queued.map(|(id, _)| id));
-        self.pending.push_back((first_id, first_action.clone()));
-        Ok(first_action)
+        let mut blocks = Vec::new();
+        let mut attach_screen = true;
+        if let Some((tool_use_id, _)) = executed {
+            let note = self.pending_note.take().unwrap_or_else(|| "done".into());
+            let mut content = vec![json!({ "type": "text", "text": note })];
+            if attach_screen {
+                if let Some(block) = tree_block(obs) {
+                    content.push(block);
+                }
+                content.push(image_block(obs));
+                attach_screen = false;
+            }
+            blocks.push(json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content
+            }));
+        }
+        for id in skipped {
+            blocks.push(json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "skipped: only one action per step is executed"
+            }));
+        }
+        for (id, reason) in failed {
+            let mut content = vec![json!({ "type": "text", "text": reason })];
+            if attach_screen {
+                if let Some(block) = tree_block(obs) {
+                    content.push(block);
+                }
+                content.push(image_block(obs));
+                attach_screen = false;
+            }
+            blocks.push(json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": content,
+                "is_error": true
+            }));
+        }
+        Some(blocks)
+    }
+
+    /// Tool uses in history that still owe a result. Used by tests to assert the
+    /// chain stays valid; a non-empty answer here means the next request 400s.
+    #[cfg(test)]
+    fn unmatched_tool_uses(&self) -> Vec<String> {
+        let mut owed: Vec<String> = Vec::new();
+        for message in &self.messages {
+            let Some(blocks) = message["content"].as_array() else {
+                continue;
+            };
+            for block in blocks {
+                match block["type"].as_str() {
+                    Some("tool_use") => {
+                        if let Some(id) = block["id"].as_str() {
+                            owed.push(id.to_string());
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(id) = block["tool_use_id"].as_str() {
+                            owed.retain(|owed| owed != id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        owed
     }
 
     fn request_body(&self) -> Value {
@@ -426,4 +534,235 @@ fn parse_tool_input(input: &Value) -> Result<Action> {
             )))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider() -> AnthropicProvider {
+        AnthropicProvider::new(AnthropicConfig {
+            api_key: "test-key".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            model: "claude-test".into(),
+            max_tokens: 64,
+        })
+    }
+
+    fn observation() -> Observation {
+        Observation::new(vec![1, 2, 3], "image/jpeg", 1280, 800)
+    }
+
+    fn tool_use(id: &str, input: Value) -> Value {
+        json!({ "type": "tool_use", "id": id, "name": "computer", "input": input })
+    }
+
+    fn result_ids(blocks: &[Value]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_result")
+            .filter_map(|b| b["tool_use_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn supported_actions_map_to_their_own_variant() {
+        assert_eq!(
+            parse_tool_input(&json!({"action": "left_click", "coordinate": [10, 20]})).unwrap(),
+            Action::Click {
+                at: Point::new(10, 20),
+                button: MouseButton::Left,
+                double: false
+            }
+        );
+        assert_eq!(
+            parse_tool_input(&json!({"action": "right_click", "coordinate": [1, 2]})).unwrap(),
+            Action::Click {
+                at: Point::new(1, 2),
+                button: MouseButton::Right,
+                double: false
+            }
+        );
+        assert_eq!(
+            parse_tool_input(&json!({"action": "double_click", "coordinate": [3, 4]})).unwrap(),
+            Action::Click {
+                at: Point::new(3, 4),
+                button: MouseButton::Left,
+                double: true
+            }
+        );
+        assert_eq!(
+            parse_tool_input(
+                &json!({"action": "left_click_drag", "start_coordinate": [0, 0], "coordinate": [9, 9]})
+            )
+            .unwrap(),
+            Action::Drag {
+                from: Point::new(0, 0),
+                to: Point::new(9, 9)
+            }
+        );
+        assert_eq!(
+            parse_tool_input(&json!({"action": "type", "text": "hi"})).unwrap(),
+            Action::Type {
+                text: "hi".into(),
+                interval_ms: 8
+            }
+        );
+        assert_eq!(
+            parse_tool_input(&json!({"action": "key", "text": "ctrl+l"})).unwrap(),
+            Action::Key {
+                combo: "ctrl+l".into()
+            }
+        );
+        assert_eq!(
+            parse_tool_input(&json!({"action": "wait", "duration": 1.5})).unwrap(),
+            Action::Wait { ms: 1500 }
+        );
+        // Scroll direction decides the axis and the sign.
+        assert_eq!(
+            parse_tool_input(
+                &json!({"action": "scroll", "coordinate": [5, 5], "scroll_direction": "up", "scroll_amount": 2})
+            )
+            .unwrap(),
+            Action::Scroll {
+                at: Point::new(5, 5),
+                dx: 0,
+                dy: -6
+            }
+        );
+    }
+
+    #[test]
+    fn missing_arguments_are_refused_not_guessed() {
+        // A click with no coordinate would land at (0,0) — top-left of the screen.
+        for input in [
+            json!({"action": "left_click"}),
+            json!({"action": "mouse_move"}),
+            json!({"action": "left_click_drag", "coordinate": [1, 1]}),
+            json!({"action": "left_click", "coordinate": [1]}),
+        ] {
+            assert!(
+                parse_tool_input(&input).is_err(),
+                "{input} must not resolve to an action"
+            );
+        }
+        assert!(parse_tool_input(&json!({})).is_err(), "no action at all");
+    }
+
+    #[test]
+    fn unsupported_computer_actions_report_their_name() {
+        // computer_20250124 exposes these; the platform has no Action for them.
+        for action in ["left_mouse_down", "left_mouse_up", "cursor_position"] {
+            let error = parse_tool_input(&json!({"action": action})).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                text.contains(action),
+                "{action} should be named in the error so the model can correct itself, got {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsupported_tool_call_still_owes_a_result() {
+        // This is the bug: the warning-and-drop path left the assistant turn's
+        // tool_use with no tool_result, so the NEXT request was invalid and the
+        // whole task died on a non-retryable 400.
+        let mut engine = provider();
+        let content = vec![
+            tool_use("ok1", json!({"action": "left_click", "coordinate": [4, 4]})),
+            tool_use("down1", json!({"action": "left_mouse_down"})),
+            tool_use("ok2", json!({"action": "type", "text": "x"})),
+        ];
+        engine.messages.push(json!({"role": "user", "content": []}));
+        engine
+            .messages
+            .push(json!({"role": "assistant", "content": content.clone()}));
+
+        let turn = engine.record_assistant_turn(&content);
+        assert!(matches!(turn, Turn::Act(Action::Click { .. })));
+        // Three tool uses in history, nothing answered yet.
+        assert_eq!(engine.unmatched_tool_uses().len(), 3);
+
+        let blocks = engine.take_ack(&observation()).expect("an answer is owed");
+        let ids = result_ids(&blocks);
+        for id in ["ok1", "down1", "ok2"] {
+            assert!(ids.contains(&id.to_string()), "{id} must be answered");
+        }
+        let rejected = blocks
+            .iter()
+            .find(|b| b["tool_use_id"] == "down1")
+            .expect("the rejected call needs its result");
+        assert_eq!(rejected["is_error"], true, "an error result, not silence");
+        assert!(
+            rejected["content"].to_string().contains("left_mouse_down"),
+            "the reason has to reach the model: {}",
+            rejected["content"]
+        );
+
+        // The invariant the API enforces: nothing in history left unanswered.
+        engine
+            .messages
+            .push(json!({"role": "user", "content": blocks}));
+        assert!(
+            engine.unmatched_tool_uses().is_empty(),
+            "every tool_use must have a tool_result before the next request"
+        );
+    }
+
+    #[test]
+    fn a_turn_of_only_unsupported_calls_acknowledges_before_anything_else() {
+        let mut engine = provider();
+        let content = vec![tool_use("d1", json!({"action": "left_mouse_down"}))];
+        engine
+            .messages
+            .push(json!({"role": "assistant", "content": content.clone()}));
+        assert!(matches!(
+            engine.record_assistant_turn(&content),
+            Turn::Acknowledge
+        ));
+        let blocks = engine.take_ack(&observation()).expect("owed");
+        assert_eq!(result_ids(&blocks), vec!["d1".to_string()]);
+        // The screen still travels with the answer, or the model repeats the mistake blind.
+        assert!(
+            blocks[0]["content"]
+                .as_array()
+                .map(|c| c.iter().any(|b| b["type"] == "image"))
+                .unwrap_or(false),
+            "the error result must carry the current screenshot"
+        );
+        engine
+            .messages
+            .push(json!({"role": "user", "content": blocks}));
+        assert!(engine.unmatched_tool_uses().is_empty());
+    }
+
+    #[test]
+    fn a_rejected_call_outranks_a_completion_marker_in_the_same_turn() {
+        // Text-only handling would end the task and never answer the tool_use,
+        // leaving the history invalid even though "Done" looked like success.
+        let mut engine = provider();
+        let content = vec![
+            tool_use("d1", json!({"action": "left_mouse_up"})),
+            json!({"type": "text", "text": "TASK_COMPLETE: all done"}),
+        ];
+        engine
+            .messages
+            .push(json!({"role": "assistant", "content": content.clone()}));
+        assert!(matches!(
+            engine.record_assistant_turn(&content),
+            Turn::Acknowledge
+        ));
+        assert!(engine.take_ack(&observation()).is_some());
+    }
+
+    #[test]
+    fn a_text_only_turn_still_reports_completion() {
+        let mut engine = provider();
+        let content = vec![json!({"type": "text", "text": "TASK_COMPLETE: done"})];
+        assert!(matches!(
+            engine.record_assistant_turn(&content),
+            Turn::Report { .. }
+        ));
+        assert!(engine.take_ack(&observation()).is_none(), "nothing owed");
+    }
 }
