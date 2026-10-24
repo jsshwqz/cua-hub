@@ -240,6 +240,47 @@ def scenario(identity: str) -> None:
             f"images={state['images']} announced={announced}",
         )
 
+        # State read over AT-SPI, checked against the app's own account of the
+        # same widget. Before the fix the first call answers "not supported on
+        # this platform", so this whole block is the red half of the control.
+        toggle_log = Path(str(result_file) + ".toggles")
+        if toggle_log.exists():
+            toggle_log.unlink()
+        before = call("control_state", {"name": "probe-toggle"})
+        before_json = before["json"] or {}
+        check(
+            f"[{identity}] control_state reads the check box as off",
+            not before["is_error"] and before_json.get("toggle") == "off",
+            f"toggle={before_json.get('toggle')!r} {before['text'][:120]}",
+        )
+
+        toggled = call("invoke_control", {"name": "probe-toggle"})
+        after = call("control_state", {"name": "probe-toggle"})
+        after_json = after["json"] or {}
+        check(
+            f"[{identity}] after DoAction the state reads as on",
+            not toggled["is_error"] and after_json.get("toggle") == "on",
+            f"invoke={toggled['text'][:60]} toggle={after_json.get('toggle')!r}",
+        )
+        check(
+            f"[{identity}] enabled and offscreen come from their own ordinals",
+            after_json.get("enabled") is True and after_json.get("offscreen") is False,
+            f"enabled={after_json.get('enabled')} offscreen={after_json.get('offscreen')}",
+        )
+        # The widget's own signal log is the independent oracle. Without it, a
+        # wrong ordinal that happened to be set could pass for a match.
+        logged = toggle_log.read_text().split() if toggle_log.exists() else []
+        check(
+            f"[{identity}] the check box itself reports one toggle, to checked",
+            logged == ["1"],
+            f"toggle log={logged}",
+        )
+        check(
+            f"[{identity}] value stays absent until the Text interface is read",
+            "value" not in after_json,
+            f"value={after_json.get('value')!r}",
+        )
+
         written = call("set_control_text", {"name": "probe-entry", "text": "AT-SPI-WRITES-HERE"})
         check(
             f"[{identity}] set_control_text reaches the entry",

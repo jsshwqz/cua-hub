@@ -29,6 +29,10 @@ if IDENTITY == "aligned":
     Gdk.set_program_class(APP_ID)
 
 RESULT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/probe_result.txt"
+# Every toggle the widget really goes through, one `0`/`1` per line. This is the
+# app's own account of its state, independent of what the accessibility bus says
+# about it -- so a state read that decodes the wrong bit cannot pass for a match.
+TOGGLE_LOG = RESULT + ".toggles"
 
 
 class Probe(Gtk.Window):
@@ -49,6 +53,7 @@ class Probe(Gtk.Window):
         box.pack_start(self.submit, False, False, 0)
 
         self.toggle = Gtk.CheckButton(label="probe-toggle")
+        self.toggle.connect("toggled", self.on_toggle)
         box.pack_start(self.toggle, False, False, 0)
 
         # One accessible name on two controls, with the label met first by a
@@ -67,6 +72,10 @@ class Probe(Gtk.Window):
         with open(RESULT, "w", encoding="utf-8") as handle:
             handle.write(self.entry.get_text())
         Gtk.main_quit()
+
+    def on_toggle(self, button):
+        with open(TOGGLE_LOG, "a", encoding="utf-8") as handle:
+            handle.write(f"{int(button.get_active())}\n")
 
 
 window = Probe()
