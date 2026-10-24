@@ -991,9 +991,11 @@ mod tests {
 
     #[test]
     fn a_missing_interface_is_not_reported_as_an_unanswered_read() {
-        // Both spellings a real bus uses for "this control does not have that".
+        // One sample per marker the classifier recognises, so dropping any single
+        // one of them reddens exactly one case. (An earlier draft put two markers
+        // in one sentence, and quietly covered for its own removal.)
         for absent in [
-            "org.freedesktop.DBus.Error.UnknownInterface: Thread main reply: no such interface",
+            "org.freedesktop.DBus.Error.UnknownInterface: Thread main reply",
             "No such interface 'org.a11y.atspi.Component' on object at path /org/a11y/atspi/accessible/1",
             "org.freedesktop.DBus.Error.UnknownProperty: Property Name not found",
             "org.freedesktop.DBus.Error.NotSupported: this method is not implemented",
