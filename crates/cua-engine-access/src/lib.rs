@@ -122,6 +122,11 @@ pub fn snapshot_window(
 /// The control that currently owns keyboard focus, if any. Typing into the
 /// wrong surface is the most common automation mistake, so callers are expected
 /// to check this before sending text.
+///
+/// **Windows only.** Other platforms answer `Err(Unsupported)`, not `Ok(None)`:
+/// `None` reads as "nothing has focus", which is exactly the false clean bill a
+/// pre-flight check is supposed to avoid. Callers that treat it as advisory
+/// should say so in whatever they report, the way `window_state` does.
 pub fn focused_element() -> Result<Option<UiNode>> {
     #[cfg(windows)]
     {
@@ -129,7 +134,9 @@ pub fn focused_element() -> Result<Option<UiNode>> {
     }
     #[cfg(not(windows))]
     {
-        Ok(None)
+        Err(cua_core::Error::Unsupported(
+            "keyboard focus is read from UIA; the AT-SPI backend does not query it yet".into(),
+        ))
     }
 }
 
@@ -345,6 +352,10 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
 }
 
 /// Read common state fields from a control.
+///
+/// `Ok(None)` means the control was found but exposes no state. On non-Windows
+/// platforms this returns `Err(Unsupported)` instead, because the AT-SPI backend
+/// does not read state yet -- see [`state`](atspi::state) for the distinction.
 pub fn state(name: &str) -> Result<Option<ControlState>> {
     #[cfg(windows)]
     {

@@ -327,14 +327,19 @@ pub fn snapshot_window(
 /// identifier, so any of them may be the one that matches — this is only the
 /// fallback now that a process id can decide it outright.
 fn app_matches(at_spi_name: &str, bus_name: &str, want: &str) -> bool {
-    let want = want.to_lowercase();
+    let want = want.trim().to_lowercase();
     if want.is_empty() {
         return false;
     }
-    let candidates = [at_spi_name.to_lowercase(), bus_name.to_lowercase()];
-    candidates
-        .iter()
-        .any(|c| *c == want || c.contains(&want) || want.contains(c.as_str()))
+    let candidates = [at_spi_name.trim().to_lowercase(), bus_name.to_lowercase()];
+    candidates.iter().any(|c| {
+        // An application that reports no name must not match every query: the
+        // reverse-containment leg would ask `want.contains("")`, which is true
+        // for any string. A toolkit that has not set `g_get_prgname()` really
+        // does look like this, so the empty candidate has to be skipped rather
+        // than assumed impossible.
+        !c.is_empty() && (*c == want || c.contains(&want) || want.contains(c.as_str()))
+    })
 }
 
 fn title_matches(at_spi_name: &str, want: &str) -> bool {
@@ -357,43 +362,81 @@ pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     Ok(UiSnapshot { nodes, truncated })
 }
 
-pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
-    let needle = name.to_lowercase();
-    let mut exact: Option<(u8, UiNode)> = None;
-    let mut partial: Option<(u8, UiNode)> = None;
+/// How actionable a role is, used to break name collisions.
+///
+/// Mirrors the Windows side, which prefers [Button, MenuItem, ListItem] over a
+/// same-named label; without that, a caption sitting next to a button steals the
+/// match and the caller presses nothing.
+fn role_priority(control_type: &str) -> u8 {
+    match control_type {
+        "Button" | "PushButton" => 3u8,
+        "MenuItem" | "ListItem" | "PageTab" => 2,
+        _ => 1,
+    }
+}
 
-    walk(max_nodes, max_depth, &mut |_, node, _, _| {
+/// Whether a candidate displaces the incumbent, where "nothing yet" loses to
+/// anything. Strictly greater keeps the *first* node among equals, so the answer
+/// does not change when two identical siblings swap places between observations.
+fn beats(incumbent: Option<u8>, candidate: u8) -> bool {
+    match incumbent {
+        Some(held) => candidate > held,
+        None => true,
+    }
+}
+
+/// The best match seen so far, split into exact and partial buckets.
+#[derive(Default)]
+struct MatchWinner {
+    exact: Option<(u8, UiNode)>,
+    partial: Option<(u8, UiNode)>,
+}
+
+impl MatchWinner {
+    fn consider(&mut self, needle: &str, node: &UiNode) {
         if node.name.is_empty() || node.rect.2 <= 0 || node.rect.3 <= 0 {
-            return false;
+            return;
         }
-        let role_priority = match node.control_type.as_str() {
-            "Button" | "PushButton" => 3u8,
-            "MenuItem" | "ListItem" | "PageTab" => 2,
-            _ => 1,
-        };
+        let priority = role_priority(&node.control_type);
         let hay = node.name.to_lowercase();
         if hay == needle {
-            if exact
-                .as_ref()
-                .map(|(p, _)| role_priority > *p)
-                .unwrap_or(true)
-            {
-                exact = Some((role_priority, node.clone()));
+            if beats(self.exact.as_ref().map(|(held, _)| *held), priority) {
+                self.exact = Some((priority, node.clone()));
             }
-            return true;
-        }
-        if hay.contains(&needle)
-            && partial
-                .as_ref()
-                .map(|(p, _)| role_priority > *p)
-                .unwrap_or(true)
+        } else if hay.contains(needle)
+            && beats(self.partial.as_ref().map(|(held, _)| *held), priority)
         {
-            partial = Some((role_priority, node.clone()));
+            self.partial = Some((priority, node.clone()));
         }
+    }
+
+    fn finish(self) -> Option<UiNode> {
+        self.exact.or(self.partial).map(|(_, node)| node)
+    }
+}
+
+/// Choose which of the *visited* controls a query meant.
+///
+/// Consuming every node is the point: cutting the walk short at the first exact
+/// hit returns whichever same-named control the tree happens to list first, and a
+/// Label -- which has no action to fire -- often comes first, because that is
+/// what a GTK button's own caption looks like from the outside.
+fn pick(needle: &str, visited: impl Iterator<Item = UiNode>) -> Option<UiNode> {
+    let needle = needle.to_lowercase();
+    let mut winner = MatchWinner::default();
+    for node in visited {
+        winner.consider(&needle, &node);
+    }
+    winner.finish()
+}
+
+pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
+    let mut visited = Vec::new();
+    walk(max_nodes, max_depth, &mut |_, node, _, _| {
+        visited.push(node.clone());
         false
     })?;
-
-    Ok(exact.or(partial).map(|(_, node)| node))
+    Ok(pick(name, visited.into_iter()))
 }
 
 /// Fire the control's first AT-SPI action (usually "click"/"press").
@@ -439,10 +482,15 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     Ok(hit)
 }
 
-/// AT-SPI state flags are not exposed as a simple property on the D-Bus
-/// interface; the caller can still use `snapshot`/`find` for structure.
+/// Control state is reachable over AT-SPI -- `org.a11y.atspi.Accessible.GetState`
+/// returns a StateSet -- but this backend has not wired it up yet. Answering
+/// `Ok(None)` here would be a lie of a specific kind: `None` means "this control
+/// reports no state", which callers read as licence to fall back to coordinates,
+/// when the real fact is that we did not ask.
 pub fn state(_name: &str) -> Result<Option<crate::ControlState>> {
-    Ok(None)
+    Err(Error::Unsupported(
+        "control state is not read over AT-SPI yet; use the tree from snapshot/find instead".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -518,5 +566,78 @@ mod tests {
             "and points at the route that still works"
         );
         assert!(no_frame_message("x", "y", 1, &[]).contains("no applications"));
+    }
+
+    #[test]
+    fn a_nameless_application_matches_no_query() {
+        // `want.contains("")` is true for every want, so an application that
+        // never set its program name used to answer to every lookup and could
+        // win the window that `snapshot_window` was trying to identify.
+        assert!(!app_matches("", "", "thunar"));
+        assert!(!app_matches("", ":1.7", "thunar"));
+        assert!(!app_matches("Thunar", "", ""));
+        // A bus name is still a usable identity when there is no display name.
+        assert!(app_matches("", ":1.7", ":1.7"));
+    }
+
+    /// A control as the AT-SPI walk hands one over: the fields the matcher reads
+    /// are real, the rest are inert.
+    fn node(control_type: &str, name: &str) -> UiNode {
+        UiNode {
+            index: 0,
+            depth: 0,
+            control_type: control_type.into(),
+            name: name.into(),
+            automation_id: String::new(),
+            rect: (10, 10, 80, 24),
+            signature: String::new(),
+            value: String::new(),
+            actions: Vec::new(),
+            focused: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn the_button_wins_over_the_label_listed_before_it() {
+        // The probe window is exactly this shape: a bare label, then a button
+        // with the same accessible name.
+        let visited = vec![
+            node("Label", "probe-ambiguous"),
+            node("Button", "probe-ambiguous"),
+        ];
+        let hit = pick("probe-ambiguous", visited.into_iter()).expect("a match");
+        assert_eq!(hit.control_type, "Button", "the actionable role must win");
+    }
+
+    #[test]
+    fn an_exact_name_beats_a_more_actionable_partial_one() {
+        let visited = vec![
+            node("Button", "probe-submit-now"),
+            node("MenuItem", "submit"),
+        ];
+        let hit = pick("submit", visited.into_iter()).expect("a match");
+        assert_eq!(hit.name, "submit", "exact outranks role");
+    }
+
+    #[test]
+    fn among_equals_the_first_seen_still_wins() {
+        let mut left = node("Button", "OK");
+        left.automation_id = "left".into();
+        let mut right = node("Button", "OK");
+        right.automation_id = "right".into();
+        let hit = pick("ok", vec![left, right].into_iter()).expect("a match");
+        assert_eq!(
+            hit.automation_id, "left",
+            "ties must not churn between observations"
+        );
+    }
+
+    #[test]
+    fn unnamed_and_off_screen_controls_are_not_candidates() {
+        let mut zero_width = node("Button", "OK");
+        zero_width.rect = (0, 0, 0, 40);
+        let blank = node("Button", "");
+        assert!(pick("ok", vec![zero_width, blank].into_iter()).is_none());
     }
 }

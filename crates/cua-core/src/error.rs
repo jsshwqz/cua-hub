@@ -19,6 +19,12 @@ pub enum Error {
     #[error("invalid action from engine: {0}")]
     InvalidAction(String),
 
+    /// The backend for this platform has not implemented the operation at all.
+    /// Distinct from "the control does not have that property", which callers
+    /// must be able to tell apart before they change strategy.
+    #[error("not supported on this platform: {0}")]
+    Unsupported(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 

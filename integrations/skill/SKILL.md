@@ -32,7 +32,7 @@ Precise UI control (prefer over pixels)
 - `perform_secondary_action {observation_id, element_index, action}` — an accessibility action besides a click: `Expand`, `Collapse`, `Raise`, `Scroll Up/Down/Left/Right`, `Toggle`, `Select`, `Focus`, `Invoke`. Only use names the element lists in its `actions=` in the tree; a guessed name returns `unsupported_action` with the real list, and the element's state is read back afterwards so you can verify.
 - `invoke_element {index, observation_id?}` — Invoke pattern first, click-centre fallback.
 - `set_element_value {index, text, observation_id?}` — Value/EditableText pattern, no keystrokes.
-- `invoke_control {name}` / `set_control_text {name, text}` / `control_state {name}` — same by accessible name.
+- `invoke_control {name}` / `set_control_text {name, text}` / `control_state {name}` — same by accessible name. `control_state` is implemented for Windows only; elsewhere it answers `not supported on this platform` rather than pretending the control has no state.
 
 Raw input
 
@@ -57,6 +57,10 @@ Tasks and browser
 1. **Observe**: `window_state {window, include_text: true}` and read the tree and
    `focused_element`. Everything you act on next must come from this
    `observation_id` — an index, a screenshot pixel, or a control name.
+   Where `focused_element` is null *and* `focused_element_note` is present, focus
+   could not be read at all (non-Windows hosts): that is missing information, not
+   an empty focus, so confirm the typed target by re-reading the window after the
+   click instead of trusting a pre-flight.
 2. **Keep the mapping, apply the diff**: after the first observation of a window
    the tree comes back as a unified diff. Apply removals first, then additions;
    unchanged lines keep their index. An index that appeared on a `-` line is
