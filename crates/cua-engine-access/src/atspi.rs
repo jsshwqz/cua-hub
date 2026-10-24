@@ -761,7 +761,7 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
 /// different fact, and dressing it up as that one is how a capped walk turns into
 /// a click on the wrong pixel.
 fn capped(name: &str, action: &str, visited: usize, max_nodes: usize, max_depth: usize) -> Error {
-    Error::Capture(format!(
+    Error::Lookup(format!(
         "did not reach {action} on {name:?}: the walk stopped after {visited} node(s) at depth {max_depth} with the tree still truncated (max_nodes={max_nodes}); raise max_nodes, or fall back to coordinates knowingly -- this is not \"the control lacks the pattern\""
     ))
 }

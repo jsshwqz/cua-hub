@@ -270,6 +270,9 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
   `max_nodes` 多少、树仍然截断，并直接点名要防的那次误读："这不是'控件没有该模式'"。
 - `Ok(None)` 的意思因此收窄成它本该表达的：走到了那个控件，它没有该模式。
 - Windows 的 UIA 遍历不按节点预算走，`_with` 的数字在那边**被忽略**而不是假装生效，代码写明。
+- 这条错误改用它自己的 `Error::Lookup`。第一版借的是 `Error::Capture`，CI 真机输出因此长成
+  `capture failed: did not reach set_value on "probe-entry" …`——内容对、帽子错，
+  读的人会以为截图环节出了问题。断言现在同时钉住这个前缀。
 - 验证：本机 1 条测文案（必须含 `did not reach` / `after 1 node(s)` / `max_nodes=1`，
   且不得再出现旧措辞）；CI 真树每场景两条——预算为 1 的 `set_control_text` 与
   `invoke_control` 必须报"没走到"，紧跟其后的正常调用必须成功。这一对是刻意配的，
