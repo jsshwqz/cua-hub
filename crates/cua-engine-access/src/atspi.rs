@@ -32,6 +32,82 @@ type NodeData = (String, u32, Rect, Kids);
 /// reported in `UiSnapshot::unreadable` instead.
 const CALL_TIMEOUT: Duration = Duration::from_millis(1200);
 
+/// Do not poke a bus that just went deaf, for this long.
+///
+/// A read that overruns its deadline cannot be cancelled: the worker thread stays
+/// parked on the socket. The cooldown keeps that to one parked thread per wedged
+/// application per window instead of one per observation, which is the difference
+/// between a survivable leak and an unbounded one.
+const WEDGED_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Buses known to have gone deaf, with when they last did.
+static WEDGED: std::sync::Mutex<Option<std::collections::HashMap<String, Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// A read that the peer did not answer in time.
+enum Stall {
+    /// No reply within the deadline; the read is now parked on a worker thread.
+    NoReply,
+    /// Not even attempted: the same bus went deaf inside the cooldown window.
+    CoolingDown,
+}
+
+fn mark_wedged(bus: &str) {
+    if let Ok(mut guard) = WEDGED.lock() {
+        let map = guard.get_or_insert_with(Default::default);
+        map.insert(bus.to_string(), Instant::now());
+    }
+}
+
+fn is_wedged(bus: &str) -> bool {
+    let Ok(guard) = WEDGED.lock() else {
+        return false;
+    };
+    let Some(map) = guard.as_ref() else {
+        return false;
+    };
+    map.get(bus)
+        .is_some_and(|since| since.elapsed() < WEDGED_COOLDOWN)
+}
+
+/// Run one round of bus reads where it cannot pin the caller.
+///
+/// zbus 5's blocking API has no client-side reply timeout: `Proxy::call` and
+/// `blocking::Connection::call_method` both just `block_on` the async call, and
+/// `Builder::method_timeout` is honoured only by the async `Connection::call`,
+/// which the blocking type does not expose. Measured on CI (run 40118056194): a
+/// connection built with `method_timeout(1200ms)` still had not returned after
+/// 180 seconds against a peer under `SIGSTOP`.
+///
+/// So the deadline lives here. The work runs on a worker thread holding its own
+/// clone of the connection; the caller waits `CALL_TIMEOUT` and, when that
+/// expires, reports the subtree as unreadable rather than hanging the walk.
+fn timed<T, F>(bus: &str, work: F) -> std::result::Result<T, Stall>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if is_wedged(bus) {
+        return Err(Stall::CoolingDown);
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(1);
+    // A panicked worker is treated as no reply: the node is then reported rather
+    // than silently absent, which is the whole point of the ledger.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|_| Stall::NoReply)?;
+    match receiver.recv_timeout(CALL_TIMEOUT) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            mark_wedged(bus);
+            Err(Stall::NoReply)
+        }
+    }
+}
+
 /// How long one tree walk may spend waiting on the bus in total.
 ///
 /// The per-call timeout bounds a single read; this bounds the observation. A
@@ -95,6 +171,8 @@ fn a11y_connection() -> Result<Connection> {
         .call("GetAddress", &())
         .map_err(|e| Error::Capture(format!("GetAddress failed: {e}")))?;
     zbus::blocking::connection::Builder::address(address.as_str())
+        // Applies only to the async `Connection::call` path; what actually bounds
+        // a wedged peer here is `timed`, so do not read this as the safety net.
         .and_then(|b| b.method_timeout(CALL_TIMEOUT).build())
         .map_err(|e| Error::Capture(format!("connect a11y bus at {address}: {e}")))
 }
@@ -116,13 +194,37 @@ fn read_node_data(conn: &Connection, dest: &str, path: &str) -> NodeData {
     read_node(conn, dest, path).0
 }
 
+/// Read one node, within the walk's reply deadline.
+///
+/// Returns an empty node plus the reason when the peer is deaf, so the caller can
+/// report the hole instead of losing it.
+fn read_node(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
+    let conn = conn.clone();
+    let dest_owned = dest.to_string();
+    let path_owned = path.to_string();
+    match timed(dest, move || read_node_raw(&conn, &dest_owned, &path_owned)) {
+        Ok(pair) => pair,
+        Err(Stall::NoReply) => (
+            (String::new(), 0, (0, 0, 0, 0), Vec::new()),
+            vec![format!("no reply within {}ms", CALL_TIMEOUT.as_millis())],
+        ),
+        Err(Stall::CoolingDown) => (
+            (String::new(), 0, (0, 0, 0, 0), Vec::new()),
+            vec![format!(
+                "not re-attempted: this bus was deaf within the last {}s",
+                WEDGED_COOLDOWN.as_secs()
+            )],
+        ),
+    }
+}
+
 /// Read one node, keeping a note of any read that went unanswered.
 ///
 /// The node is still returned with whatever did arrive: a control whose name is
 /// unknown but whose rectangle answered is useful, and dropping it silently was
 /// the old failure. What changed is that the caller now also learns which reads
 /// nobody answered.
-fn read_node(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
+fn read_node_raw(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
     let mut name = String::new();
     let mut role = 0u32;
     let mut kids = Vec::new();
@@ -1010,6 +1112,43 @@ mod tests {
             decode_state(&node("Button", "plain"), &words_for(&[])).expanded,
             None
         );
+    }
+
+    #[test]
+    fn a_read_that_never_returns_is_bounded_and_not_retried() {
+        // No bus needed: the point is that a call which never comes back cannot
+        // pin the caller, and that the caller does not keep spawning helpers
+        // against the same deaf peer.
+        let bus = "[:9.999-deadline-test]";
+        let started = Instant::now();
+        let first = timed(bus, || loop {
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let waited = started.elapsed();
+        assert!(
+            matches!(first, Err(Stall::NoReply)),
+            "a stuck read must return"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "the caller waited {waited:?}, not indefinitely"
+        );
+
+        let second_started = Instant::now();
+        let second = timed(bus, || 7u32);
+        assert!(
+            matches!(second, Err(Stall::CoolingDown)),
+            "a bus already known deaf is not poked again"
+        );
+        assert!(
+            second_started.elapsed() < Duration::from_millis(200),
+            "the cooldown path must not wait a second deadline"
+        );
+
+        // And an unrelated bus is still tried, so one wedged application does not
+        // shade the whole desktop.
+        let other = timed("[:9.998-other-bus]", || 42u32);
+        assert!(matches!(other, Ok(42)), "other peers are unaffected");
     }
 
     #[test]

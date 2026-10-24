@@ -214,8 +214,17 @@ Linux 上**不设** `CUA_HUB_BROWSER` 直接
   `NotSupported` 不记账——没有这条区分，每个 panel 都会变成故障，真卡死的应用反倒被淹掉。
   分类器写成"去空格再比"，因为同一次失败有两种措辞：
   `org.freedesktop.DBus.Error.UnknownInterface` 和 `No such interface ... on object`。
-- **单次调用超时 1200ms**（zbus 5 的 `method_timeout`）。树不再因为整次失败而不可用，
-  也不再为一个装死的应用烧掉 25s×调用数。
+- **一次读最多等 1200ms** —— 但**不是**靠 `method_timeout` 做到的。zbus 5 的 blocking API
+  没有客户端应答超时：`Proxy::call` 与 `blocking::Connection::call_method` 都只是
+  `block_on` 那个 async 调用，而 `Builder::method_timeout` 只在 async `Connection::call`
+  里被读取，blocking 类型不暴露那个方法。真机实测（run `40118056194`）：对端被 `SIGSTOP`
+  之后，设了 `method_timeout(1200ms)` 的连接**连 180s 都没回来**。
+  所以期限改在这里实现：每次节点读跑在一个持有连接克隆的工作线程上，调用方只等
+  `CALL_TIMEOUT`，超时就把这棵子树记成读不到并继续。**代价说清楚**：那次跑着的线程没法取消，
+  会停在 socket 上；因此加了一个 30s 的"这家人聋过"名单，同一 bus 在窗口内不再敲门——
+  把一个装死应用的成本从"每次观测漏一个线程"压到"每 30 秒最多一个"。
+- 整棵树的遍历另有一个 6s 的总预算（`WALK_BUDGET`），超了就停下并点名第一个**没被尝试**的节点。
+  单次期限管不住"200 个节点 × 每节点若干次调用"，总预算才管得住。
 - 输出口：`accessibility_tree` 的文本尾部加 `! parts of this tree were not read:`
   （最多点名 6 条，其余只给条数）；`window_state` 的 `accessibility` 里多一个
   **只在有情况时**出现的 `unreadable` 键。
@@ -225,9 +234,10 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
 
 ### 测试与验证（issue #11 第 6 项）
 
-- 4 条纯函数测试（每个宿主都编译）：两种"接口缺失"措辞都不该进账、`NoReply`/timeout/
+- 5 条测试（每个宿主都编译）：两种"接口缺失"措辞都不该进账、`NoReply`/timeout/
   `connection closed` 必须进账且长度受限、`shorten` 只留一行截到 160、账本点名 6 条后
-  仍报剩余条数。
+  仍报剩余条数、以及**永不返回的读会被期限截下且同一 bus 在冷却窗口内不再重试**
+  （这条不要真总线，用一个死循环闭包就能证）。
 - **端到端红/绿排在 CI 图形作业里**：新阶段起两个 probe，`SIGSTOP` 其中一个，再取桌面树，
   三条断言——① 活着那个应用仍在树里（不是整次失败）；② 输出点名读不到的部分；
   ③ 整体耗时 <10s。提交 `ac75429` 只有断言，应当红在 ②③。
