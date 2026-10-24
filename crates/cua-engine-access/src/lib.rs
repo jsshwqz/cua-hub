@@ -376,8 +376,20 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
     }
 }
 
-/// Invoke a control through its accessibility Invoke pattern. Returns `None`
-/// when the control has no invoke pattern (caller should fall back to a click).
+/// How far a name-based action searches when the caller does not choose.
+///
+/// The AT-SPI tree of a real desktop is easily deeper than this; the point of
+/// exposing it is that running out is now reported as "did not reach", not as
+/// "no such pattern".
+pub const DEFAULT_ACTION_NODES: usize = 600;
+pub const DEFAULT_ACTION_DEPTH: usize = 10;
+
+/// Invoke a control through its accessibility Invoke pattern.
+///
+/// Returns `None` when the control has no invoke pattern (caller should fall back
+/// to a click). A search that ran out of tree before it ever met the control
+/// answers `Err` and says so: that is not a missing pattern, and treating it as
+/// one sends the caller to coordinates for a control nobody looked at.
 pub fn invoke(name: &str) -> Result<Option<UiNode>> {
     #[cfg(windows)]
     {
@@ -389,8 +401,26 @@ pub fn invoke(name: &str) -> Result<Option<UiNode>> {
     }
 }
 
+/// [`invoke`] with the traversal limits chosen by the caller.
+///
+/// Only AT-SPI honours them: UIA walks the element tree live and has no node
+/// budget to run out of, so the numbers are ignored there rather than faked.
+pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
+    #[cfg(windows)]
+    {
+        let _ = (max_nodes, max_depth);
+        imp::invoke(name)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::invoke_with(name, max_nodes, max_depth)
+    }
+}
+
 /// Set a control's text through its Value/EditableText pattern. Returns `None`
-/// when unsupported (caller can fall back to focus + typing).
+/// when the control does not expose that pattern (caller can fall back to focus +
+/// typing); a search that stopped before reaching it answers `Err`, per
+/// [`invoke`].
 pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     #[cfg(windows)]
     {
@@ -399,6 +429,25 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     #[cfg(not(windows))]
     {
         atspi::set_value(name, text)
+    }
+}
+
+/// [`set_value`] with the traversal limits chosen by the caller; see
+/// [`invoke_with`] for why UIA ignores them.
+pub fn set_value_with(
+    name: &str,
+    text: &str,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<UiNode>> {
+    #[cfg(windows)]
+    {
+        let _ = (max_nodes, max_depth);
+        imp::set_value(name, text)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::set_value_with(name, text, max_nodes, max_depth)
     }
 }
 

@@ -192,6 +192,9 @@ const WALK_BUDGET: Duration = Duration::from_millis(6000);
 /// What one traversal produced: the nodes it read, plus what it could not read.
 struct WalkReport {
     truncated: bool,
+    /// How many nodes were actually looked at, so a capped search can say
+    /// how far it got rather than only that it stopped.
+    visited: usize,
     unreadable: Vec<crate::Unreadable>,
 }
 
@@ -454,6 +457,7 @@ fn walk_from(
         if visit(conn, &node, &dest, &path) {
             return Ok(WalkReport {
                 truncated,
+                visited,
                 unreadable,
             });
         }
@@ -468,6 +472,7 @@ fn walk_from(
 
     Ok(WalkReport {
         truncated,
+        visited,
         unreadable,
     })
 }
@@ -749,15 +754,36 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
     Ok(pick(name, visited.into_iter()))
 }
 
+/// The walk ran out of tree before it met the control.
+///
+/// `Ok(None)` means "this control does not expose that pattern", and callers act
+/// on it by falling back to coordinates. A search that stopped early is a
+/// different fact, and dressing it up as that one is how a capped walk turns into
+/// a click on the wrong pixel.
+fn capped(name: &str, action: &str, visited: usize, max_nodes: usize, max_depth: usize) -> Error {
+    Error::Capture(format!(
+        "did not reach {action} on {name:?}: the walk stopped after {visited} node(s) at depth {max_depth} with the tree still truncated (max_nodes={max_nodes}); raise max_nodes, or fall back to coordinates knowingly -- this is not \"the control lacks the pattern\""
+    ))
+}
+
 /// Fire the control's first AT-SPI action (usually "click"/"press").
 ///
 /// A control nobody answered is an `Err`, not `Ok(None)`: the caller's documented
 /// response to `None` is a coordinate click, and dropping to coordinates because a
 /// toolkit was silent is exactly the mistake this backend keeps having to unmake.
 pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+    invoke_with(
+        name,
+        crate::DEFAULT_ACTION_NODES,
+        crate::DEFAULT_ACTION_DEPTH,
+    )
+}
+
+/// [`invoke`] with the traversal limits spelled out.
+pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
     let mut hit = None;
     let mut silence: Option<String> = None;
-    walk(600, 10, &mut |conn, node, dest, path| {
+    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
@@ -789,8 +815,13 @@ pub fn invoke(name: &str) -> Result<Option<UiNode>> {
         false
     })?;
     if hit.is_none() {
+        // Silence first: we did meet a control by that name, and it is the more
+        // specific fact than "the walk ran out".
         if let Some(reason) = silence {
             return Err(unanswered_call("invoke", name, &reason));
+        }
+        if report.truncated {
+            return Err(capped(name, "invoke", report.visited, max_nodes, max_depth));
         }
     }
     Ok(hit)
@@ -799,9 +830,24 @@ pub fn invoke(name: &str) -> Result<Option<UiNode>> {
 /// Replace text through the EditableText interface. See [`invoke`] for why a
 /// silent toolkit is an `Err` here rather than a `None`.
 pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+    set_value_with(
+        name,
+        text,
+        crate::DEFAULT_ACTION_NODES,
+        crate::DEFAULT_ACTION_DEPTH,
+    )
+}
+
+/// [`set_value`] with the traversal limits spelled out.
+pub fn set_value_with(
+    name: &str,
+    text: &str,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<UiNode>> {
     let mut hit = None;
     let mut silence: Option<String> = None;
-    walk(600, 10, &mut |conn, node, dest, path| {
+    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
@@ -837,6 +883,15 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     if hit.is_none() {
         if let Some(reason) = silence {
             return Err(unanswered_call("set_value", name, &reason));
+        }
+        if report.truncated {
+            return Err(capped(
+                name,
+                "set_value",
+                report.visited,
+                max_nodes,
+                max_depth,
+            ));
         }
     }
     Ok(hit)
@@ -1195,6 +1250,31 @@ mod tests {
         assert!(
             message.contains("This is not \"the control has no invoke pattern\""),
             "must name the misreading it prevents: {message}"
+        );
+    }
+
+    #[test]
+    fn a_capped_search_blames_the_cap_not_the_control() {
+        // The whole point of item 7: this message is what keeps a caller from
+        // reading "no pattern" and dropping to a coordinate click.
+        let message = capped("probe-entry", "set_value", 1, 1, 10).to_string();
+        assert!(
+            message.starts_with("accessibility lookup failed: "),
+            "the label must not send the reader to a screenshot problem: {message}"
+        );
+        assert!(
+            message.contains("did not reach set_value on \"probe-entry\""),
+            "{message}"
+        );
+        assert!(message.contains("after 1 node(s)"), "{message}");
+        assert!(message.contains("max_nodes=1"), "{message}");
+        assert!(
+            message.contains("not \"the control lacks the pattern\""),
+            "must name the misreading it is preventing: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("no such pattern"),
+            "the old wording must not survive in the new one"
         );
     }
 

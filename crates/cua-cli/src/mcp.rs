@@ -350,6 +350,22 @@ fn ensure_on_screen(x: i64, y: i64) -> std::result::Result<(), Value> {
     Ok(())
 }
 
+/// Traversal budget for a name-based action, so a caller can widen it and -- more
+/// usefully -- narrow it in a test. A walk that runs out answers "did not reach",
+/// which must never be read as "this control has no pattern".
+fn action_limits(args: &Value) -> (usize, usize) {
+    (
+        args["max_nodes"]
+            .as_u64()
+            .map(|n| n.clamp(1, 100_000) as usize)
+            .unwrap_or(cua_engine_access::DEFAULT_ACTION_NODES),
+        args["max_depth"]
+            .as_u64()
+            .map(|d| d.clamp(1, 64) as usize)
+            .unwrap_or(cua_engine_access::DEFAULT_ACTION_DEPTH),
+    )
+}
+
 fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
     args[key]
         .as_str()
@@ -1602,7 +1618,8 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            match cua_engine_access::set_value(&name, &text) {
+            let (max_nodes, max_depth) = action_limits(args);
+            match cua_engine_access::set_value_with(&name, &text, max_nodes, max_depth) {
                 Ok(Some(node)) => tool_ok(format!(
                     "set text of {} \"{}\" ({} chars)",
                     node.control_type,
@@ -1806,7 +1823,8 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             // Prefer the accessibility Invoke pattern: no pointer movement and
             // immune to overlapping windows.
-            match cua_engine_access::invoke(&name) {
+            let (max_nodes, max_depth) = action_limits(args);
+            match cua_engine_access::invoke_with(&name, max_nodes, max_depth) {
                 Ok(Some(node)) => {
                     return tool_ok(format!(
                         "invoked {} \"{}\" via accessibility pattern",
@@ -2370,12 +2388,14 @@ fn tool_defs() -> Value {
         },
         {
             "name": "set_control_text",
-            "description": "Set a control's text through its Value/EditableText accessibility pattern (no synthetic keystrokes). Use type_text when the control has no such pattern.",
+            "description": "Set a control's text through its Value/EditableText accessibility pattern (no synthetic keystrokes). Use type_text when the control has no such pattern. A walk that runs out of nodes says so instead of reporting a missing pattern; widen with max_nodes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
-                    "text": { "type": "string" }
+                    "text": { "type": "string" },
+                    "max_nodes": { "type": "integer", "minimum": 1 },
+                    "max_depth": { "type": "integer", "minimum": 1 }
                 },
                 "required": ["name", "text"]
             }
@@ -2391,10 +2411,14 @@ fn tool_defs() -> Value {
         },
         {
             "name": "invoke_control",
-            "description": "Invoke a control by accessible name (Invoke pattern first, click-center fallback).",
+            "description": "Invoke a control by accessible name (Invoke pattern first, click-center fallback). A walk that stopped early reports \"did not reach\" rather than \"no pattern\"; raise max_nodes.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "name": { "type": "string" } },
+                "properties": {
+                    "name": { "type": "string" },
+                    "max_nodes": { "type": "integer", "minimum": 1 },
+                    "max_depth": { "type": "integer", "minimum": 1 }
+                },
                 "required": ["name"]
             }
         },

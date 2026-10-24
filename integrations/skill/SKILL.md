@@ -33,6 +33,7 @@ Precise UI control (prefer over pixels)
 - `invoke_element {index, observation_id?}` — Invoke pattern first, click-centre fallback.
 - `set_element_value {index, text, observation_id?}` — Value/EditableText pattern, no keystrokes.
 - `invoke_control {name}` / `set_control_text {name, text}` / `control_state {name}` — same by accessible name. `control_state` works on both platforms and uses the same vocabulary on each (`toggle`: `on`/`off`/`indeterminate`; `expanded`: `expanded`/`collapsed`/`partially_expanded`/`leaf`). On Linux `value` and `range_value` stay absent, so read a field's text from the tree instead; `toggle` only appears for a control that says it is checkable, so a missing `toggle` means "not a toggle", not "off".
+  Both name-based actions take an optional `max_nodes`/`max_depth`. Read their failures precisely: `did not reach` means the search ran out of tree — raise `max_nodes` and retry, do **not** go hunting by coordinates, because the control may be fine and simply unseen. Only a `None`-style answer means the control genuinely lacks the pattern.
 
 Raw input
 

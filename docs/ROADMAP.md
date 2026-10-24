@@ -126,7 +126,7 @@
   序号表照 at-spi2-core 的 `atspi-constants.h` 数出来：第一份文档给的 VISIBLE/HORIZONTAL
   各差一位，而这种错位不会报错，只会把一个状态读成另一个。probe 因此让 GTK 自己写
   `toggled` 信号当独立 oracle——总线的数字不等于控件的真相。
-  **还差**：`invoke` 后的效果校验（第 8 项）。
+  **还差**：`invoke` 后的效果校验（第 8 项）——第 7 项（写死的 600/10 与 `None` 的含义）见下面一条。
 - [x] 动作路径同样上期限，并且不再把沉默说成"不支持"（#28 自留边界的收尾）：
   `DoAction` / `SetTextContents` / `GetState` 走同一个 `timed` 期限；结果分三类
   （答了 / 没这个接口 / 没人答），只有第三类变成 `Error::Lookup` 并写明
@@ -137,7 +137,7 @@
 - [x] AT-SPI 读不到时不再无声（issue #11 第 6 项，契约定为**带诊断的部分成功**）：
   `UiSnapshot` 多一本 `unreadable` 账（bus + 对象路径 + 哪几个读没应答），
   `accessibility_tree` 树尾点名（最多 6 条再给计数）、`window_state` 里条件性出现
-  `accessibility.unreadable`；单次调用超时 1200ms（zbus 5 `method_timeout`，不是 4 的
+  `accessibility.unreadable`；单次调用最多等 1200ms（一开始按 zbus 5 `method_timeout` 写的，不是 4 的
   `general_timeout`）。关键是**把"没人答"和"这控件没这接口"分开**——
   `UnknownInterface`/`UnknownProperty`/`NotSupported` 不记账，否则每个 panel 都是"故障"，
   真装死的应用反倒被淹。**超时不是 zbus 给的**：blocking API 的 `Proxy::call` 只 `block_on`，
@@ -149,4 +149,12 @@
   服务器活着（0.01s），再取桌面树，断言"活着的仍在树里 + 说不出读不到的不行 + 整体 <10s"；
   修复前第一条就过、后两条红，这正是原 bug 的形状（观测"成功"，只是静默少了一块）。
   UIA 侧没做同一本账，恒空并注明原因。
+- [x] `invoke` / `set_value` 不再把"没走到"说成"没有那个模式"（issue #11 第 7 项）：
+  两者原本各自写死 600/10，而 `Ok(None)` 在文档里等于"控件没有该模式"、调用方据此降级成坐标点击
+  ——桌面大一点、搜索被截断，就会被误报成"不支持"。现在 `invoke_with`/`set_value_with` 把上限交给
+  调用方（默认仍是 600/10，收敛到一处常量），工具侧 `invoke_control`/`set_control_text` 新增可选
+  `max_nodes`/`max_depth`；**被截断又没找到 → 返回 `Err` 并写清走了多少节点、上限多少、树仍截断**，
+  `None` 恢复成它真正表达的东西。UIA 的遍历不按节点预算走，那边的数字是"忽略"而不是"假装生效"。
+  CI 每场景配一对：预算 1 必须报"没走到"、默认预算必须成功——红绿因此只归因于预算本身。
+  已知同类未修：`find_control` 的 400/8 仍是写死的，它返回 `None` 时同样分不清这两种情况。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"

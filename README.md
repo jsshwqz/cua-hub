@@ -134,9 +134,9 @@ export OPENROUTER_API_KEY=sk-or-...
 | `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |
 | `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选 |
 | `accessibility_tree` | 带编号的桌面级 UIA 树（窗口/按钮/输入框 + 矩形）；日常观测请用 `window_state`。Linux 上如果某些应用没应答，树尾会列出 `! parts of this tree were not read:`（最多点名 6 个子树，其余给条数）——少节点不再无声 |
-| `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心 |
+| `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心。`invoke_control` 可选 `max_nodes`/`max_depth`：搜遍仍没找到且树被截断时返回 `did not reach`（说明预算不够），返回 `None` 才真的是控件没有该模式 |
 | `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |
-| `set_control_text` / `set_element_value` | 用 Value/EditableText 模式按名称/编号直接设值（不模拟键盘） |
+| `set_control_text` / `set_element_value` | 用 Value/EditableText 模式按名称/编号直接设值（不模拟键盘）。`set_control_text` 同样接受可选 `max_nodes`/`max_depth`，遍历被截断时报"没走到"而不是"控件不支持" |
 | `control_state` | 读取启用/可见、勾选、展开状态、范围值。两平台都实现：Windows 走 UIA 的 Toggle/ExpandCollapse/Value/RangeValue 模式，Linux 走 AT-SPI 的 `GetState` 位图（`toggle` = `on`/`off`/`indeterminate`，`expanded` = `expanded`/`collapsed`/`partially_expanded`/`leaf`，口径一致）。Linux 侧 `value` 与 `range_value` 暂不填——那两个在 Text / Value 接口后面，还没接 |
 | `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽；`click` 支持 `observation_id`+`element_index`，或 `observation_id`+`screenshot_id`+`x/y`（弹层图片的坐标系与主窗口不同，必须指名） |
 | `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
