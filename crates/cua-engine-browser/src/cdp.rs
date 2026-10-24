@@ -295,7 +295,7 @@ fn find_browser() -> Option<PathBuf> {
 /// Can we actually start this path? A directory is not a browser.
 #[cfg(unix)]
 fn is_launchable(path: &Path) -> bool {
-    use std::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
