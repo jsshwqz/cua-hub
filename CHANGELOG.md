@@ -86,7 +86,7 @@ Unix `kill -0`）——不是"句柄没了"这种同义反复。
 | 把守卫的 `Drop` 改成空实现 | `a_dropped_guard_kills_a_live_child_and_removes_the_profile` 与 `a_failed_launch_leaves_no_profile_behind` 同时红：`pid 18232 outlived the guard that owned it`、临时目录列表里多出条目 |
 | 把 `claim_profile_dir` 退回 `create_dir_all` | `a_stale_profile_is_never_adopted` 红：`an occupied profile directory was handed out again` |
 | 把收尾改回"只 kill 句柄 + 删目录" | 真机那条 `--ignored` 红：`profile "D:\\Temp\\cua-hub-browser-10920-0-222119000" survived the session drop` |
-| 修复后 | `cargo test -p cua-engine-browser` 5 过 1 ignore；`-- --ignored` 真机过；`browser_smoke`（走真实 session 收尾）前后对照 **8 进程 + 717 文件目录 → 0 + 0** |
+| 修复后 | `cargo test -p cua-engine-browser` 13 过 1 ignore；`-- --ignored` 真机过；`browser_smoke`（走真实 session 收尾）前后对照 **8 进程 + 717 文件目录 → 0 + 0** |
 
 已知边界：CI 上没有浏览器，`a_real_browser_session_leaves_nothing_behind` 只能真机跑
 （`cargo test -p cua-engine-browser -- --ignored`）；Windows 上的反查每次收尾起一个
@@ -119,7 +119,8 @@ PowerShell 进程（约 0.2~0.5 秒），只发生在 session 结束时；macOS 
 ### 测试与验证（issue #11 第一批）
 
 - 新增 5 条纯函数测试（`pick` 的四种选择情形 + `app_matches` 的空名）。`atspi.rs` 在每个
-  宿主上都编译（只有非 Windows 才会被调用），所以这些断言本机就绿。
+  宿主上都编译（只有非 Windows 才会被调用），所以这些断言本机也跑；workspace 执行数
+  **109 → 114**。
   **两处负控实测**：把早停塞回 `pick` 的循环 → `the_button_wins_over_the_label_listed_before_it`
   红（`left: "Label" / right: "Button"`）；去掉空名守卫 → `a_nameless_application_matches_no_query`
   红（`assertion failed: !app_matches("", "", "thunar")`）。
