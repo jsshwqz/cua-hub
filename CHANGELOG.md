@@ -238,6 +238,13 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
   `connection closed` 必须进账且长度受限、`shorten` 只留一行截到 160、账本点名 6 条后
   仍报剩余条数、以及**永不返回的读会被期限截下且同一 bus 在冷却窗口内不再重试**
   （这条不要真总线，用一个死循环闭包就能证）。
+- 分类器第一版把 `UnknownMethod` 漏了，CI 的健康树因此出现误报（`[:1.19] extents:
+  UnknownMethod: Method "GetExtents" … does not exist`——那是没有 Component 接口的应用根节点，
+  而同一行输出里 `[:1.20] no reply within 1200ms` 才是真装死的那个）。补 `UnknownMethod` /
+  `UnknownObject`，并加一条**反向断言**：健康的窗口必须什么都不报。缺了它，一个喊狼来的
+  分类器照样全绿。夹具用的是那条真回复的原文。
+- 动作路径（`invoke_control` / `set_control_text` / `control_state`）**仍未包期限**：
+  对装死的应用它们会挂住不返回。不在"加了超时"这句话里混过去，见 PR 的已知边界。
 - **端到端红/绿排在 CI 图形作业里**：新阶段起两个 probe，`SIGSTOP` 其中一个，再取桌面树，
   三条断言——① 活着那个应用仍在树里（不是整次失败）；② 输出点名读不到的部分；
   ③ 整体耗时 <10s。提交 `ac75429` 只有断言，应当红在 ②③。
