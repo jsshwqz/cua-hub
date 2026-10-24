@@ -1611,7 +1611,9 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             match cua_engine_access::state(&name) {
                 Ok(Some(state)) => tool_ok(json!(state)),
-                Ok(None) => tool_err(format!("no state available for control {name:?}")),
+                Ok(None) => tool_err(format!(
+                    "no control named {name:?} was found to read state from"
+                )),
                 Err(e) => tool_err(e),
             }
         }

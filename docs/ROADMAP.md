@@ -119,6 +119,12 @@
   **第 1 项也已做**：Linux 的浏览器发现——候选是相对名而 `exists()` 查的是 CWD 不是 PATH，
   装着 `/usr/bin/chromium` 的机器不设 `CUA_HUB_BROWSER` 就报"no Chrome/Edge found"；
   现在按 PATH 找、返回绝对路径，并把"存在"收紧成"是文件且可执行"。
-  **下一批要真图形会话**：`GetState` 读状态、遍历超时与错误上报、`invoke` 后的效果校验、
-  `invoke`/`set_value` 写死的 600/10 上限。
+- [x] Linux 的 `control_state`（issue #11 第 3 项）：接到 `org.a11y.atspi.Accessible.GetState`
+  ——无入参、回 `au`（按 `AtspiStateType` 序号排的 u32 位图，32 号以上落在第二个字）。
+  字段口径与 Windows 一致；`toggle`/`expanded` 只在控件自称可勾选/可展开时出现，
+  没观察到的状态不写成 `off`；`value`/`range_value` 明确留空（在 Text / Value 接口后面）。
+  序号表照 at-spi2-core 的 `atspi-constants.h` 数出来：第一份文档给的 VISIBLE/HORIZONTAL
+  各差一位，而这种错位不会报错，只会把一个状态读成另一个。probe 因此让 GTK 自己写
+  `toggled` 信号当独立 oracle——总线的数字不等于控件的真相。
+  **还差**：遍历超时与错误上报、`invoke` 后的效果校验、`invoke`/`set_value` 写死的 600/10 上限。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"

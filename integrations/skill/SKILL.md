@@ -32,7 +32,7 @@ Precise UI control (prefer over pixels)
 - `perform_secondary_action {observation_id, element_index, action}` — an accessibility action besides a click: `Expand`, `Collapse`, `Raise`, `Scroll Up/Down/Left/Right`, `Toggle`, `Select`, `Focus`, `Invoke`. Only use names the element lists in its `actions=` in the tree; a guessed name returns `unsupported_action` with the real list, and the element's state is read back afterwards so you can verify.
 - `invoke_element {index, observation_id?}` — Invoke pattern first, click-centre fallback.
 - `set_element_value {index, text, observation_id?}` — Value/EditableText pattern, no keystrokes.
-- `invoke_control {name}` / `set_control_text {name, text}` / `control_state {name}` — same by accessible name. `control_state` is implemented for Windows only; elsewhere it answers `not supported on this platform` rather than pretending the control has no state.
+- `invoke_control {name}` / `set_control_text {name, text}` / `control_state {name}` — same by accessible name. `control_state` works on both platforms and uses the same vocabulary on each (`toggle`: `on`/`off`/`indeterminate`; `expanded`: `expanded`/`collapsed`/`partially_expanded`/`leaf`). On Linux `value` and `range_value` stay absent, so read a field's text from the tree instead; `toggle` only appears for a control that says it is checkable, so a missing `toggle` means "not a toggle", not "off".
 
 Raw input
 

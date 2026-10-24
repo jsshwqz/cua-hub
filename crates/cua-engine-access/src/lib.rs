@@ -353,9 +353,10 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
 
 /// Read common state fields from a control.
 ///
-/// `Ok(None)` means the control was found but exposes no state. On non-Windows
-/// platforms this returns `Err(Unsupported)` instead, because the AT-SPI backend
-/// does not read state yet -- see [`state`](atspi::state) for the distinction.
+/// `Ok(None)` means no control of that name was found. Both platforms read
+/// enabled / offscreen / toggle / expanded; on AT-SPI `value` and `range_value`
+/// are still `None`, because the text lives behind the Text interface and a
+/// slider's number behind the Value one, neither of which is queried here.
 pub fn state(name: &str) -> Result<Option<ControlState>> {
     #[cfg(windows)]
     {
