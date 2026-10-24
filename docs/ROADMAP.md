@@ -126,7 +126,14 @@
   序号表照 at-spi2-core 的 `atspi-constants.h` 数出来：第一份文档给的 VISIBLE/HORIZONTAL
   各差一位，而这种错位不会报错，只会把一个状态读成另一个。probe 因此让 GTK 自己写
   `toggled` 信号当独立 oracle——总线的数字不等于控件的真相。
-  **还差**：`invoke` 后的效果校验、`invoke`/`set_value` 写死的 600/10 上限。
+  **还差**：`invoke` 后的效果校验（第 8 项）。
+- [x] 动作路径同样上期限，并且不再把沉默说成"不支持"（#28 自留边界的收尾）：
+  `DoAction` / `SetTextContents` / `GetState` 走同一个 `timed` 期限；结果分三类
+  （答了 / 没这个接口 / 没人答），只有第三类变成 `Error::Lookup` 并写明
+  "这不是'控件没有该模式'"。顺手修掉同族的一处：旧写法 `.is_ok()` 把工具包
+  **明确拒绝**（回 `false`）也当成触发成功，现在只认 `Answered(true)`。
+  证明放在能确定性触发的那一层（`classify` 拆成纯函数 + 两条本机单测），
+  CI 那三条只当不变量守卫并在脚本注释里说明它们为什么不算证据。
 - [x] AT-SPI 读不到时不再无声（issue #11 第 6 项，契约定为**带诊断的部分成功**）：
   `UiSnapshot` 多一本 `unreadable` 账（bus + 对象路径 + 哪几个读没应答），
   `accessibility_tree` 树尾点名（最多 6 条再给计数）、`window_state` 里条件性出现

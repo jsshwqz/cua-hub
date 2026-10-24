@@ -243,13 +243,35 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
   而同一行输出里 `[:1.20] no reply within 1200ms` 才是真装死的那个）。补 `UnknownMethod` /
   `UnknownObject`，并加一条**反向断言**：健康的窗口必须什么都不报。缺了它，一个喊狼来的
   分类器照样全绿。夹具用的是那条真回复的原文。
-- 动作路径（`invoke_control` / `set_control_text` / `control_state`）**仍未包期限**：
-  对装死的应用它们会挂住不返回。不在"加了超时"这句话里混过去，见 PR 的已知边界。
+- 动作路径（`invoke_control` / `set_control_text` / `control_state`）当时**仍未包期限**，
+  对装死的应用会挂住不返回——不在"加了超时"这句话里混过去。下面一节把它闭合了。
 - **端到端红/绿排在 CI 图形作业里**：新阶段起两个 probe，`SIGSTOP` 其中一个，再取桌面树，
   三条断言——① 活着那个应用仍在树里（不是整次失败）；② 输出点名读不到的部分；
-  ③ 整体耗时 <10s。提交 `ac75429` 只有断言，应当红在 ②③。
+  ③ 整体耗时 <10s。
   **①在修复前就是通的**，这不是我写错的断言，而是这个 bug 的形状：观测"成功"返回，
   只是静默少了东西。
+
+### 补：动作路径也在期限内，并且不再把沉默当成"不支持"（#28 自己声明的边界）
+
+第 6 项合入前我在 PR 里留了一条边界：**只有树被期限保护**，`invoke_control` /
+`set_control_text` / `control_state` 对装死的应用仍会挂住。这条现在闭合了，
+过程里又挖出同一族的两个问题：
+
+- **沉默、"没这个接口"、"答了"是三件事**。旧代码里 `DoAction` / `SetTextContents` 的
+  失败和"这个控件没有 Action / EditableText 接口"走同一个分支，最终都变成 `Ok(None)`——
+  而 `None` 的文档含义是"控件没有该模式"，调用方据此降级成坐标点击。现在统一走
+  `classify()` 三分类，沉默返回 `Error::Lookup`，消息里直接写明
+  "This is not \"the control has no invoke pattern\""。
+- **`DoAction` 的回包 bool 之前被无视**：旧写法是 `.is_ok()`，也就是一把拿"工具包明确回答
+  我拒绝了"也算触发成功。现在只有 `Answered(true)` 才算。这跟当年 `SetTextContents`
+  把 bool 解成 `()` 是同一类错误，只是这次方向相反。
+- **证明放在能确定性触发的地方**：三分类由本机两条单测钉住（`classify` 拆成纯函数，
+  喂死循环 / `UnknownInterface` / `NoReply` 三种输入）。CI 里那三条"动作也要有界限"
+  的断言**只是不变量守卫，不是这条修复的证据**——因为树已经先跳过了聋掉的应用，
+  动作只会打到活着的那个，修复前那三条同样会绿。这一点写在脚本注释里，
+  免得有人把它们当成红/绿对照。
+  负控：把 `classify` 的 `NoReply` 分支折回 `NoPattern`（= 修复前的形状），
+  `a_silent_toolkit_is_not_reported_as_a_missing_pattern` 立刻红。
 
 ## 0.1.5 — 2026-10-23
 

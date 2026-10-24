@@ -256,6 +256,41 @@ def hung_application() -> None:
         f"elapsed={elapsed:.1f}s",
     )
 
+    # The tree is not the only thing that can be pinned by a frozen peer, so this
+    # checks the invariant holds for the action calls too: either an answer, or an
+    # explicit "nobody replied" -- never a wait that outlasts the caller's patience.
+    #
+    # Honest about what this is NOT: it is a guard, not the proof of the fix. With
+    # the tree already skipping the deaf application, an action only ever reaches
+    # the live one here, so these lines would pass without the action deadline as
+    # well. The thing that actually pins the three-way classification -- reply /
+    # "no such interface" / silence -- is the local unit test
+    # `a_silent_toolkit_is_not_reported_as_a_missing_pattern`, which can force all
+    # three cases and does not depend on which application the walk happens to
+    # reach first.
+    for tool, arguments in (
+        ("invoke_control", {"name": "probe-toggle"}),
+        ("set_control_text", {"name": "probe-entry", "text": "STILL-BOUNDED"}),
+        ("control_state", {"name": "probe-toggle"}),
+    ):
+        started_at = time.time()
+        try:
+            outcome = call(tool, arguments, timeout=90)
+        except (urllib.error.URLError, OSError) as exc:
+            outcome = {
+                "is_error": True,
+                "text": f"never returned: {exc}",
+                "json": None,
+                "images": 0,
+            }
+        took = time.time() - started_at
+        replied = (not outcome["is_error"]) or "did not get an answer" in outcome["text"]
+        check(
+            f"[hung] {tool} against a frozen peer answers or says silence, never hangs",
+            replied and took < 30,
+            f"elapsed={took:.1f}s {outcome['text'][:140]}",
+        )
+
     os.kill(procs["hung"].pid, signal.SIGCONT)
     for proc in procs.values():
         proc.terminate()

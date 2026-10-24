@@ -52,6 +52,79 @@ enum Stall {
     CoolingDown,
 }
 
+/// Why a single bus call ended the way it did.
+#[derive(Debug)]
+enum Attempt<T> {
+    /// The toolkit replied.
+    Answered(T),
+    /// It answered "I do not implement that": a fact about the control.
+    NoPattern(String),
+    /// It said nothing, or was already known deaf. We know nothing here.
+    Unanswered(String),
+}
+
+/// One method call, deadline-bounded and classified.
+///
+/// The three-way split is the point. Before this, silence fell through to the
+/// same branch as "no such interface", so an application that never answered was
+/// reported as a control that cannot be invoked -- and the caller's documented
+/// response to that is a coordinate click.
+fn attempted<T, F>(conn: &Connection, bus: &str, work: F) -> Attempt<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Connection) -> std::result::Result<T, String> + Send + 'static,
+{
+    let owned = conn.clone();
+    classify(timed(bus, move || work(owned)))
+}
+
+/// The classification on its own, so it can be tested without a bus: silence, an
+/// absent interface and a reply are three different facts.
+fn classify<T>(outcome: std::result::Result<std::result::Result<T, String>, Stall>) -> Attempt<T> {
+    match outcome {
+        Err(Stall::NoReply) => {
+            Attempt::Unanswered(format!("no reply within {}ms", CALL_TIMEOUT.as_millis()))
+        }
+        Err(Stall::CoolingDown) => Attempt::Unanswered(format!(
+            "not attempted: this bus was deaf within the last {}s",
+            WEDGED_COOLDOWN.as_secs()
+        )),
+        Ok(Ok(value)) => Attempt::Answered(value),
+        Ok(Err(reason)) => match unanswered(&reason) {
+            Some(_) => Attempt::Unanswered(reason),
+            None => Attempt::NoPattern(reason),
+        },
+    }
+}
+
+/// The one failure a caller must not act on, phrased so they cannot misread it.
+fn unanswered_call(what: &str, name: &str, reason: &str) -> Error {
+    Error::Lookup(format!(
+        "did not get an answer for {what} on {name:?}: {reason}. This is not \"the control has no {what} pattern\" -- nobody replied, so the control may well support it"
+    ))
+}
+
+/// Build a proxy and call one method, keeping the bus's own wording for failures.
+fn proxy_call<T, B>(
+    conn: &Connection,
+    dest: &str,
+    path: &str,
+    iface: &str,
+    method: &str,
+    body: &B,
+) -> std::result::Result<T, String>
+where
+    T: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
+    B: serde::ser::Serialize + zbus::zvariant::DynamicType,
+{
+    match Proxy::new(conn, dest, path, iface) {
+        Ok(proxy) => proxy
+            .call::<_, _, T>(method, body)
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn mark_wedged(bus: &str) {
     if let Ok(mut guard) = WEDGED.lock() {
         let map = guard.get_or_insert_with(Default::default);
@@ -677,45 +750,95 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
 }
 
 /// Fire the control's first AT-SPI action (usually "click"/"press").
+///
+/// A control nobody answered is an `Err`, not `Ok(None)`: the caller's documented
+/// response to `None` is a coordinate click, and dropping to coordinates because a
+/// toolkit was silent is exactly the mistake this backend keeps having to unmake.
 pub fn invoke(name: &str) -> Result<Option<UiNode>> {
     let mut hit = None;
+    let mut silence: Option<String> = None;
     walk(600, 10, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
-        if let Ok(action) = Proxy::new(conn, dest, path, "org.a11y.atspi.Action") {
-            if action.call::<_, _, bool>("DoAction", &(0i32,)).is_ok() {
+        let dest_owned = dest.to_string();
+        let path_owned = path.to_string();
+        match attempted(conn, dest, move |conn| {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest_owned,
+                &path_owned,
+                "org.a11y.atspi.Action",
+                "DoAction",
+                &(0i32,),
+            )
+        }) {
+            // DoAction answers with its own success boolean, so a reply of
+            // `false` is "the toolkit refused", not "the control fired": only the
+            // first counts as an invoke.
+            Attempt::Answered(true) => {
                 hit = Some(node.clone());
                 return true;
             }
+            Attempt::Answered(false) => {}
+            Attempt::Unanswered(reason) => {
+                silence = Some(reason);
+            }
+            Attempt::NoPattern(_) => {}
         }
         false
     })?;
+    if hit.is_none() {
+        if let Some(reason) = silence {
+            return Err(unanswered_call("invoke", name, &reason));
+        }
+    }
     Ok(hit)
 }
 
-/// Replace text through the EditableText interface.
+/// Replace text through the EditableText interface. See [`invoke`] for why a
+/// silent toolkit is an `Err` here rather than a `None`.
 pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     let mut hit = None;
+    let mut silence: Option<String> = None;
     walk(600, 10, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
-        if let Ok(editable) = Proxy::new(conn, dest, path, "org.a11y.atspi.EditableText") {
+        let dest_owned = dest.to_string();
+        let path_owned = path.to_string();
+        let text_owned = text.to_string();
+        match attempted(conn, dest, move |conn| {
             // SetTextContents answers with a boolean. Decoding it as nothing
             // made a call that the toolkit *had* applied look like a control
             // without the interface, which is the opposite of what the caller
             // needs to know.
-            if editable
-                .call::<_, _, bool>("SetTextContents", &(text,))
-                .unwrap_or(false)
-            {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest_owned,
+                &path_owned,
+                "org.a11y.atspi.EditableText",
+                "SetTextContents",
+                &(text_owned,),
+            )
+        }) {
+            Attempt::Answered(true) => {
                 hit = Some(node.clone());
                 return true;
             }
+            Attempt::Answered(false) => {}
+            Attempt::Unanswered(reason) => {
+                silence = Some(reason);
+            }
+            Attempt::NoPattern(_) => {}
         }
         false
     })?;
+    if hit.is_none() {
+        if let Some(reason) = silence {
+            return Err(unanswered_call("set_value", name, &reason));
+        }
+    }
     Ok(hit)
 }
 
@@ -796,12 +919,28 @@ fn decode_state(node: &UiNode, words: &[u32]) -> crate::ControlState {
 }
 
 /// `org.a11y.atspi.Accessible.GetState`: no arguments, an array of u32.
+///
+/// Bounded like every other call: `control_state` on a wedged application used to
+/// wait on the peer forever, which is the same silence the tree walk now reports.
 fn state_words(conn: &Connection, dest: &str, path: &str) -> Result<Vec<u32>> {
-    let proxy = Proxy::new(conn, dest, path, "org.a11y.atspi.Accessible")
-        .map_err(|e| Error::Capture(format!("state proxy {path}: {e}")))?;
-    proxy
-        .call::<_, _, Vec<u32>>("GetState", &())
-        .map_err(|e| Error::Capture(format!("GetState {path}: {e}")))
+    let dest_owned = dest.to_string();
+    let path_owned = path.to_string();
+    match attempted(conn, dest, move |owned| {
+        proxy_call::<Vec<u32>, _>(
+            &owned,
+            &dest_owned,
+            &path_owned,
+            "org.a11y.atspi.Accessible",
+            "GetState",
+            &(),
+        )
+    }) {
+        Attempt::Answered(words) => Ok(words),
+        Attempt::NoPattern(reason) => Err(Error::Capture(format!("GetState {path}: {reason}"))),
+        Attempt::Unanswered(reason) => Err(Error::Lookup(format!(
+            "did not get state for {path}: {reason}. This is not \"the control has no state\""
+        ))),
+    }
 }
 
 /// Read one control's state by accessible name.
@@ -1002,6 +1141,61 @@ mod tests {
         assert_eq!(atspi_state::VISIBLE, 30);
         assert_eq!(atspi_state::INDETERMINATE, 32);
         assert_eq!(atspi_state::CHECKABLE, 41);
+    }
+
+    #[test]
+    fn a_silent_toolkit_is_not_reported_as_a_missing_pattern() {
+        // The proof of the action-side fix, and deliberately not a CI check: only
+        // here can all three outcomes be forced regardless of which application
+        // the walk happens to reach first.
+        assert!(matches!(classify(Ok(Ok(true))), Attempt::Answered(true)));
+
+        match classify::<bool>(Err(Stall::NoReply)) {
+            Attempt::Unanswered(reason) => assert!(
+                reason.contains("no reply within"),
+                "the deadline must say it was the deadline: {reason}"
+            ),
+            other => panic!("a stalled call must be Unanswered, got {other:?}"),
+        }
+        match classify::<bool>(Err(Stall::CoolingDown)) {
+            Attempt::Unanswered(reason) => assert!(reason.contains("was deaf"), "{reason}"),
+            other => panic!("a cooled-down bus is still silence, got {other:?}"),
+        }
+
+        // "I do not implement that" is a fact about the control.
+        match classify::<bool>(Ok(Err(
+            "org.freedesktop.DBus.Error.UnknownInterface: nope".into()
+        ))) {
+            Attempt::NoPattern(reason) => assert!(reason.contains("UnknownInterface"), "{reason}"),
+            other => panic!("an absent interface must be NoPattern, got {other:?}"),
+        }
+
+        // The bus's own "nobody answered" is not an absent interface. This is the
+        // pair that used to collapse into the same branch.
+        match classify::<bool>(Ok(Err(
+            "org.freedesktop.DBus.Error.NoReply: Did not receive a reply".into(),
+        ))) {
+            Attempt::Unanswered(_) => {}
+            other => panic!("a NoReply is silence, not absence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn silence_is_reported_as_silence_to_the_caller() {
+        let message =
+            unanswered_call("invoke", "probe-toggle", "no reply within 1200ms").to_string();
+        assert!(
+            message.starts_with("accessibility lookup failed: "),
+            "not a capture problem, not a pattern problem: {message}"
+        );
+        assert!(
+            message.contains("did not get an answer for invoke"),
+            "{message}"
+        );
+        assert!(
+            message.contains("This is not \"the control has no invoke pattern\""),
+            "must name the misreading it prevents: {message}"
+        );
     }
 
     #[test]
