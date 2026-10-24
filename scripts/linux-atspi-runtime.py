@@ -354,6 +354,15 @@ def scenario(identity: str) -> None:
             "type into the entry below" in body,
             "the label only exists inside the probe frame",
         )
+        # The false-positive control. Reporting a hole for every control that
+        # legitimately has no Component interface would bury the one application
+        # that is really stuck -- and CI caught exactly that on the first run
+        # (an UnknownMethod reply listed as unreadable).
+        check(
+            f"[{identity}] a responsive window reports nothing unreadable",
+            "not read" not in body,
+            f"tree head={body[:220]}",
+        )
         # Two controls answer to `probe-ambiguous` and the walk meets the label
         # first, so a find that stops at the first exact hit hands back something
         # that cannot be pressed. The actionable role has to win.

@@ -140,6 +140,8 @@ fn unanswered(reason: &str) -> Option<String> {
     let absent = [
         "unknowninterface",
         "unknownproperty",
+        "unknownmethod",
+        "unknownobject",
         "nosuchinterface",
         "notsupported",
     ]
@@ -1161,6 +1163,11 @@ mod tests {
             "No such interface 'org.a11y.atspi.Component' on object at path /org/a11y/atspi/accessible/1",
             "org.freedesktop.DBus.Error.UnknownProperty: Property Name not found",
             "org.freedesktop.DBus.Error.NotSupported: this method is not implemented",
+            // Verbatim from a real tree (CI run 40118967046): an application root
+            // that has no Component interface. The first version of the
+            // classifier reported this as a hole, which is precisely the noise
+            // that would bury a genuinely wedged application.
+            "org.freedesktop.DBus.Error.UnknownMethod: Method \"GetExtents\" with signature \"u\" on interface \"org.a11y.atspi.Component\" does not exist",
         ] {
             assert_eq!(
                 unanswered(absent),
