@@ -259,7 +259,7 @@ fn remove_profile_dir(dir: &Path) -> bool {
 fn find_browser() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CUA_HUB_BROWSER") {
         let path = PathBuf::from(p);
-        if path.exists() {
+        if is_launchable(&path) {
             return Some(path);
         }
     }
@@ -286,7 +286,52 @@ fn find_browser() -> Option<PathBuf> {
         .collect()
     };
 
-    candidates.into_iter().find(|p| p.exists())
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    candidates
+        .into_iter()
+        .find_map(|candidate| resolve_candidate(&candidate, &path))
+}
+
+/// Can we actually start this path? A directory is not a browser.
+#[cfg(unix)]
+fn is_launchable(path: &Path) -> bool {
+    use std::fs::PermissionsExt;
+    path.metadata()
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_launchable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Find `candidate` the way a shell would.
+///
+/// The Linux candidates are bare names (`chromium`, `google-chrome`), and
+/// `Path::exists()` resolves a bare name against the *current working directory*.
+/// Measured by the issue #11 audit: with `/usr/bin/chromium` installed, launch
+/// still answered "no Chrome/Edge found" unless `CUA_HUB_BROWSER` was set -- the
+/// engine worked, discovery made it unusable out of the box.
+fn resolve_candidate(candidate: &Path, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    if candidate.is_absolute() {
+        if is_launchable(candidate) {
+            return Some(candidate.to_path_buf());
+        }
+        return None;
+    }
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            // An empty PATH entry is the current directory; that is exactly the
+            // answer we are replacing.
+            continue;
+        }
+        let hit = dir.join(candidate);
+        if is_launchable(&hit) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 fn free_port() -> Result<u16> {
@@ -955,6 +1000,51 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&next).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_bare_browser_name_is_found_through_path() {
+        let _slot = temp_slot().await;
+        // A unique scratch directory standing in for one PATH entry. The process
+        // environment is never mutated, so the test stays parallel-safe.
+        let dir = fresh_profile_dir().unwrap();
+        let name = format!("cua-hub-fake-browser{}", std::env::consts::EXE_SUFFIX);
+        let planted = dir.join(&name);
+        std::fs::write(&planted, b"not a real browser").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let found = resolve_candidate(Path::new(&name), dir.as_os_str())
+            .expect("a bare name listed in PATH must resolve to the planted file");
+        assert_eq!(found, planted, "the answer must be an absolute path");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Same name, same file, no execute bit. `Path::exists` accepted it;
+            // a text file on PATH is not something we can spawn.
+            std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                resolve_candidate(Path::new(&name), dir.as_os_str()),
+                None,
+                "a non-executable file is not a browser"
+            );
+        }
+
+        // A directory that merely has the right name is not launchable either.
+        let lookalike = dir.join(format!("cua-hub-lookalike{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir(&lookalike).unwrap();
+        assert_eq!(
+            resolve_candidate(Path::new(lookalike.file_name().unwrap()), dir.as_os_str()),
+            None,
+            "a directory is not an executable"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

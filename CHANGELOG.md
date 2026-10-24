@@ -130,6 +130,38 @@ PowerShell 进程（约 0.2~0.5 秒），只发生在 session 结束时；macOS 
   `walk` 的回调里——那一层只有真树能暴露，所以两边都要。PR 的提交顺序就是
   "先加断言（应当红）→ 再修（应当绿）"，CI 记录即证据。
 
+### 修复：Linux 上"找不到浏览器"（issue #11 第 1 项）
+
+`find_browser()` 的 Linux 候选是**相对名**（`chromium`、`google-chrome`…），命中判断用的却是
+`Path::exists()`——相对名的 `exists()` 查的是**当前工作目录**，不是 PATH。审计的真机实证写在
+issue 里：机器上装着 `/usr/bin/chromium`，不设 `CUA_HUB_BROWSER` 时 launch 直接报
+"no Chrome/Edge found"，设上之后 `browser_smoke` 全套通过。引擎从头到尾没问题，卡在发现环节，
+Linux 开箱不可用。
+
+- 现在按 shell 找可执行文件的方式找：绝对路径直接判，裸名到 `PATH` 的每个目录里找，
+  命中后返回**绝对路径**（这样 spawn 用的是真路径，报错里给的名字也对得上）。
+- "存在"改成"可启动"：必须是文件，且在 Unix 上还必须有执行位。`CUA_HUB_BROWSER` 指到一个
+  目录以前算命中（目录的 `exists()` 也是真），现在不算。
+- `PATH` 里的空项等价于"当前目录"，直接跳过——那正是这次要替换掉的语义。
+
+### 测试与验证（issue #11 第 1 项）
+
+`a_bare_browser_name_is_found_through_path` 在自己的临时目录里种一个假浏览器，把这个目录当作
+唯一的 PATH 传给 `resolve_candidate`——**不碰进程环境**，所以并行安全。断言三件事：裸名能找到、
+找到的是绝对路径、同名目录不算可执行。
+
+两处负控分别把实现退回：
+
+| 退回 | 变红 |
+|---|---|
+| 只对候选本身 `exists()`（= 修复前语义） | `a bare name listed in PATH must resolve to the planted file` |
+| PATH 遍历改用 `exists()` 而不是可执行判断 | `assertion left == right failed: a directory is not an executable`，`left: Some("...cua-hub-lookalike.exe") right: None` |
+
+**Linux 真机那一格要由验收方复现**：本机是 Windows，那条命令跑不了。在一台装了 chromium 的
+Linux 上**不设** `CUA_HUB_BROWSER` 直接
+`cargo run -p cua-engine-browser --example browser_smoke`——修复前报 "no Chrome/Edge found"
+（issue 里已实证），修复后应 `BROWSER_SMOKE_OK`。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。
