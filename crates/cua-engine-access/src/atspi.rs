@@ -8,7 +8,7 @@
 //! but only dispatched to on non-Windows platforms.
 
 use cua_core::{Error, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
@@ -31,6 +31,14 @@ type NodeData = (String, u32, Rect, Kids);
 /// the shorter tree used to arrive looking complete. Unanswered reads are
 /// reported in `UiSnapshot::unreadable` instead.
 const CALL_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// How long one tree walk may spend waiting on the bus in total.
+///
+/// The per-call timeout bounds a single read; this bounds the observation. A
+/// desktop with several wedged applications would otherwise multiply
+/// `calls x timeout` into something the caller cannot wait for, and "give up
+/// politely and say what was not attempted" is the contract.
+const WALK_BUDGET: Duration = Duration::from_millis(6000);
 
 /// What one traversal produced: the nodes it read, plus what it could not read.
 struct WalkReport {
@@ -205,6 +213,7 @@ fn walk_from(
     let mut truncated = false;
     let mut unreadable: Vec<crate::Unreadable> = Vec::new();
     let mut visited = 0usize;
+    let deadline = Instant::now() + WALK_BUDGET;
     let mut stack: Vec<(String, String, usize)> = starts
         .into_iter()
         .rev()
@@ -214,6 +223,20 @@ fn walk_from(
     while let Some((dest, path, depth)) = stack.pop() {
         if visited >= max_nodes {
             truncated = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            // Named by the first node it refused to attempt: the walk does not
+            // know what else would have answered, and saying so is the point.
+            truncated = true;
+            unreadable.push(crate::Unreadable {
+                bus: dest.clone(),
+                path: path.clone(),
+                reason: format!(
+                    "not attempted: the {}ms walk budget ran out after {visited} node(s)",
+                    WALK_BUDGET.as_millis()
+                ),
+            });
             break;
         }
         if depth > max_depth {

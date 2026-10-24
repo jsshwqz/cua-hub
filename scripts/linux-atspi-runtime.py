@@ -18,6 +18,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -111,6 +112,21 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         text=True,
     )
+
+    # The pipe must be drained continuously: it is never read again before
+    # `server.wait()`, so once 64 KB of log accumulates the server blocks on
+    # writing to it and every later request stalls. Measured 2026-10-25 on run
+    # 40117301727, where the freeze phase timed out at 180s and looked exactly
+    # like an AT-SPI read that never returns. Draining into a file also keeps
+    # the server side of the evidence.
+    server_log = open(EVIDENCE / "server.log", "w", encoding="utf-8")
+
+    def drain(pipe):
+        for line in iter(pipe.readline, ""):
+            server_log.write(line)
+            server_log.flush()
+
+    threading.Thread(target=drain, args=(server.stdout,), daemon=True).start()
     try:
         if not wait_for_server(30):
             print("the MCP server never answered /health")
@@ -189,6 +205,19 @@ def hung_application() -> None:
     # would be testing an application that never joined the walk.
     time.sleep(3.0)
     os.kill(procs["hung"].pid, signal.SIGSTOP)
+
+    # Is the *server* still alive, or did the freeze take it down too? X11 window
+    # listing never touches the accessibility bus, so this separates "the bus read
+    # hangs" from "the whole process is stuck" -- the two need different fixes and
+    # the first run could not tell them apart.
+    x11_started = time.time()
+    alive = call("list_windows", {"query": PROBE_TITLE}, timeout=20)
+    x11_elapsed = time.time() - x11_started
+    check(
+        "[hung] the server still answers a non-AT-SPI call while the app is frozen",
+        not alive["is_error"] and x11_elapsed < 5,
+        f"list_windows took {x11_elapsed:.2f}s",
+    )
 
     started = time.time()
     # A generous HTTP timeout on purpose: before the fix the walk burns the ~25s
