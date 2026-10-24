@@ -51,6 +51,13 @@ class Probe(Gtk.Window):
         self.toggle = Gtk.CheckButton(label="probe-toggle")
         box.pack_start(self.toggle, False, False, 0)
 
+        # One accessible name on two controls, with the label met first by a
+        # depth-first walk. This is the collision that makes a `find` stop at the
+        # first exact hit press nothing: the label cannot be invoked.
+        box.pack_start(Gtk.Label(label="probe-ambiguous"), False, False, 0)
+        self.ambiguous = Gtk.Button(label="probe-ambiguous")
+        box.pack_start(self.ambiguous, False, False, 0)
+
         self.add(box)
         self.connect("destroy", Gtk.main_quit)
 
