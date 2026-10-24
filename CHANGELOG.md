@@ -163,6 +163,42 @@ Linux 上**不设** `CUA_HUB_BROWSER` 直接
 `cargo run -p cua-engine-browser --example browser_smoke`——修复前报 "no Chrome/Edge found"
 （issue 里已实证），修复后应 `BROWSER_SMOKE_OK`。
 
+### 新增：Linux 也能读控件状态（issue #11 第 3 项）
+
+`control_state` 原先只有 Windows 有实现。Linux 侧先是用 `Ok(None)` 蒙（等于宣称"这个控件
+没有状态"），#25 里改成明确的 `Unsupported`，这一批接到
+`org.a11y.atspi.Accessible.GetState` 上。
+
+- **签名**：`GetState` 无入参，回 `au`——一串 u32 位掩码，按 `AtspiStateType` 的**序号**排。
+  于是序号直接当位下标用，32 及以上落在第二个字（`INDETERMINATE=32` 就是词 1 位 0）。
+  序号表是照 at-spi2-core `atspi-constants.h` 的枚举顺序**数**出来的：第一次抓文档给的
+  VISIBLE / HORIZONTAL 各差一位，改用原始头文件重数才对上。错位不会报错，只会把一个状态
+  读成另一个（把 collapsing 读成 checked 这种），所以这份表必须有独立证据撑着。
+- **字段口径与 Windows 对齐**：`toggle` 是 `on` / `off` / `indeterminate`，`expanded` 是
+  `expanded` / `collapsed` / `partially_expanded` / `leaf`，全小写——调用方在两平台看到同一套
+  字符串，不用分支。
+- **没观察到的事不写进结果**：`toggle` 只在控件自称可勾选时才出现（置了 CHECKABLE、已置
+  CHECKED、或角色本身就是 CheckBox/RadioButton）；否则每个按钮都会带一个 `off`，那是在陈述
+  一件我们没读到的事。`value` 与 `range_value` 仍是 `None`：文本在 Text 接口后面，滑块的数值
+  在 Value 接口后面，这批都没查。
+- `enabled` 取 SENSITIVE（"用户能操作它"），`offscreen` 取 `not (VISIBLE and SHOWING)`。
+  两者刻意分开：滚出可视区的控件依然 enabled，把 offscreen 当 disabled 用是另一个错。
+- 读状态**不再要求控件有非零矩形**——offscreen 恰恰是这种控件要报的答案。
+
+### 测试与验证（issue #11 第 3 项）
+
+- 5 条纯函数测试：位序号解码、`toggle` / `expanded` 的门控、offscreen 不等于 disabled、
+  INDETERMINATE 落在第二个字、回包字数不足时是 miss 而不是 panic。这些本机就绿
+  （`atspi.rs` 在每个宿主上都编译）。
+  写夹具时我自己错过一次：把 CHECKABLE 塞进了按钮的状态集，"按钮不该有 toggle"当场红——
+  红的是夹具不是实现；已改成两条都断言：不自称 CHECKABLE 的按钮没有 `toggle`，
+  自称 CHECKABLE 的按钮**要**被采信。
+- **红/绿排在 CI 的历史里**：提交 `c138cee` 只有断言、没有实现，`Linux AT-SPI runtime`
+  （run `40108824986`）应当红在 `control_state reads the check box as off`；实现提交转绿。
+- **独立 oracle**：probe 应用把自己每次 `toggled` 信号（GTK 的直接事件，不经过无障碍总线）
+  写进第二个文件，脚本断言它恰好是 `["1"]`。少了这一条，"读回来的 toggle 变了"完全可能是
+  我把序号解错、恰好命中另一个被置位的状态——控件自己的说法和总线的数字必须分开证。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。

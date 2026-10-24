@@ -482,15 +482,113 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     Ok(hit)
 }
 
-/// Control state is reachable over AT-SPI -- `org.a11y.atspi.Accessible.GetState`
-/// returns a StateSet -- but this backend has not wired it up yet. Answering
-/// `Ok(None)` here would be a lie of a specific kind: `None` means "this control
-/// reports no state", which callers read as licence to fall back to coordinates,
-/// when the real fact is that we did not ask.
-pub fn state(_name: &str) -> Result<Option<crate::ControlState>> {
-    Err(Error::Unsupported(
-        "control state is not read over AT-SPI yet; use the tree from snapshot/find instead".into(),
-    ))
+/// `AtspiStateType` ordinals, counted from the enum in at-spi2-core's
+/// `atspi-constants.h` (INVALID is 0 and every following name takes the next
+/// number). `GetState` answers an array of u32 bitmasks in that order, so the
+/// ordinal doubles as the bit index and anything from 32 up lives in word 1.
+mod atspi_state {
+    pub const CHECKED: u32 = 4;
+    pub const COLLAPSED: u32 = 5;
+    pub const EXPANDABLE: u32 = 9;
+    pub const EXPANDED: u32 = 10;
+    pub const SENSITIVE: u32 = 24;
+    pub const SHOWING: u32 = 25;
+    pub const VISIBLE: u32 = 30;
+    pub const INDETERMINATE: u32 = 32;
+    pub const CHECKABLE: u32 = 41;
+}
+
+/// Whether a `GetState` reply has the given state ordinal set.
+fn has_state(words: &[u32], ordinal: u32) -> bool {
+    words
+        .get(ordinal as usize / 32)
+        .is_some_and(|mask| mask & (1 << (ordinal % 32)) != 0)
+}
+
+/// Map an AT-SPI state set onto the fields this backend reports, in the same
+/// vocabulary the Windows side uses: `on` / `off` / `indeterminate`, and
+/// `expanded` / `collapsed` / `partially_expanded` / `leaf`.
+///
+/// `toggle` and `expanded` stay absent unless the control says it can be toggled
+/// or expanded. Emitting `off` for every button would read as "a toggle that is
+/// currently off", which is a claim about a state we never observed.
+fn decode_state(node: &UiNode, words: &[u32]) -> crate::ControlState {
+    let checkable = has_state(words, atspi_state::CHECKABLE)
+        || has_state(words, atspi_state::CHECKED)
+        // Gate on the role too: a toolkit is free to expose a check button as
+        // checkable-by-role without setting CHECKABLE.
+        || matches!(node.control_type.as_str(), "CheckBox" | "RadioButton");
+    let toggle = checkable.then(|| {
+        if has_state(words, atspi_state::INDETERMINATE) {
+            "indeterminate"
+        } else if has_state(words, atspi_state::CHECKED) {
+            "on"
+        } else {
+            "off"
+        }
+        .to_string()
+    });
+
+    let expanded = has_state(words, atspi_state::EXPANDABLE).then(|| {
+        if has_state(words, atspi_state::EXPANDED) {
+            "expanded"
+        } else if has_state(words, atspi_state::COLLAPSED) {
+            "collapsed"
+        } else {
+            "leaf"
+        }
+        .to_string()
+    });
+
+    crate::ControlState {
+        name: node.name.clone(),
+        control_type: node.control_type.clone(),
+        // SENSITIVE is "the user can act on this"; a widget that is merely not
+        // on screen keeps it, which is why offscreen is a separate field.
+        enabled: has_state(words, atspi_state::SENSITIVE),
+        offscreen: !(has_state(words, atspi_state::VISIBLE)
+            && has_state(words, atspi_state::SHOWING)),
+        toggle,
+        // The current text needs the Text interface and a slider's number the
+        // Value one. Neither is read here, so the fields stay absent rather than
+        // being inferred from the name.
+        value: None,
+        range_value: None,
+        expanded,
+    }
+}
+
+/// `org.a11y.atspi.Accessible.GetState`: no arguments, an array of u32.
+fn state_words(conn: &Connection, dest: &str, path: &str) -> Result<Vec<u32>> {
+    let proxy = Proxy::new(conn, dest, path, "org.a11y.atspi.Accessible")
+        .map_err(|e| Error::Capture(format!("state proxy {path}: {e}")))?;
+    proxy
+        .call::<_, _, Vec<u32>>("GetState", &())
+        .map_err(|e| Error::Capture(format!("GetState {path}: {e}")))
+}
+
+/// Read one control's state by accessible name.
+///
+/// An off-screen control is still returned: `offscreen: true` is the answer the
+/// caller needs, and refusing to look it up would push them into clicking a
+/// coordinate for a control we can describe.
+pub fn state(name: &str) -> Result<Option<crate::ControlState>> {
+    let mut found = None;
+    let mut failure: Option<Error> = None;
+    walk(600, 10, &mut |conn, node, dest, path| {
+        if node.name != name {
+            return false;
+        }
+        match state_words(conn, dest, path) {
+            Ok(words) => found = Some(decode_state(node, &words)),
+            Err(e) => failure = Some(e),
+        }
+        true
+    })?;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(found),
+    }
 }
 
 #[cfg(test)]
@@ -639,5 +737,145 @@ mod tests {
         zero_width.rect = (0, 0, 0, 40);
         let blank = node("Button", "");
         assert!(pick("ok", vec![zero_width, blank].into_iter()).is_none());
+    }
+
+    /// A state set the way the D-Bus reply carries it: one u32 per 32 ordinals.
+    fn words_for(ordinals: &[u32]) -> Vec<u32> {
+        let mut out = vec![0u32; 2];
+        for ordinal in ordinals {
+            out[*ordinal as usize / 32] |= 1 << (ordinal % 32);
+        }
+        out
+    }
+
+    #[test]
+    fn the_state_ordinals_are_pinned_to_the_header() {
+        // Literal positions counted from `AtspiStateType` in at-spi2-core's
+        // atspi-constants.h, where INVALID is 0 and every following name takes
+        // the next number. The other tests build their bitmaps *from* these
+        // constants, so they cannot catch a constant that drifted -- this test
+        // can. What the constants really mean on a live widget is proven by the
+        // probe's own `toggled` log, not by anything here.
+        assert_eq!(atspi_state::CHECKED, 4);
+        assert_eq!(atspi_state::COLLAPSED, 5);
+        assert_eq!(atspi_state::EXPANDABLE, 9);
+        assert_eq!(atspi_state::EXPANDED, 10);
+        assert_eq!(atspi_state::SENSITIVE, 24);
+        assert_eq!(atspi_state::SHOWING, 25);
+        assert_eq!(atspi_state::VISIBLE, 30);
+        assert_eq!(atspi_state::INDETERMINATE, 32);
+        assert_eq!(atspi_state::CHECKABLE, 41);
+    }
+
+    #[test]
+    fn a_state_ordinal_is_a_bit_index_into_the_reply_words() {
+        // Ordinal 4 is word 0 bit 4; ordinal 32 is word 1 bit 0. Getting this
+        // wrong would silently report a different state than the one set.
+        let words = words_for(&[atspi_state::CHECKED, atspi_state::INDETERMINATE]);
+        assert!(has_state(&words, atspi_state::CHECKED));
+        assert!(has_state(&words, atspi_state::INDETERMINATE));
+        assert!(!has_state(&words, atspi_state::CHECKABLE));
+        assert!(
+            !has_state(&[], atspi_state::CHECKED),
+            "a short reply misses, it does not panic"
+        );
+    }
+
+    #[test]
+    fn a_checked_box_reports_toggle_and_a_button_does_not() {
+        let on = words_for(&[
+            atspi_state::SENSITIVE,
+            atspi_state::VISIBLE,
+            atspi_state::SHOWING,
+            atspi_state::CHECKABLE,
+            atspi_state::CHECKED,
+        ]);
+        let decoded = decode_state(&node("CheckBox", "probe-toggle"), &on);
+        assert_eq!(decoded.toggle.as_deref(), Some("on"));
+        assert!(decoded.enabled);
+        assert!(!decoded.offscreen);
+        assert_eq!(
+            decoded.value, None,
+            "text is not read yet, so it must stay absent"
+        );
+        assert_eq!(decoded.range_value, None);
+
+        let off = words_for(&[
+            atspi_state::SENSITIVE,
+            atspi_state::VISIBLE,
+            atspi_state::SHOWING,
+            atspi_state::CHECKABLE,
+        ]);
+        assert_eq!(
+            decode_state(&node("CheckBox", "probe-toggle"), &off)
+                .toggle
+                .as_deref(),
+            Some("off")
+        );
+
+        // A push button that does not claim to be checkable must not come back
+        // with a toggle that happens to be off -- that is a state we never saw.
+        let plain = words_for(&[
+            atspi_state::SENSITIVE,
+            atspi_state::VISIBLE,
+            atspi_state::SHOWING,
+        ]);
+        let button = decode_state(&node("Button", "probe-submit"), &plain);
+        assert_eq!(button.toggle, None);
+        assert_eq!(button.expanded, None);
+
+        // A button that does report CHECKABLE is believed, role notwithstanding.
+        assert_eq!(
+            decode_state(&node("Button", "mute"), &off)
+                .toggle
+                .as_deref(),
+            Some("off")
+        );
+    }
+
+    #[test]
+    fn indeterminate_is_read_from_the_second_word() {
+        let mixed = words_for(&[
+            atspi_state::CHECKABLE,
+            atspi_state::CHECKED,
+            atspi_state::INDETERMINATE,
+        ]);
+        assert_eq!(
+            decode_state(&node("CheckBox", "tri"), &mixed)
+                .toggle
+                .as_deref(),
+            Some("indeterminate"),
+            "a partly-applied state is not the same as checked"
+        );
+    }
+
+    #[test]
+    fn off_screen_is_not_the_same_as_disabled() {
+        let sensitive_only = words_for(&[atspi_state::SENSITIVE]);
+        let decoded = decode_state(&node("Button", "scrolled away"), &sensitive_only);
+        assert!(decoded.enabled, "still actionable");
+        assert!(decoded.offscreen, "just not visible right now");
+    }
+
+    #[test]
+    fn only_an_expandable_control_gets_an_expanded_field() {
+        let collapsed = words_for(&[atspi_state::EXPANDABLE, atspi_state::COLLAPSED]);
+        assert_eq!(
+            decode_state(&node("Button", "more"), &collapsed)
+                .expanded
+                .as_deref(),
+            Some("collapsed")
+        );
+        let expanded = words_for(&[atspi_state::EXPANDABLE, atspi_state::EXPANDED]);
+        assert_eq!(
+            decode_state(&node("Button", "more"), &expanded)
+                .expanded
+                .as_deref(),
+            Some("expanded")
+        );
+        assert_eq!(
+            decode_state(&node("Button", "plain"), &words_for(&[])).expanded,
+            None
+        );
     }
 }
