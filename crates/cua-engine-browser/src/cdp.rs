@@ -1,7 +1,8 @@
 //! Minimal Chrome DevTools Protocol client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -48,10 +49,211 @@ pub struct TabInfo {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.profile_dir);
+        teardown(Some(&mut self.child), &self.profile_dir);
     }
+}
+
+/// A browser process and profile directory that are not yet owned by a session.
+///
+/// `std::process::Child` does not kill on drop, so every error path after
+/// `spawn` used to leave a live Chromium plus its profile directory behind — the
+/// only cleanup lives in `BrowserSession::Drop`, which a failed launch never
+/// reaches. Dropping this guard kills the process and deletes the directory;
+/// [`PendingBrowser::commit`] hands both to the session and makes the guard inert.
+struct PendingBrowser {
+    child: Option<Child>,
+    profile_dir: Option<PathBuf>,
+}
+
+impl PendingBrowser {
+    /// Take responsibility for a profile directory that has no process yet.
+    fn owns_dir(profile_dir: PathBuf) -> Self {
+        Self {
+            child: None,
+            profile_dir: Some(profile_dir),
+        }
+    }
+
+    /// Adopt the spawned process, returning its pid for the error messages.
+    fn attach(&mut self, child: Child) -> u32 {
+        let pid = child.id();
+        self.child = Some(child);
+        pid
+    }
+
+    fn commit(&mut self) -> (Child, PathBuf) {
+        (
+            self.child.take().expect("committed once"),
+            self.profile_dir.take().expect("committed once"),
+        )
+    }
+}
+
+impl Drop for PendingBrowser {
+    fn drop(&mut self) {
+        let mut child = self.child.take();
+        match self.profile_dir.take() {
+            Some(dir) => teardown(child.as_mut(), &dir),
+            None => {
+                // Only reachable after `commit` handed both halves over, which
+                // disarms the guard; killing here keeps a half-committed guard
+                // from detaching a process instead of leaking it.
+                if let Some(child) = child.as_mut() {
+                    let _ = child.kill();
+                    // Reap it: an unreaped child leaves a zombie on Unix, which
+                    // is a leak of a different kind but still a leak.
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
+/// Kill a browser and delete its profile directory.
+///
+/// `Child::kill` is not enough. Measured on this machine (2026-10-24): Edge's
+/// spawn target re-execs the real browser and exits, so the handle we own was
+/// already dead while the browser root and seven children kept running with the
+/// profile open — `kill` "succeeded", `remove_dir_all` failed, and both were
+/// swallowed by `let _`. Anything still holding a profile directory we minted is
+/// therefore swept by the `--user-data-dir` argument, which only we hand out.
+fn teardown(child: Option<&mut Child>, profile_dir: &Path) {
+    // Nothing could be holding the profile open if we never got a process, so
+    // the sweep is only worth its cost when one existed.
+    let had_process = child.is_some();
+    if let Some(child) = child {
+        let _ = child.kill();
+        // Reap it: an unreaped child leaves a zombie on Unix, which is a
+        // leak of a different kind but still a leak.
+        let _ = child.wait();
+    }
+    let orphans = if had_process {
+        pids_using_profile(profile_dir)
+    } else {
+        Vec::new()
+    };
+    if !orphans.is_empty() {
+        tracing::warn!(
+            pids = ?orphans,
+            profile = %profile_dir.display(),
+            "browser processes survived the child handle and still hold this profile"
+        );
+        for pid in orphans {
+            kill_pid(pid);
+        }
+    }
+    if !remove_profile_dir(profile_dir) {
+        tracing::warn!(
+            profile = %profile_dir.display(),
+            "profile directory survived teardown and is left in the temp dir"
+        );
+    }
+}
+
+/// Pids of browser processes running with `profile_dir` as their user data dir.
+fn pids_using_profile(profile_dir: &Path) -> Vec<u32> {
+    let mut found = Vec::new();
+
+    #[cfg(windows)]
+    {
+        // Single-quoted so the path's backslashes stay literal; a stray quote in
+        // the path is doubled rather than interpolated.
+        let literal = profile_dir.display().to_string().replace('\'', "''");
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \
+             \"Name='msedge.exe' OR Name='chrome.exe' OR Name='chromium.exe' OR Name='headless_shell.exe'\" | \
+             Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{literal}') }} | \
+             ForEach-Object {{ $_.ProcessId }}"
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        if let Ok(out) = out {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let field = line.trim().trim_start_matches('\u{feff}');
+                if let Ok(pid) = field.parse::<u32>() {
+                    if pid != std::process::id() {
+                        found.push(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let needle = format!("--user-data-dir={}", profile_dir.display());
+        let self_pid = std::process::id();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if pid == self_pid {
+                    continue;
+                }
+                let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                    continue;
+                };
+                // Arguments are NUL-separated, so this matches a whole flag
+                // rather than a substring of some other option.
+                if cmdline.split(|b| *b == 0).any(|a| a == needle.as_bytes()) {
+                    found.push(pid);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    let _ = profile_dir;
+
+    found
+}
+
+/// Force a process we do not own to exit.
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    #[cfg(not(any(windows, unix)))]
+    let _ = pid;
+}
+
+/// Delete the profile, giving Chromium a moment to release its file handles.
+///
+/// Returns whether the directory is actually gone; callers cannot pretend success
+/// here, because a swallowed failure is what turned a cleanup bug into hundreds
+/// of megabytes per run.
+fn remove_profile_dir(dir: &Path) -> bool {
+    for attempt in 0..12 {
+        if !dir.exists() {
+            return true;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+        if !dir.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(if attempt == 0 { 50 } else { 100 }));
+    }
+    !dir.exists()
 }
 
 fn find_browser() -> Option<PathBuf> {
@@ -92,10 +294,109 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-async fn wait_for_debugger(port: u16) -> Result<()> {
+/// Claim `dir` for exclusive use: `true` only when this call is what created it.
+///
+/// `create_dir_all` answers "yes" for a directory an earlier crashed launch left
+/// behind, which is how a stale profile — cookies, tabs, history and all —
+/// silently became the next run's supposedly isolated one.
+fn claim_profile_dir(dir: &Path) -> Result<bool> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("create {}", dir.display())),
+    }
+}
+
+/// Mint a profile directory that has never existed before, and own it.
+///
+/// The name used to be `cua-hub-browser-{pid}-{port}`, which is both guessable
+/// and — worse — reusable. The counter plus sub-second clock make two calls in
+/// the same process disagree even when the port is reused, and
+/// [`claim_profile_dir`] refuses anything already on disk.
+fn fresh_profile_dir() -> Result<PathBuf> {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    for _ in 0..64 {
+        let n = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let dir = base.join(format!(
+            "cua-hub-browser-{}-{}-{}",
+            std::process::id(),
+            n,
+            nanos
+        ));
+        if claim_profile_dir(&dir)? {
+            return Ok(dir);
+        }
+    }
+    bail!("could not allocate a fresh browser profile directory")
+}
+
+/// Whether a process id is still live, straight from the OS.
+///
+/// An oracle independent of the `Child` handle: the handles under test are moved
+/// into [`PendingBrowser`] and consumed by its `Drop`, so the only way to prove
+/// cleanup is to ask the process table rather than the type system.
+#[cfg(test)]
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let Ok(out) = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        // `INFO: No tasks are running which match the search criteria.` has no
+        // bare pid field; the CSV row for a live process starts
+        // "image.exe","<pid>",...
+        text.split("\",\"")
+            .nth(1)
+            .map(|field| field.trim() == pid.to_string())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+/// A leaf process that stays running for a minute, used to prove that cleanup
+/// really kills instead of merely detaching. `ping`/`sleep` spawn no children, so
+/// a surviving pid means the guard failed rather than an orphaned grandchild.
+#[cfg(test)]
+fn slow_child() -> Child {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("ping");
+        c.args(["-n", "60", "127.0.0.1"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("sleep");
+        c.arg("60");
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a slow child")
+}
+
+async fn wait_for_debugger(port: u16, attempts: u32) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/json/version");
-    for _ in 0..80 {
+    for _ in 0..attempts {
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
                 return Ok(());
@@ -124,16 +425,29 @@ pub async fn launch(opts: LaunchOptions) -> Result<BrowserSession> {
     let binary = find_browser().ok_or_else(|| {
         anyhow!("no Chrome/Edge found; set CUA_HUB_BROWSER to the executable path")
     })?;
+    launch_with(&binary, opts, 80).await
+}
+
+/// Launch `binary` and wait up to `wait_attempts * 125ms` for its devtools port.
+///
+/// Split out from [`launch`] so the failure paths are reachable from a test with
+/// a two-attempt budget instead of the ten-second production one.
+async fn launch_with(
+    binary: &Path,
+    opts: LaunchOptions,
+    wait_attempts: u32,
+) -> Result<BrowserSession> {
     let port = free_port()?;
-    let profile_dir =
-        std::env::temp_dir().join(format!("cua-hub-browser-{}-{}", std::process::id(), port));
-    std::fs::create_dir_all(&profile_dir)?;
+    let profile_dir = fresh_profile_dir()?;
+    // The guard owns the directory before the process exists, so a `spawn` that
+    // fails outright (a bad `CUA_HUB_BROWSER` path) cannot strand it either.
+    let mut pending = PendingBrowser::owns_dir(profile_dir.clone());
 
     let start_url = opts
         .start_url
         .clone()
         .unwrap_or_else(|| "about:blank".into());
-    let mut cmd = Command::new(&binary);
+    let mut cmd = Command::new(binary);
     cmd.arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
@@ -154,12 +468,21 @@ pub async fn launch(opts: LaunchOptions) -> Result<BrowserSession> {
     let child = cmd
         .spawn()
         .with_context(|| format!("failed to launch {}", binary.display()))?;
-    wait_for_debugger(port).await?;
-    let (target_id, ws_url) = first_page_target(port).await?;
+    // From here until the session exists, `pending` is the only owner of the
+    // process and the directory; every `?` below unwinds through its Drop.
+    let child_pid = pending.attach(child);
+
+    wait_for_debugger(port, wait_attempts)
+        .await
+        .with_context(|| format!("debugger never came up for pid {child_pid}"))?;
+    let (target_id, ws_url) = first_page_target(port)
+        .await
+        .with_context(|| format!("no page target for pid {child_pid}"))?;
     let (ws, _resp) = connect_async(&ws_url)
         .await
-        .with_context(|| format!("failed to connect to {ws_url}"))?;
+        .with_context(|| format!("failed to connect to {ws_url} (pid {child_pid})"))?;
 
+    let (child, profile_dir) = pending.commit();
     Ok(BrowserSession {
         child,
         profile_dir,
@@ -553,4 +876,223 @@ fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Profile directories live in a shared temp dir and are found by prefix, so
+    /// these tests take turns. An async lock, because the guard is held across
+    /// awaits.
+    fn temp_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn temp_slot() -> tokio::sync::MutexGuard<'static, ()> {
+        temp_lock().lock().await
+    }
+
+    fn leftover_profiles() -> Vec<PathBuf> {
+        let prefix = format!("cua-hub-browser-{}-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with(&prefix))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A browser that exits at once, so `wait_for_debugger` is the failing step.
+    fn unresponsive_browser() -> PathBuf {
+        #[cfg(windows)]
+        {
+            PathBuf::from("cmd")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from("/bin/true")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_directory_is_never_reused() {
+        let _slot = temp_slot().await;
+        let first = fresh_profile_dir().unwrap();
+        let second = fresh_profile_dir().unwrap();
+        assert_ne!(first, second, "two launches cannot share a profile");
+        // Both were created, not merely named: `create_dir` only succeeds on a
+        // name that had no contents, so a leaked profile can never be adopted.
+        assert!(first.is_dir() && second.is_dir());
+        std::fs::remove_dir_all(&first).unwrap();
+        std::fs::remove_dir_all(&second).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stale_profile_is_never_adopted() {
+        let _slot = temp_slot().await;
+        let dir = fresh_profile_dir().unwrap();
+        // What a crashed launch leaves behind is exactly this: a directory with
+        // someone else's state in it.
+        std::fs::write(dir.join("Cookies"), b"a previous run's state").unwrap();
+        assert!(
+            !claim_profile_dir(&dir).unwrap(),
+            "an occupied profile directory was handed out again"
+        );
+        let next = fresh_profile_dir().unwrap();
+        assert_ne!(next, dir, "the mint landed on the stale directory");
+        assert!(
+            !next.join("Cookies").exists(),
+            "the new profile inherited the stale one's files"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&next).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_guard_kills_a_live_child_and_removes_the_profile() {
+        let _slot = temp_slot().await;
+        let child = slow_child();
+        let pid = child.id();
+        let dir = fresh_profile_dir().unwrap();
+        assert!(process_is_alive(pid), "the fixture child is running");
+        let mut guard = PendingBrowser::owns_dir(dir.clone());
+        guard.attach(child);
+        drop(guard);
+        assert!(
+            !process_is_alive(pid),
+            "pid {pid} outlived the guard that owned it"
+        );
+        assert!(
+            !dir.exists(),
+            "the profile outlived the guard that owned it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_committed_guard_leaves_both_the_child_and_the_profile_alone() {
+        let _slot = temp_slot().await;
+        let child = slow_child();
+        let pid = child.id();
+        let dir = fresh_profile_dir().unwrap();
+        let mut guard = PendingBrowser::owns_dir(dir.clone());
+        guard.attach(child);
+        let (mut child, handed_dir) = guard.commit();
+        drop(guard);
+        assert!(process_is_alive(pid), "committing must not kill");
+        assert!(
+            handed_dir == dir && dir.is_dir(),
+            "committing must not delete"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `BrowserSession` is not `Debug`, so `expect_err` is unavailable; fail the
+    /// test with the session dropped instead (its own `Drop` cleans up).
+    async fn launch_failure(binary: &Path, attempts: u32) -> anyhow::Error {
+        match launch_with(binary, LaunchOptions::default(), attempts).await {
+            Err(e) => e,
+            Ok(_session) => panic!("expected a launch that never reaches devtools"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_leaves_no_profile_behind() {
+        let _slot = temp_slot().await;
+        let before = leftover_profiles();
+        let err = launch_failure(&unresponsive_browser(), 2).await;
+        assert!(
+            err.to_string().contains("debugger never came up"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            leftover_profiles(),
+            before,
+            "the failed launch leaked its profile directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_cannot_spawn_leaves_no_profile_behind() {
+        let _slot = temp_slot().await;
+        let before = leftover_profiles();
+        let err = launch_failure(Path::new("cua-hub-no-such-browser-9f3a2"), 1).await;
+        assert!(
+            err.to_string().contains("failed to launch"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            leftover_profiles(),
+            before,
+            "a launch that never spawned still created and abandoned a profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_names_the_pid_it_killed() {
+        let _slot = temp_slot().await;
+        let text = format!("{:#}", launch_failure(&unresponsive_browser(), 1).await);
+        // The chain must carry the child pid: without it an operator cannot tell
+        // a bad `CUA_HUB_BROWSER` path from a browser that started and hung.
+        let pid_part = text
+            .split("debugger never came up for pid ")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            pid_part.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "error does not report the killed pid: {text}"
+        );
+    }
+
+    /// The check CI cannot make without a browser, and the one that caught the
+    /// real bug: the process we spawn is not always the browser process, so a
+    /// session drop must leave no profile directory, no answering devtools port,
+    /// and no browser still running with our profile.
+    #[tokio::test]
+    #[ignore = "needs a local Chrome/Edge; run: cargo test -p cua-engine-browser -- --ignored"]
+    async fn a_real_browser_session_leaves_nothing_behind() {
+        let _slot = temp_slot().await;
+        let binary = find_browser().expect("set CUA_HUB_BROWSER to a Chrome/Edge executable");
+        let before = leftover_profiles();
+        let session = launch_with(&binary, LaunchOptions::default(), 80)
+            .await
+            .expect("launch a real browser");
+        let dir = session.profile_dir.clone();
+        let port = session.port;
+        assert!(
+            dir.is_dir(),
+            "the profile should exist while the session runs"
+        );
+        drop(session);
+
+        assert!(!dir.exists(), "profile {dir:?} survived the session drop");
+        let still_serving = reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        assert!(
+            !still_serving,
+            "devtools port {port} still answers: a browser process survived the drop"
+        );
+        assert_eq!(
+            pids_using_profile(&dir),
+            Vec::<u32>::new(),
+            "browser processes still reference the deleted profile"
+        );
+        assert_eq!(
+            leftover_profiles(),
+            before,
+            "teardown left a profile directory in the temp dir"
+        );
+    }
 }

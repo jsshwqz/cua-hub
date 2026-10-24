@@ -47,6 +47,53 @@
   不能证明真实模型在同一情形下的行为完全一致。
 - #15（关键路径测试缺口）里的"vision 侧解析零覆盖"这一项随之关闭。
 
+### 修复：浏览器 launch 失败与正常收尾都残留进程和 profile（issue #10）
+
+`launch()` 在 `spawn` 之后任何一步失败（devtools 端口没起来、找不到 page target、
+websocket 连不上）都是直接 `?` 返回。此时 `Child` 还没进 `BrowserSession`，而唯一的
+清理写在 `BrowserSession::Drop` 里——失败路径根本构造不出 session；`std::process::Child`
+drop 时又不杀进程，于是浏览器进程和它的 profile 目录双双留下。
+
+- **所有权提前**：spawn 成功的一刻就把进程与目录交给 `PendingBrowser` 守卫，只有
+  `commit()` 能把它们移交给 session；没 commit 就 drop，则杀掉、reap（不 reap 在 Unix 上
+  留僵尸）、删目录。`launch` 里不存在"已经 spawn 但没人负责"的窗口了。
+- **profile 不可能再被复用**：旧名 `cua-hub-browser-{pid}-{port}` 既可预测、又被
+  `create_dir_all` 静默复用——上一次泄漏的目录（连着页面状态）会直接给下一次运行用，
+  `lib.rs` 声称的 isolated profile 在失败路径上并不成立。现在名字是
+  pid + 进程内计数 + 亚秒时钟，且用 `create_dir` 创建：名字已存在就换下一个，绝不接手。
+- **`Child::kill()` 杀不到真正的浏览器**（真机量出来的，issue 里没写）：Edge 的 spawn
+  目标会 re-exec 出浏览器主进程、自己退出。本机一次**正常收尾**的 smoke 之后仍剩
+  8 个 msedge 进程和 1 个 717 文件的目录——我们杀的是那个已经退出的中间进程，
+  `remove_dir_all` 因目录被占用而失败，又被 `let _` 吞掉。收尾因此改为：按
+  `--user-data-dir` 反查"仍在用这个 profile 的浏览器进程"并杀掉（这个路径只有我们会
+  生成，碰不到用户自己的 Chrome），再带重试删目录；实在删不掉就 `warn` 写明它留在
+  临时目录，不再假装清理成功。Linux 用 `/proc/*/cmdline` 反查，不引入新依赖。
+- 三条失败路径（devtools 没起来、找不到 page target、websocket 连不上）的错误现在都带上
+  被杀进程的 pid（如 `debugger never came up for pid N`）。
+  没有它，"`CUA_HUB_BROWSER` 指错路径"和"浏览器起来了但没响应"长得一模一样。
+
+### 测试与验证（issue #10）
+
+新增 8 条测试（7 条随 `cargo test` 跑，1 条要本机有浏览器、默认 `--ignored`），
+workspace 执行数 **102 → 109**。
+
+**进程存活以操作系统为 oracle**：`Child` 句柄会被 move 进守卫并被 Drop 消费掉，之后
+没有任何类型还能告诉我们它死没死，所以直接查进程表（Windows `tasklist /FI "PID eq N"`，
+Unix `kill -0`）——不是"句柄没了"这种同义反复。
+
+| 改动 | 结果 |
+|------|------|
+| 把守卫的 `Drop` 改成空实现 | `a_dropped_guard_kills_a_live_child_and_removes_the_profile` 与 `a_failed_launch_leaves_no_profile_behind` 同时红：`pid 18232 outlived the guard that owned it`、临时目录列表里多出条目 |
+| 把 `claim_profile_dir` 退回 `create_dir_all` | `a_stale_profile_is_never_adopted` 红：`an occupied profile directory was handed out again` |
+| 把收尾改回"只 kill 句柄 + 删目录" | 真机那条 `--ignored` 红：`profile "D:\\Temp\\cua-hub-browser-10920-0-222119000" survived the session drop` |
+| 修复后 | `cargo test -p cua-engine-browser` 5 过 1 ignore；`-- --ignored` 真机过；`browser_smoke`（走真实 session 收尾）前后对照 **8 进程 + 717 文件目录 → 0 + 0** |
+
+已知边界：CI 上没有浏览器，`a_real_browser_session_leaves_nothing_behind` 只能真机跑
+（`cargo test -p cua-engine-browser -- --ignored`）；Windows 上的反查每次收尾起一个
+PowerShell 进程（约 0.2~0.5 秒），只发生在 session 结束时；macOS 没有反查手段，
+仍只有 `Child::kill()`。profile 目录若始终删不掉，现在只警告不谎报，残留目录需要人工
+或后续的统一清理来收——本次没做自动清扫旧目录，避免误删。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。
