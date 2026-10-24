@@ -262,6 +262,13 @@ fn find_browser() -> Option<PathBuf> {
         if is_launchable(&path) {
             return Some(path);
         }
+        // Somebody set the variable on purpose; falling through to the generic
+        // "no Chrome/Edge found" would hide the real cause -- a typo, a
+        // directory, or a file without an execute bit.
+        tracing::warn!(
+            path = %path.display(),
+            "CUA_HUB_BROWSER is set but is not a launchable executable; ignoring it"
+        );
     }
 
     let candidates: Vec<PathBuf> = if cfg!(windows) {
