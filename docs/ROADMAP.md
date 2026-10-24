@@ -96,4 +96,20 @@
   session，约 0.7~1.2 秒固定开销。真要切主序，先做会话复用再谈。
   配套改动：WGC 拒绝时把**失败阶段**报出来（观测里新增 `backend_error`），
   以前 `capture_or_error` 写明了阶段却被调用方丢成 `None`，等于没有诊断。
+- [x] 浏览器进程与 profile 目录不再残留（issue #10）：`launch` 在 spawn 之后失败原本
+  直接返回，`Child` 还没进 `BrowserSession`，清理逻辑根本跑不到；现在由 `PendingBrowser`
+  守卫接管——直到 session 真的建起来，进程与目录的所有权都在它手上，落不回就杀+删。
+  顺带关掉两个连带问题：profile 目录名从 `pid-port`（可预测、且 `create_dir_all`
+  会**复用**上一次泄漏的目录，lib.rs 号称的 isolated profile 在失败路径上不成立）
+  改为 pid+进程内计数+亚秒时钟并用 `create_dir` 创建（已存在就换名重试）。
+  **真机量出来还有一层**：`Child::kill()` 杀的是我们 spawn 的那个进程，而 Edge 会
+  re-exec 出真正的浏览器再让原进程退出——本机一次正常收尾的 smoke 之后仍剩
+  8 个 msedge 进程和 717 个文件的目录，`remove_dir_all` 因目录被占用而失败、
+  又被 `let _` 吞掉。收尾改为按 `--user-data-dir` 反查仍在用该 profile 的浏览器进程
+  并杀掉，再带重试删目录；删不掉就 `warn` 说明留在临时目录，不再假装成功。
+  验证：本机三向负控——把守卫改成空实现，2 条测试立刻红（进程仍活 / 目录仍留）；把
+  `claim_profile_dir` 退回 `create_dir_all`，`a_stale_profile_is_never_adopted` 红
+  （"an occupied profile directory was handed out again"）；把收尾改回"只 kill + 删"，
+  真机那条 `--ignored` 测试报 "profile survived the session drop"。
+  修复后 workspace 执行数 **102 → 109**，真机 smoke 从 8 进程 + 717 文件目录降到 0 + 0。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"
