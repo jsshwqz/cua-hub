@@ -115,7 +115,10 @@
 - [ ] Linux 平台完整性（issue #11）**第一批**已做：`find` 不再在第一个精确命中处早停
   （同名 Label 会压过 Button，而 Label 没有动作）、`app_matches` 不再让空应用名命中任何查询、
   `state()`/`focused_element` 在 Linux 从"静默 `Ok(None)`"改为明确的 `Unsupported`
-  （观测里多带 `focused_element_note`）。**下一批要真图形会话**：`GetState` 读状态、
-  遍历超时与错误上报、`invoke` 后的效果校验、`invoke`/`set_value` 写死的 600/10 上限，
-  以及 Linux 的浏览器发现（候选是相对名，`exists()` 查的是 CWD 而不是 PATH，开箱不可用）。
+  （观测里多带 `focused_element_note`）。
+  **第 1 项也已做**：Linux 的浏览器发现——候选是相对名而 `exists()` 查的是 CWD 不是 PATH，
+  装着 `/usr/bin/chromium` 的机器不设 `CUA_HUB_BROWSER` 就报"no Chrome/Edge found"；
+  现在按 PATH 找、返回绝对路径，并把"存在"收紧成"是文件且可执行"。
+  **下一批要真图形会话**：`GetState` 读状态、遍历超时与错误上报、`invoke` 后的效果校验、
+  `invoke`/`set_value` 写死的 600/10 上限。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"
