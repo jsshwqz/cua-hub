@@ -112,4 +112,10 @@
   （"an occupied profile directory was handed out again"）；把收尾改回"只 kill + 删"，
   真机那条 `--ignored` 测试报 "profile survived the session drop"。
   修复后 workspace 执行数 **102 → 109**，真机 smoke 从 8 进程 + 717 文件目录降到 0 + 0。
+- [ ] Linux 平台完整性（issue #11）**第一批**已做：`find` 不再在第一个精确命中处早停
+  （同名 Label 会压过 Button，而 Label 没有动作）、`app_matches` 不再让空应用名命中任何查询、
+  `state()`/`focused_element` 在 Linux 从"静默 `Ok(None)`"改为明确的 `Unsupported`
+  （观测里多带 `focused_element_note`）。**下一批要真图形会话**：`GetState` 读状态、
+  遍历超时与错误上报、`invoke` 后的效果校验、`invoke`/`set_value` 写死的 600/10 上限，
+  以及 Linux 的浏览器发现（候选是相对名，`exists()` 查的是 CWD 而不是 PATH，开箱不可用）。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"

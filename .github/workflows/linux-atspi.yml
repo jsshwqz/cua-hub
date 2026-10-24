@@ -73,6 +73,12 @@ jobs:
 
       - name: Upload the evidence
         if: always()
+        # The PASS/FAIL table above is the evidence; the zip is a convenience copy.
+        # Artifact storage is an account-level quota (measured 2026-10-24: this repo
+        # holds 7MB of 15 artifacts, yet the upload was refused), so a full account
+        # must not turn a healthy accessibility run red -- that red reads exactly
+        # like "the backend broke" to whoever is reviewing the PR.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: linux-atspi-evidence

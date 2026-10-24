@@ -86,13 +86,49 @@ Unix `kill -0`）——不是"句柄没了"这种同义反复。
 | 把守卫的 `Drop` 改成空实现 | `a_dropped_guard_kills_a_live_child_and_removes_the_profile` 与 `a_failed_launch_leaves_no_profile_behind` 同时红：`pid 18232 outlived the guard that owned it`、临时目录列表里多出条目 |
 | 把 `claim_profile_dir` 退回 `create_dir_all` | `a_stale_profile_is_never_adopted` 红：`an occupied profile directory was handed out again` |
 | 把收尾改回"只 kill 句柄 + 删目录" | 真机那条 `--ignored` 红：`profile "D:\\Temp\\cua-hub-browser-10920-0-222119000" survived the session drop` |
-| 修复后 | `cargo test -p cua-engine-browser` 5 过 1 ignore；`-- --ignored` 真机过；`browser_smoke`（走真实 session 收尾）前后对照 **8 进程 + 717 文件目录 → 0 + 0** |
+| 修复后 | `cargo test -p cua-engine-browser` 13 过 1 ignore；`-- --ignored` 真机过；`browser_smoke`（走真实 session 收尾）前后对照 **8 进程 + 717 文件目录 → 0 + 0** |
 
 已知边界：CI 上没有浏览器，`a_real_browser_session_leaves_nothing_behind` 只能真机跑
 （`cargo test -p cua-engine-browser -- --ignored`）；Windows 上的反查每次收尾起一个
 PowerShell 进程（约 0.2~0.5 秒），只发生在 session 结束时；macOS 没有反查手段，
 仍只有 `Child::kill()`。profile 目录若始终删不掉，现在只警告不谎报，残留目录需要人工
 或后续的统一清理来收——本次没做自动清扫旧目录，避免误删。
+
+### 修复：Linux 无障碍匹配的三处静默错误（issue #11 第一批）
+
+审计里的 Linux 问题不是一条，这批先做**不需要真图形会话也能判对错**的两条，再把两条
+"静默缺位"改成有信号的；剩下要真机的（`GetState`、遍历超时、invoke 效果校验）留在下一批。
+
+- **同名控件选错**（`atspi.rs` 的 `find`）：精确命中即 `return true` 结束整棵树，先到的
+  同名控件胜出。GTK 的按钮自带一个同名的 label 子节点，于是 `find_control` 完全可能返回
+  一个**没有动作的 Label**，调用方照着它的位置去点才碰得到按钮。Windows 侧按
+  [Button, MenuItem, ListItem] 的角色优先级选，两侧行为不一致。现在把决定权收进 `pick()`：
+  遍历到的节点**全部看完**再判，精确优先于部分匹配，同桶内更可执行的角色胜出，
+  并列时取先见到的（编号不会因两次观测顺序抖动而换人）。
+- **空名字的应用匹配任何查询**（`app_matches`）：反向包含那条腿问的是 `want.contains(c)`，
+  而 `c` 是空串时对任何 `want` 都成立——没设置程序名的应用（Python 脚本、部分 Electron）
+  因此命中每一次查询，`snapshot_window` 可能选错窗口。空候选现在直接跳过。
+- **`state()` 在 Linux 恒 `Ok(None)`**：`None` 在契约里的意思是"这个控件没有状态可读"，
+  真实情况却是"我们还没去读"。混起来会让依赖它的调用方错误降级成坐标点击。改为返回新增的
+  `Error::Unsupported`；原注释里"AT-SPI 不把状态暴露为属性"的说法也是错的
+  （`org.a11y.atspi.Accessible.GetState` 读得到），一并改掉——实现留到能真机验证的下一批。
+- **`focused_element` 同理**：非 Windows 从 `Ok(None)` 改为 `Err(Unsupported)`。
+  `window_state` 把它当参考信息，那里仍是 null，但**多带一个 `focused_element_note`**
+  写明"读不到"而不是"没有控件持有焦点"；README 与 SKILL 的相应口径同时改掉。
+
+### 测试与验证（issue #11 第一批）
+
+- 新增 5 条纯函数测试（`pick` 的四种选择情形 + `app_matches` 的空名）。`atspi.rs` 在每个
+  宿主上都编译（只有非 Windows 才会被调用），所以这些断言本机也跑；workspace 执行数
+  **109 → 114**。
+  **两处负控实测**：把早停塞回 `pick` 的循环 → `the_button_wins_over_the_label_listed_before_it`
+  红（`left: "Label" / right: "Button"`）；去掉空名守卫 → `a_nameless_application_matches_no_query`
+  红（`assertion failed: !app_matches("", "", "thunar")`）。
+- **端到端的那条控制在 CI 图形作业**：GTK probe 现在放了一个裸 Label 和一个**同名** Button，
+  且 Label 先被深度优先遍历到；`linux-atspi-runtime.py` 断言 `find_control` 返回
+  `control_type == "Button"`。纯函数测试锁的是 `pick` 内部的决策，而修复前的早停发生在
+  `walk` 的回调里——那一层只有真树能暴露，所以两边都要。PR 的提交顺序就是
+  "先加断言（应当红）→ 再修（应当绿）"，CI 记录即证据。
 
 ## 0.1.5 — 2026-10-23
 

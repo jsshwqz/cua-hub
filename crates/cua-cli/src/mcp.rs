@@ -1393,7 +1393,13 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 }
             }
 
-            let focused = cua_engine_access::focused_element().ok().flatten();
+            // A null `focused_element` has two different meanings: "nothing is
+            // focused" (a clean pre-flight) and "this platform cannot tell"
+            // (no information at all). Say which one it was.
+            let (focused, focus_note) = match cua_engine_access::focused_element() {
+                Ok(node) => (node, None),
+                Err(e) => (None, Some(e.to_string())),
+            };
             let recorded = observations::record(observations::Observation {
                 id: observation_id.clone(),
                 window_id: window.id,
@@ -1418,6 +1424,11 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 "accessibility": accessibility,
                 "usage": "element_index and x/y are only valid with this observation_id. accessibility.tree is a unified diff against your previous observation of this window unless mode is full or baseline_reset: keep the mapping you have, apply the diff, and treat any index on a '-' line as retired. After acting, re-read this window.",
             });
+            if let Some(note) = focus_note {
+                if let Some(map) = meta.as_object_mut() {
+                    map.insert("focused_element_note".to_string(), json!(note));
+                }
+            }
             if let Some(shot) = screenshot {
                 if let Some(map) = meta.as_object_mut() {
                     map.insert("screenshot".to_string(), shot);

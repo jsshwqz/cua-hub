@@ -218,6 +218,17 @@ def scenario(identity: str) -> None:
             "type into the entry below" in body,
             "the label only exists inside the probe frame",
         )
+        # Two controls answer to `probe-ambiguous` and the walk meets the label
+        # first, so a find that stops at the first exact hit hands back something
+        # that cannot be pressed. The actionable role has to win.
+        found = call("find_control", {"name": "probe-ambiguous"})
+        found_json = found["json"] or {}
+        check(
+            f"[{identity}] find_control prefers the button over a same-named label",
+            found_json.get("control_type") == "Button",
+            f"got {found_json.get('control_type')!r} "
+            f"name={found_json.get('name')!r} {found['text'][:120]}",
+        )
         # The contract being checked is that a missing image is announced, not
         # that Xvfb can always produce one: window_state must not silently drop
         # the half of the observation that failed.
