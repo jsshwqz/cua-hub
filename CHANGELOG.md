@@ -39,9 +39,9 @@ RawViewWalker 走到的元素，解析之后不再按名二次查找（二次查
   本机 Windows 10、约 2300 个 control-view 节点的桌面、debug 构建、单轮测量：`find` 约 15s；
   同轮同规模的 control-view 快照约 14s——成本在树的大小，不在 walker 本身。共享机上有
   并发任务，这组数字用于说明量级，不作为基准；release 未单独取数。
-- workspace 测试 194 passed / 2 ignored；`cargo fmt --check` 与
+- 本机 Windows workspace 测试 192 passed / 2 ignored；`cargo fmt --check` 与
   `clippy --all-targets -D warnings` 干净；CI `test (ubuntu-24.04)` / `test (windows-latest)`
-  在 47ce157 与 f520201 上均绿。
+  在 47ce157、f520201 与最终提交上均绿（Linux 侧计数以 CI 自己的输出为准）。
 
 ### 修复：Anthropic 会话被解析失败的 tool_use 毒化（issue #9）
 
