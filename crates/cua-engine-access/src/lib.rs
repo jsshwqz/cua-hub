@@ -139,6 +139,103 @@ pub struct ControlState {
     pub range_value: Option<f64>,
 }
 
+/// What the control itself looks like after an action the toolkit answered.
+///
+/// A pattern call answering successfully only means the toolkit processed the
+/// request. The audit found a panel button that answered, opened nothing, and left
+/// the tree without menu items, while the CLI reported "invoked via accessibility
+/// pattern" unconditionally (issue #11 item 8). This verdict is read back from the
+/// control, so a caller can tell "answered and something moved" from "answered and
+/// nothing observable moved" without taking a screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    /// A readable state of the control differs from before the action.
+    Changed,
+    /// Every readable state is identical to before the action.
+    Unchanged,
+    /// Too little was readable to claim either way.
+    Unverifiable,
+}
+
+/// An action the toolkit answered, plus the control's state read back after it.
+pub struct ActionReport {
+    pub node: UiNode,
+    pub effect: Effect,
+    /// The state read back after the action, when the platform can read one.
+    pub state: Option<ControlState>,
+}
+
+impl Effect {
+    /// The word a caller sees, and the word the documentation describes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::Changed => "changed",
+            Effect::Unchanged => "unchanged",
+            Effect::Unverifiable => "unverifiable",
+        }
+    }
+}
+
+/// The states an action is expected to be able to move.
+///
+/// `name` and `control_type` are left out on purpose: they identify the control, so
+/// counting them would report `changed` for a control the action never touched.
+fn states_equivalent(before: &ControlState, after: &ControlState) -> bool {
+    before.enabled == after.enabled
+        && before.offscreen == after.offscreen
+        && before.toggle == after.toggle
+        && before.expanded == after.expanded
+        && match (before.range_value, after.range_value) {
+            // total_cmp, not ==: a slider may answer with a NaN, and NaN != NaN
+            // would invent a change that did not happen.
+            (Some(a), Some(b)) => a.total_cmp(&b) == std::cmp::Ordering::Equal,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// Judge an action from the control's own state before and after it.
+///
+/// `value` is deliberately not compared here -- setting text is judged against the
+/// text asked for, by [`judge_text_effect`].
+pub fn judge_effect(before: Option<&ControlState>, after: Option<&ControlState>) -> Effect {
+    let (Some(before), Some(after)) = (before, after) else {
+        // A missing readback is not evidence that nothing happened, and reporting
+        // `unchanged` for it would talk the caller out of a retry.
+        return Effect::Unverifiable;
+    };
+    if !states_equivalent(before, after) {
+        return Effect::Changed;
+    }
+    // Nothing moved. That is only a claim about the action when the control
+    // publishes a state an action could move: a plain button has no toggle and no
+    // expand bit, so "identical before and after" would report `unchanged` for every
+    // successful button press in the desktop -- a false negative that would teach
+    // callers to ignore the verdict, which is how the original bug got trusted.
+    if before.toggle.is_none()
+        && before.expanded.is_none()
+        && after.toggle.is_none()
+        && after.expanded.is_none()
+    {
+        return Effect::Unverifiable;
+    }
+    Effect::Unchanged
+}
+
+/// Judge a text assignment by reading the text back.
+///
+/// Only the exact requested value counts as changed: a field that ends up holding
+/// something else did not take the text, whatever the pattern replied. A platform
+/// that does not read `value` at all answers `unverifiable` rather than guessing.
+pub fn judge_text_effect(after: Option<&ControlState>, expected: &str) -> Effect {
+    match after.and_then(|state| state.value.as_deref()) {
+        Some(text) if text == expected => Effect::Changed,
+        Some(_) => Effect::Unchanged,
+        None => Effect::Unverifiable,
+    }
+}
+
 /// Snapshot the control tree rooted at one window, so indexes are scoped to the
 /// window the caller is about to act on rather than the whole desktop.
 ///
@@ -384,13 +481,26 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
 pub const DEFAULT_ACTION_NODES: usize = 600;
 pub const DEFAULT_ACTION_DEPTH: usize = 10;
 
+/// How long to wait before re-reading a control that looks untouched right after an
+/// answered action.
+///
+/// One retry, on both platforms: long enough for a toolkit that updates on the next
+/// paint, short enough that the caller still gets its answer promptly. On AT-SPI
+/// each read is a bounded D-Bus round trip, so the worst case this adds is one more
+/// deadline, not an unbounded wait.
+pub const EFFECT_SETTLE_MS: u64 = 200;
+
 /// Invoke a control through its accessibility Invoke pattern.
 ///
 /// Returns `None` when the control has no invoke pattern (caller should fall back
 /// to a click). A search that ran out of tree before it ever met the control
 /// answers `Err` and says so: that is not a missing pattern, and treating it as
 /// one sends the caller to coordinates for a control nobody looked at.
-pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+///
+/// A `Some` report carries an [`Effect`] read back from the control. The pattern
+/// answering is not the same fact as the control having done something, and the
+/// two used to be reported as one.
+pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
         imp::invoke(name)
@@ -405,7 +515,7 @@ pub fn invoke(name: &str) -> Result<Option<UiNode>> {
 ///
 /// Only AT-SPI honours them: UIA walks the element tree live and has no node
 /// budget to run out of, so the numbers are ignored there rather than faked.
-pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
+pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
         let _ = (max_nodes, max_depth);
@@ -421,7 +531,11 @@ pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Opt
 /// when the control does not expose that pattern (caller can fall back to focus +
 /// typing); a search that stopped before reaching it answers `Err`, per
 /// [`invoke`].
-pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+///
+/// The report's [`Effect`] is judged against the text asked for, so
+/// `unverifiable` on a platform that cannot read the field back is a statement
+/// about the readback, not about the assignment.
+pub fn set_value(name: &str, text: &str) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
         imp::set_value(name, text)
@@ -439,7 +553,7 @@ pub fn set_value_with(
     text: &str,
     max_nodes: usize,
     max_depth: usize,
-) -> Result<Option<UiNode>> {
+) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
         let _ = (max_nodes, max_depth);
@@ -643,7 +757,10 @@ fn control_type_name(id: u32) -> &'static str {
 
 #[cfg(windows)]
 mod imp {
-    use super::{child_signature, control_type_name, UiNode, UiSnapshot};
+    use super::{
+        child_signature, control_type_name, judge_effect, judge_text_effect, ActionReport,
+        ControlState, Effect, UiNode, UiSnapshot, EFFECT_SETTLE_MS,
+    };
     use cua_core::{Error, Result};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -982,7 +1099,7 @@ mod imp {
             .filter(|n| n.rect.2 > 0 && n.rect.3 > 0))
     }
 
-    pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+    pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
         use windows::Win32::UI::Accessibility::{IUIAutomationInvokePattern, UIA_InvokePatternId};
 
         let Some(element) = find_element(name)? else {
@@ -993,15 +1110,33 @@ mod imp {
             unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) };
         match pattern {
             Ok(p) => {
+                // Read the control before the action so that "the pattern answered"
+                // and "the control did something" can be told apart afterwards
+                // without asking for a screenshot.
+                let before = state_of(&element);
                 unsafe { p.Invoke() }
                     .map_err(|e| Error::Capture(format!("UIA Invoke failed: {e}")))?;
-                Ok(Some(node))
+                let mut after = state_of(&element);
+                let mut effect = judge_effect(Some(&before), Some(&after));
+                if effect == Effect::Unchanged {
+                    // A provider that updates on the next paint can look untouched
+                    // to an immediate read, so give it one short wait. Cheaper here
+                    // than on AT-SPI, where every read is a D-Bus round trip.
+                    std::thread::sleep(std::time::Duration::from_millis(EFFECT_SETTLE_MS));
+                    after = state_of(&element);
+                    effect = judge_effect(Some(&before), Some(&after));
+                }
+                Ok(Some(ActionReport {
+                    node,
+                    effect,
+                    state: Some(after),
+                }))
             }
             Err(_) => Ok(None),
         }
     }
 
-    pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+    pub fn set_value(name: &str, text: &str) -> Result<Option<ActionReport>> {
         use windows::core::BSTR;
         use windows::Win32::UI::Accessibility::{IUIAutomationValuePattern, UIA_ValuePatternId};
 
@@ -1015,13 +1150,29 @@ mod imp {
             Ok(p) => {
                 unsafe { p.SetValue(&BSTR::from(text)) }
                     .map_err(|e| Error::Capture(format!("UIA SetValue failed: {e}")))?;
-                Ok(Some(node))
+                let after = state_of(&element);
+                Ok(Some(ActionReport {
+                    effect: judge_text_effect(Some(&after), text),
+                    state: Some(after),
+                    node,
+                }))
             }
             Err(_) => Ok(None),
         }
     }
 
-    pub fn state(name: &str) -> Result<Option<super::ControlState>> {
+    pub fn state(name: &str) -> Result<Option<ControlState>> {
+        let Some(element) = find_element(name)? else {
+            return Ok(None);
+        };
+        Ok(Some(state_of(&element)))
+    }
+
+    /// Every state read for an element the caller already holds.
+    ///
+    /// An action has to read the same control before and after firing it; re-finding
+    /// it by name would walk the desktop twice more for numbers already in hand.
+    fn state_of(element: &IUIAutomationElement) -> ControlState {
         use windows::Win32::UI::Accessibility::{
             ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
             ExpandCollapseState_PartiallyExpanded, IUIAutomationExpandCollapsePattern,
@@ -1031,10 +1182,7 @@ mod imp {
             UIA_ValuePatternId,
         };
 
-        let Some(element) = find_element(name)? else {
-            return Ok(None);
-        };
-        let node = element_to_node(&element);
+        let node = element_to_node(element);
 
         let toggle = unsafe {
             element.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
@@ -1086,7 +1234,7 @@ mod imp {
         .ok()
         .and_then(|p| unsafe { p.CurrentValue().ok() });
 
-        Ok(Some(super::ControlState {
+        ControlState {
             name: node.name,
             control_type: node.control_type,
             enabled: unsafe { element.CurrentIsEnabled() }
@@ -1099,7 +1247,7 @@ mod imp {
             value,
             expanded,
             range_value,
-        }))
+        }
     }
 
     fn find_element(name: &str) -> Result<Option<IUIAutomationElement>> {

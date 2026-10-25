@@ -283,10 +283,12 @@ fn main() -> Result<()> {
         } => {
             // Prefer the Invoke pattern: no pointer movement, works when the
             // control is covered by another window.
-            if let Some(node) = cua_engine_access::invoke(&name)? {
+            if let Some(report) = cua_engine_access::invoke(&name)? {
                 println!(
-                    "invoked {} \"{}\" via accessibility pattern",
-                    node.control_type, node.name
+                    "invoked {} \"{}\" via accessibility pattern; effect={}",
+                    report.node.control_type,
+                    report.node.name,
+                    report.effect.as_str()
                 );
                 return Ok(());
             }

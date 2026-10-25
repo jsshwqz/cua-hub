@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
 
-use crate::{control_type_name, UiNode, UiSnapshot};
+use crate::{control_type_name, ActionReport, ControlState, Effect, UiNode, UiSnapshot};
 
 const A11Y_BUS: &str = "org.a11y.Bus";
 const A11Y_PATH: &str = "/org/a11y/bus";
@@ -766,12 +766,46 @@ fn capped(name: &str, action: &str, visited: usize, max_nodes: usize, max_depth:
     ))
 }
 
+/// Why a name-based action that fired nothing should say what it says.
+///
+/// Kept apart from the walk so the ordering has a test. Silence outranks a
+/// truncated walk because meeting the control and getting no reply is the more
+/// specific fact; `None` is left for the one case where `Ok(None)` is honest,
+/// namely a walk that finished and found the control without the pattern.
+fn action_miss(
+    name: &str,
+    action: &str,
+    silence: Option<&str>,
+    walked: &WalkReport,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Option<Error> {
+    if let Some(reason) = silence {
+        return Some(unanswered_call(action, name, reason));
+    }
+    if walked.truncated {
+        return Some(capped(name, action, walked.visited, max_nodes, max_depth));
+    }
+    None
+}
+
+/// Read one control's state without a second walk, swallowing a failed read.
+///
+/// A failed readback is not an error: the action it follows already answered. It
+/// becomes `unverifiable`, which the caller can act on, instead of an `Err` that
+/// would suggest the action itself did not happen.
+fn read_state(conn: &Connection, node: &UiNode, dest: &str, path: &str) -> Option<ControlState> {
+    state_words(conn, dest, path)
+        .ok()
+        .map(|words| decode_state(node, &words))
+}
+
 /// Fire the control's first AT-SPI action (usually "click"/"press").
 ///
 /// A control nobody answered is an `Err`, not `Ok(None)`: the caller's documented
 /// response to `None` is a coordinate click, and dropping to coordinates because a
 /// toolkit was silent is exactly the mistake this backend keeps having to unmake.
-pub fn invoke(name: &str) -> Result<Option<UiNode>> {
+pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
     invoke_with(
         name,
         crate::DEFAULT_ACTION_NODES,
@@ -780,13 +814,17 @@ pub fn invoke(name: &str) -> Result<Option<UiNode>> {
 }
 
 /// [`invoke`] with the traversal limits spelled out.
-pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
+pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<ActionReport>> {
     let mut hit = None;
     let mut silence: Option<String> = None;
     let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
+        // Read the control before firing it. "The pattern answered" and "the
+        // control did something" are two facts, and the audit found a panel button
+        // that gave the first answer while opening nothing.
+        let before = read_state(conn, node, dest, path);
         let dest_owned = dest.to_string();
         let path_owned = path.to_string();
         match attempted(conn, dest, move |conn| {
@@ -803,7 +841,20 @@ pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Opt
             // `false` is "the toolkit refused", not "the control fired": only the
             // first counts as an invoke.
             Attempt::Answered(true) => {
-                hit = Some(node.clone());
+                let mut after = read_state(conn, node, dest, path);
+                let mut effect = crate::judge_effect(before.as_ref(), after.as_ref());
+                if effect == Effect::Unchanged {
+                    // One bounded re-read: a toolkit that updates on the next paint
+                    // looks untouched to a call made immediately after the action.
+                    std::thread::sleep(Duration::from_millis(crate::EFFECT_SETTLE_MS));
+                    after = read_state(conn, node, dest, path);
+                    effect = crate::judge_effect(before.as_ref(), after.as_ref());
+                }
+                hit = Some(ActionReport {
+                    node: node.clone(),
+                    effect,
+                    state: after,
+                });
                 return true;
             }
             Attempt::Answered(false) => {}
@@ -815,13 +866,15 @@ pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Opt
         false
     })?;
     if hit.is_none() {
-        // Silence first: we did meet a control by that name, and it is the more
-        // specific fact than "the walk ran out".
-        if let Some(reason) = silence {
-            return Err(unanswered_call("invoke", name, &reason));
-        }
-        if report.truncated {
-            return Err(capped(name, "invoke", report.visited, max_nodes, max_depth));
+        if let Some(miss) = action_miss(
+            name,
+            "invoke",
+            silence.as_deref(),
+            &report,
+            max_nodes,
+            max_depth,
+        ) {
+            return Err(miss);
         }
     }
     Ok(hit)
@@ -829,7 +882,7 @@ pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Opt
 
 /// Replace text through the EditableText interface. See [`invoke`] for why a
 /// silent toolkit is an `Err` here rather than a `None`.
-pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
+pub fn set_value(name: &str, text: &str) -> Result<Option<ActionReport>> {
     set_value_with(
         name,
         text,
@@ -839,12 +892,17 @@ pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
 }
 
 /// [`set_value`] with the traversal limits spelled out.
+///
+/// The verdict here is `unverifiable` on this backend, not because the write did
+/// not happen but because reading a field's text needs the Text interface, which
+/// `control_state` does not query yet (see ROADMAP). `Changed` is only claimed when
+/// the control answers with the exact text asked for.
 pub fn set_value_with(
     name: &str,
     text: &str,
     max_nodes: usize,
     max_depth: usize,
-) -> Result<Option<UiNode>> {
+) -> Result<Option<ActionReport>> {
     let mut hit = None;
     let mut silence: Option<String> = None;
     let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
@@ -869,7 +927,12 @@ pub fn set_value_with(
             )
         }) {
             Attempt::Answered(true) => {
-                hit = Some(node.clone());
+                let state = read_state(conn, node, dest, path);
+                hit = Some(ActionReport {
+                    node: node.clone(),
+                    effect: crate::judge_text_effect(state.as_ref(), text),
+                    state,
+                });
                 return true;
             }
             Attempt::Answered(false) => {}
@@ -881,17 +944,15 @@ pub fn set_value_with(
         false
     })?;
     if hit.is_none() {
-        if let Some(reason) = silence {
-            return Err(unanswered_call("set_value", name, &reason));
-        }
-        if report.truncated {
-            return Err(capped(
-                name,
-                "set_value",
-                report.visited,
-                max_nodes,
-                max_depth,
-            ));
+        if let Some(miss) = action_miss(
+            name,
+            "set_value",
+            silence.as_deref(),
+            &report,
+            max_nodes,
+            max_depth,
+        ) {
+            return Err(miss);
         }
     }
     Ok(hit)
@@ -1276,6 +1337,172 @@ mod tests {
             !message.to_lowercase().contains("no such pattern"),
             "the old wording must not survive in the new one"
         );
+    }
+
+    fn readable(toggle: Option<&str>, expanded: Option<&str>) -> crate::ControlState {
+        crate::ControlState {
+            name: "probe-toggle".to_string(),
+            control_type: "CheckBox".to_string(),
+            enabled: true,
+            offscreen: false,
+            toggle: toggle.map(str::to_string),
+            value: None,
+            expanded: expanded.map(str::to_string),
+            range_value: None,
+        }
+    }
+
+    fn walked(truncated: bool, visited: usize) -> WalkReport {
+        WalkReport {
+            truncated,
+            visited,
+            unreadable: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_answered_action_that_moves_the_control_says_changed() {
+        assert_eq!(
+            crate::judge_effect(
+                Some(&readable(Some("off"), None)),
+                Some(&readable(Some("on"), None))
+            ),
+            Effect::Changed
+        );
+    }
+
+    #[test]
+    fn an_answered_action_that_moves_nothing_says_unchanged() {
+        // The audit's shape: the panel button answered DoAction and opened nothing.
+        // Reporting that as a plain success is what made the call untrustworthy.
+        assert_eq!(
+            crate::judge_effect(
+                Some(&readable(None, Some("collapsed"))),
+                Some(&readable(None, Some("collapsed")))
+            ),
+            Effect::Unchanged
+        );
+    }
+
+    #[test]
+    fn an_unreadable_readback_is_never_reported_as_unchanged() {
+        // The other direction matters just as much: "nothing moved" is a claim that
+        // talks the caller out of a retry, so it cannot rest on a read that failed.
+        let before = readable(Some("off"), None);
+        assert_eq!(
+            crate::judge_effect(Some(&before), None),
+            Effect::Unverifiable
+        );
+        assert_eq!(
+            crate::judge_effect(None, Some(&before)),
+            Effect::Unverifiable
+        );
+        assert_eq!(crate::judge_effect(None, None), Effect::Unverifiable);
+    }
+
+    #[test]
+    fn a_plain_button_that_shows_no_state_is_not_reported_unchanged() {
+        // The flood guard. A press that works looks exactly like this on the control
+        // itself, so calling it "unchanged" would tell the caller the action did
+        // nothing every time they invoke a button -- and a verdict that is wrong that
+        // often gets ignored, which is how the original bug stayed trusted.
+        assert_eq!(
+            crate::judge_effect(Some(&readable(None, None)), Some(&readable(None, None))),
+            Effect::Unverifiable
+        );
+    }
+
+    #[test]
+    fn what_identifies_a_control_is_not_evidence_of_an_effect() {
+        let before = readable(Some("off"), None);
+        let mut after = readable(Some("off"), None);
+        after.name = "someone renamed me".to_string();
+        after.control_type = "Text".to_string();
+        assert_eq!(
+            crate::judge_effect(Some(&before), Some(&after)),
+            Effect::Unchanged,
+            "a rename is not a state the action moved"
+        );
+    }
+
+    #[test]
+    fn a_slider_that_answers_twice_with_nan_did_not_move() {
+        // NaN != NaN, so an equality check here would report a change every single
+        // time for any control whose range read is not a number.
+        let mut before = readable(Some("off"), None);
+        let mut after = readable(Some("off"), None);
+        before.range_value = Some(12.5);
+        after.range_value = Some(12.5);
+        assert_eq!(
+            crate::judge_effect(Some(&before), Some(&after)),
+            Effect::Unchanged
+        );
+        before.range_value = Some(f64::NAN);
+        after.range_value = Some(f64::NAN);
+        assert_eq!(
+            crate::judge_effect(Some(&before), Some(&after)),
+            Effect::Unchanged,
+            "NaN must not invent a change"
+        );
+    }
+
+    #[test]
+    fn a_text_assignment_is_judged_against_the_text_asked_for() {
+        let mut answered = readable(None, None);
+        answered.value = Some("hello".to_string());
+        assert_eq!(
+            crate::judge_text_effect(Some(&answered), "hello"),
+            Effect::Changed
+        );
+        answered.value = Some("hell".to_string());
+        assert_eq!(
+            crate::judge_text_effect(Some(&answered), "hello"),
+            Effect::Unchanged,
+            "a field holding other text did not take this one"
+        );
+        // AT-SPI does not read a field's text yet: no verdict rather than a guess.
+        assert_eq!(
+            crate::judge_text_effect(Some(&readable(None, None)), "hello"),
+            Effect::Unverifiable
+        );
+        assert_eq!(
+            crate::judge_text_effect(None, "hello"),
+            Effect::Unverifiable
+        );
+    }
+
+    #[test]
+    fn silence_outranks_a_truncated_walk_in_the_answer() {
+        let miss = action_miss(
+            "probe-toggle",
+            "invoke",
+            Some("no reply within 1200ms"),
+            &walked(true, 600),
+            600,
+            10,
+        )
+        .unwrap()
+        .to_string();
+        assert!(miss.contains("did not get an answer"), "{miss}");
+        assert!(
+            !miss.contains("did not reach"),
+            "meeting the control is the more specific fact: {miss}"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_ran_out_without_silence_blames_the_cap() {
+        let miss = action_miss("probe-toggle", "invoke", None, &walked(true, 1), 1, 10)
+            .unwrap()
+            .to_string();
+        assert!(miss.contains("did not reach"), "{miss}");
+    }
+
+    #[test]
+    fn a_walk_that_finished_and_found_nothing_is_not_an_error() {
+        // The one case where Ok(None) is the honest answer: the control was seen and
+        // does not expose the pattern.
+        assert!(action_miss("probe-toggle", "invoke", None, &walked(false, 42), 600, 10).is_none());
     }
 
     #[test]
