@@ -21,7 +21,7 @@ Perception
 - `capture_screen` — primary display as a JPEG plus dimensions.
 - `list_windows {query?, include_minimized?}` — top-level windows with id, app, title, bounds, focus state.
 - `focus_window {window}` — focus by id, an exact-one title/app selector, or `{app,id}`; zero or several matches return `target_not_found` / `target_ambiguous` with candidates.
-- `window_input {window, text, x?, y?, submit?, interval_ms?}` — atomically focus, click a window-relative point, type, and optionally press Return; the target must resolve to exactly one window.
+- `window_input {window, text, x?, y?, submit?, interval_ms?}` — atomically focus, click a window-relative point, type, and optionally press Return; the target must resolve to exactly one window. `x`/`y` are measured from the window's own top-left and must land inside its rectangle — an offset that would escape is refused with `offset_outside_window`, and giving only one axis is refused too, because half a point is not a click. This tool cannot reach outside the window it names; if you need a screen coordinate, use `click` with absolute pixels and say so.
 - `screen_info` — screen size, origin, DPI, cursor position (use to validate coordinates).
 - `accessibility_tree {max_nodes?, depth?}` — desktop-wide UIA (Windows) / AT-SPI (Linux) tree. Prefer `window_state` for in-window indexes.
 - `find_control {name}` — locate by accessible name or `id:<AutomationId>`, returns rectangle and centre.

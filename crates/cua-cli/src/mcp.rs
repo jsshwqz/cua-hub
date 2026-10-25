@@ -254,6 +254,8 @@ pub async fn serve_http(bind: &str) -> Result<()> {
         );
     }
 
+    let notice = unauthenticated_remote_notice(bind, local, &token);
+
     use axum::{
         extract::State,
         http::{HeaderMap, StatusCode},
@@ -294,6 +296,15 @@ pub async fn serve_http(bind: &str) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("bind {bind}: {e}"))?;
     eprintln!("MCP HTTP listening on http://{bind}/mcp");
+    if let Some(notice) = notice {
+        // After the bind succeeded, so a port that never opened is not announced as
+        // one. Refusing to bind was already loud; getting through the opt-in was not.
+        eprint!("{notice}");
+        tracing::warn!(
+            bind,
+            "MCP HTTP bound to a non-loopback address with no bearer token: unauthenticated remote control of this desktop"
+        );
+    }
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("http server: {e}"))?;
@@ -398,6 +409,99 @@ fn effect_note(report: &cua_engine_access::ActionReport, text_write: bool) -> St
         report.effect.as_str(),
         readback.join(" ")
     )
+}
+
+/// Where a window-relative offset actually lands, or why it is refused.
+///
+/// `window_input` documents that its `x`/`y` aim inside the named window, and the
+/// numbers come from the model. Without a containment check an offset is a click
+/// anywhere on the desktop -- while the answer still reports the window it was
+/// "aimed at". Arithmetic stays in i64 because `as i32` would wrap a huge value
+/// straight back into the window's own neighbourhood, which is the failure this
+/// prevents rather than the one it looks like.
+fn window_relative_point(
+    window: &cua_io::WindowInfo,
+    x: Option<i64>,
+    y: Option<i64>,
+) -> std::result::Result<Option<(i32, i32)>, Value> {
+    let (x, y) = match (x, y) {
+        (None, None) => return Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(tool_err(json!({
+                "ok": false,
+                "error": {
+                    "code": "half_a_point",
+                    "message": "window-relative input needs both x and y; one alone is not a point",
+                    "retry": true,
+                }
+            })));
+        }
+        (Some(x), Some(y)) => (x, y),
+    };
+    if x < 0 || y < 0 || x >= window.width as i64 || y >= window.height as i64 {
+        return Err(tool_err(json!({
+            "ok": false,
+            "error": {
+                "code": "offset_outside_window",
+                "message": format!(
+                    "window-relative point ({x},{y}) is outside {} {:?} ({}x{}); this tool never clicks outside the window it names",
+                    window.app, window.title, window.width, window.height
+                ),
+                "window": {
+                    "x": window.x,
+                    "y": window.y,
+                    "width": window.width,
+                    "height": window.height,
+                },
+                "hint": "aim inside the window, or use click with absolute screen pixels knowingly",
+                "retry": true,
+            }
+        })));
+    }
+    let absolute_x = window.x as i64 + x;
+    let absolute_y = window.y as i64 + y;
+    match (i32::try_from(absolute_x), i32::try_from(absolute_y)) {
+        (Ok(px), Ok(py)) => Ok(Some((px, py))),
+        _ => Err(tool_err(format!(
+            "window-relative point ({x},{y}) resolves to ({absolute_x},{absolute_y}), outside the coordinate range this desktop can address"
+        ))),
+    }
+}
+
+/// The centre of a control rectangle, or `None` when the rectangle is degenerate.
+///
+/// A toolkit answers `(0,0,0,0)` for a control it has never laid out, and the
+/// "centre" of that is the top-left pixel of the screen. Every fallback click goes
+/// through here so the check cannot be forgotten by the next call site.
+fn control_center(rect: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
+    let (x, y, w, h) = rect;
+    (w > 0 && h > 0).then(|| (x + w / 2, y + h / 2))
+}
+
+/// What to print when the HTTP endpoint will accept callers it cannot authenticate.
+///
+/// Refusing to bind was loud; passing the `CUA_HUB_ALLOW_REMOTE=1` opt-in was not,
+/// so an operator who set it for a quick test never learned that the open port is an
+/// unauthenticated remote-control desk for this machine -- `run_task` with the code
+/// engine included.
+fn unauthenticated_remote_notice(
+    bind: &str,
+    local: bool,
+    token: &Option<String>,
+) -> Option<String> {
+    if local || token.is_some() {
+        return None;
+    }
+    Some(format!(
+        "\n==================================================================\n\
+         SECURITY: MCP HTTP is listening on {bind} with NO authentication.\n\
+         Anyone who can reach this port can drive this desktop -- screenshot,\n\
+         click, type, and run_task (which can execute commands on this machine).\n\
+         Set CUA_HUB_MCP_TOKEN to require a bearer token, or bind to 127.0.0.1\n\
+         and front it with your own authenticated proxy. You opted in with\n\
+         CUA_HUB_ALLOW_REMOTE=1; unset it to make a non-loopback bind refuse.\n\
+         ==================================================================\n"
+    ))
 }
 
 fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
@@ -1572,6 +1676,14 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             let submit = args["submit"].as_bool().unwrap_or(false);
             let interval_ms = args["interval_ms"].as_u64().unwrap_or(8);
+            // Validate the aim before touching the desktop: raising a window is a
+            // side effect, and a call that is about to be refused should never have
+            // changed what the user sees. It also means the containment answer
+            // arrives on platforms where focusing is not implemented at all.
+            let aim = match window_relative_point(&window, args["x"].as_i64(), args["y"].as_i64()) {
+                Ok(aim) => aim,
+                Err(e) => return e,
+            };
             if let Err(e) = cua_engine_access::focus_window(window.id) {
                 return tool_err(json!({
                     "ok": false,
@@ -1582,12 +1694,9 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     }
                 }));
             }
-            if let (Some(x), Some(y)) = (args["x"].as_i64(), args["y"].as_i64()) {
+            if let Some((px, py)) = aim {
                 let action = Action::Click {
-                    at: Point::new(
-                        window.x.saturating_add(x as i32),
-                        window.y.saturating_add(y as i32),
-                    ),
+                    at: Point::new(px, py),
                     button: cua_core::MouseButton::Left,
                     double: false,
                 };
@@ -1705,24 +1814,20 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     effect_note(&report, false)
                 )),
                 Ok(None) => {
-                    let (x, y, w, h) = resolved.node.rect;
-                    if w <= 0 || h <= 0 {
+                    let Some(center) = control_center(resolved.node.rect) else {
                         return tool_err(format!(
                             "control at index {index} has no usable rectangle"
                         ));
-                    }
+                    };
                     let action = Action::Click {
-                        at: Point::new(x + w / 2, y + h / 2),
+                        at: Point::new(center.0, center.1),
                         button: cua_core::MouseButton::Left,
                         double: false,
                     };
                     match cua_io::apply(&action, 1.0) {
                         Ok(()) => tool_ok(format!(
                             "clicked {} \"{}\" at ({},{})",
-                            resolved.node.control_type,
-                            resolved.node.name,
-                            x + w / 2,
-                            y + h / 2
+                            resolved.node.control_type, resolved.node.name, center.0, center.1
                         )),
                         Err(e) => tool_err(e),
                     }
@@ -1877,19 +1982,20 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             }
             match cua_engine_access::find(&name, 400, 8) {
                 Ok(Some(node)) => {
-                    let (x, y, w, h) = node.rect;
+                    let Some(center) = control_center(node.rect) else {
+                        return tool_err(format!(
+                            "control {name:?} reports no usable rectangle, so there is nothing to click"
+                        ));
+                    };
                     let action = Action::Click {
-                        at: Point::new(x + w / 2, y + h / 2),
+                        at: Point::new(center.0, center.1),
                         button: cua_core::MouseButton::Left,
                         double: false,
                     };
                     match cua_io::apply(&action, 1.0) {
                         Ok(()) => tool_ok(format!(
                             "clicked {} \"{}\" at ({},{})",
-                            node.control_type,
-                            node.name,
-                            x + w / 2,
-                            y + h / 2
+                            node.control_type, node.name, center.0, center.1
                         )),
                         Err(e) => tool_err(e),
                     }
@@ -1907,14 +2013,16 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     Ok(r) => r,
                     Err(e) => return e,
                 };
-                let (x, y, w, h) = resolved.node.rect;
-                if w <= 0 || h <= 0 {
-                    return stale_err(format!("element_index {index} has no usable rectangle"));
-                }
+                let (x, y) = match control_center(resolved.node.rect) {
+                    Some(center) => center,
+                    None => {
+                        return stale_err(format!("element_index {index} has no usable rectangle"))
+                    }
+                };
                 // A node inside a popup must not trigger activation of the
                 // owner window: that closes the menu before the click lands.
                 target_window = resolved.focus_window;
-                (x + w / 2, y + h / 2)
+                (x, y)
             } else if let (Some(x), Some(y)) = (args["x"].as_f64(), args["y"].as_f64()) {
                 let shot_id = args["screenshot_id"].as_str();
                 match observation_id.and_then(observations::get) {
@@ -2379,7 +2487,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "window_input",
-            "description": "Atomically focus a window, optionally click a window-relative physical point, type text, and optionally press Return. The window must resolve to exactly one target; ambiguous or missing targets return candidates and never fall back to an unrelated app.",
+            "description": "Atomically focus a window, optionally click a window-relative physical point, type text, and optionally press Return. The window must resolve to exactly one target; ambiguous or missing targets return candidates and never fall back to an unrelated app. The window-relative point is enforced: it has to land inside that window's own rectangle, otherwise the call is refused with offset_outside_window rather than clicking something else, and both axes must be given together.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2399,8 +2507,8 @@ fn tool_defs() -> Value {
                         ]
                     },
                     "text": { "type": "string" },
-                    "x": { "type": "integer", "description": "Window-relative physical X" },
-                    "y": { "type": "integer", "description": "Window-relative physical Y" },
+                    "x": { "type": "integer", "description": "Window-relative physical X, measured from the window's own top-left; must be inside the window (0 .. width-1)" },
+                    "y": { "type": "integer", "description": "Window-relative physical Y, measured from the window's own top-left; must be inside the window (0 .. height-1). Needs x as well." },
                     "submit": { "type": "boolean", "default": false },
                     "interval_ms": { "type": "integer", "default": 8 }
                 },
@@ -2682,6 +2790,121 @@ fn add_chain_controls(defs: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(x: i32, y: i32, width: u32, height: u32) -> cua_io::WindowInfo {
+        cua_io::WindowInfo {
+            id: 42,
+            pid: 7,
+            app: "probe".into(),
+            title: "cua-probe".into(),
+            x,
+            y,
+            width,
+            height,
+            minimized: false,
+            focused: true,
+        }
+    }
+
+    #[test]
+    fn a_window_relative_point_stays_inside_the_window() {
+        let win = window(100, 200, 400, 300);
+        // Inside, including the first pixel of each edge.
+        assert_eq!(
+            window_relative_point(&win, Some(0), Some(0)).unwrap(),
+            Some((100, 200))
+        );
+        assert_eq!(
+            window_relative_point(&win, Some(399), Some(299)).unwrap(),
+            Some((499, 499))
+        );
+        // No point at all is the documented "just type into the focused window".
+        assert_eq!(window_relative_point(&win, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn an_offset_that_would_escape_the_window_is_refused() {
+        let win = window(100, 200, 400, 300);
+        for (x, y) in [(400, 0), (0, 300), (-1, 10), (10, -1), (5000, 5000)] {
+            let refused = window_relative_point(&win, Some(x), Some(y)).unwrap_err();
+            assert_eq!(refused["isError"], true, "({x},{y}) must not be clicked");
+            let text = refused["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains("offset_outside_window"),
+                "the caller needs the code, not a prose apology: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_window_it_compared_against() {
+        let win = window(100, 200, 400, 300);
+        let text = window_relative_point(&win, Some(900), Some(10)).unwrap_err()["content"][0]
+            ["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(text.contains("(900,10)"), "say which offset: {text}");
+        assert!(text.contains("400x300"), "say against what: {text}");
+        assert!(text.contains("cua-probe"), "say which window: {text}");
+    }
+
+    #[test]
+    fn half_a_point_is_not_a_click() {
+        // Before the fix, x alone was silently ignored and the text still went out
+        // under an answer that read like the aiming had happened.
+        let win = window(0, 0, 100, 100);
+        for pair in [(Some(5), None), (None, Some(5))] {
+            let refused = window_relative_point(&win, pair.0, pair.1).unwrap_err();
+            let text = refused["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(text.contains("half_a_point"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_huge_offset_cannot_wrap_through_i32() {
+        // `as i32` would fold 2^32+50 back to 50 -- inside the window -- after the
+        // check above, which is the shape of the escape this test pins closed.
+        let win = window(0, 0, 100, 100);
+        assert!(window_relative_point(&win, Some(1 << 32), Some(1 << 32)).is_err());
+        // A window sitting against the far edge of the coordinate space cannot
+        // produce an absolute point the input layer can address.
+        let far = window(i32::MAX - 50, 0, 400, 400);
+        let refused = window_relative_point(&far, Some(300), Some(10)).unwrap_err();
+        let text = refused["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("outside the coordinate range"), "{text}");
+    }
+
+    #[test]
+    fn a_degenerate_control_rectangle_has_no_centre() {
+        // (0,0,0,0) is what a toolkit answers for a control it never laid out. Its
+        // "centre" is the top-left pixel of the screen, and invoke_control used to
+        // click exactly there.
+        assert_eq!(control_center((0, 0, 0, 0)), None);
+        assert_eq!(control_center((12, 8, 0, 40)), None);
+        assert_eq!(control_center((12, 8, 40, -3)), None);
+        assert_eq!(control_center((10, 10, 20, 8)), Some((20, 14)));
+    }
+
+    #[test]
+    fn an_unauthenticated_remote_bind_says_so_out_loud() {
+        let token: Option<String> = None;
+        let notice = unauthenticated_remote_notice("0.0.0.0:8765", false, &token)
+            .expect("a remote bind without a token must warn");
+        assert!(notice.contains("NO authentication"), "{notice}");
+        assert!(notice.contains("0.0.0.0:8765"), "name the port at risk");
+        assert!(notice.contains("CUA_HUB_MCP_TOKEN"), "and the way out");
+    }
+
+    #[test]
+    fn a_local_or_token_protected_bind_is_not_warned_about() {
+        // Flooding a false warning onto every normal start would train the operator
+        // to scroll past the one that matters.
+        let token: Option<String> = None;
+        assert!(unauthenticated_remote_notice("127.0.0.1:8765", true, &token).is_none());
+        let guarded = Some("secret".to_string());
+        assert!(unauthenticated_remote_notice("0.0.0.0:8765", false, &guarded).is_none());
+    }
 
     #[test]
     fn responses_carry_envelope() {

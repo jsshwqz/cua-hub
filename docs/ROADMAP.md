@@ -71,6 +71,30 @@
   全部成为测试，并用旧二进制做过逐格对照
 - [ ] 风险分级仍基于形状而非意图：`allow_high` 是一把大开关，一旦给出就不区分具体命令；
   下一步可做成按命令前缀的点名预批准（对齐四档模型里的"点名预批准"那一档）
+- [x] `window_input` 的窗口相对坐标补上门禁（issue #12 第 3 项）：`x`/`y` 以前只做 `as i32`
+  截断 + `saturating_add` 就注入，越界等于点到屏幕任意位置，而答复照样声称落在那个窗口里、
+  工具自述"绝不落到无关应用"。现在必须在窗口自身矩形内，越界回 `offset_outside_window`，
+  只给一个轴也拒绝（旧代码静默忽略半个点仍回 ok:true）。算术走 i64：`as i32` 会把
+  2^32+50 折回 50，正好又"看起来在窗口内"。真机两向都跑了（两个无关窗口各自写自己的
+  TextChanged 日志当独立 oracle）：修复前的二进制把文字逐字打进了那个无关窗口，修复后同一发被拒。
+  同批把 `invoke_control` 回退点击缺的退化矩形检查补上（`(0,0,0,0)` 的"中心"是屏幕左上角像素），
+  三处回退点击统一走 `control_center()`，下一个调用点没法再忘记查。
+- [x] 无鉴权远程绑定会大声说（issue #12 第 4 项）：穿过 `CUA_HUB_ALLOW_REMOTE=1` 这道 opt-in
+  之后以前只打一行普通 `listening`；现在非回环 + 无 token 打醒目横幅 + `tracing::warn!`。
+  回环或已设 token 不打——把假警告刷在每次正常启动上，只会让人跳过真警告那一条。
+- [ ] `window_input` 在 Linux 上整条不可用（本次做第 3 项时查出来的）：`focus_window` 只对
+  Windows 实现，AT-SPI 侧没有等价物，任何一次 `window_input` 都停在 `focus_failed`。
+  所以审计 #12 第 3 项那个坐标越界洞在 Linux 上"存在但不可达"——被前面那一步挡住了。
+  要么给 Linux 实现窗口激活（X11 `_NET_ACTIVE_WINDOW`），要么让 `window_input` 在没有聚焦
+  能力时明确降级成"不聚焦、只按坐标注入"并在结果里说明。定口径前不动。
+- [ ] issue #12 剩下两项，都需要先定契约（不打算自己拍）：
+  ① **浏览器引擎零闸门**——四个入口（runner / orchestrator / `browser_task` / CLI）全部绕过
+  `confirm()` 执行门，`BrowserAction::Eval` 是任意 JS（可读 cookie、可向外发请求），
+  system prompt 里"不提交表单/不登录"是软约束。要做的是给 `BrowserAction` 建一套到
+  `cua_core::Risk` 的显式映射（DESIGN.md 明写浏览器动作故意不放进 `Action`，所以映射是设计决定）；
+  ② **从思维链里提取动作**——`content` 为空时改从 `reasoning` 扫描 JSON 执行，
+  思维链中的假设/否定示例会被当真指令落地，两处都没有来源标记（只有 code 引擎打了一行 warn）。
+  这一项减能力（有的模型确实只回 reasoning），要定的是"拒绝执行"还是"降级成必须显式许可的来源"。
 - [x] `then:[…]` 服务端动作链：一次调用按序跑确定性图元动作，只回一份逐步 trace
   加一次观测；步骤继承 `observation_id`/`window`，失败即停在 `stopped_at`，
   模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 55%）
