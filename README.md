@@ -120,7 +120,7 @@ export OPENROUTER_API_KEY=sk-or-...
 |------|------|
 | `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径 |
 | `start_task` / `task_status` / `task_cancel` | 后台任务：立即返回 job_id，可查进度、可取消 |
-| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false` |
+| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false`。click/type 的答复是**回读裁决**：`clicked <sel> [effect=changed] (checked Some(false)->Some(true))`、`typed N chars into <sel> [verified: value reads as sent]`；富文本走 `Input.insertText`（光标落末尾、不覆盖已有内容）并按三条标准回读；读不一致报 `FAILED:`，**这条路径不再出现 `OK`** |
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |

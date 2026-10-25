@@ -107,6 +107,17 @@
   **还剩**：给 X11 实现窗口激活（`_NET_ACTIVE_WINDOW`），或让 `window_input` 在无聚焦能力时
   降级成"不聚焦、只按坐标注入"并说明——那是补能力，不在这条契约里。
   `cua-io/apps.rs` 的 `launch_app` 有同一处误标，本次没动（不属这条契约，单独提）。
+- [x] 浏览器 click / type 给回读裁决，富文本走 insertText（急件契约三项，issue #12 评论 6396246834）：
+  click 读元素自己的 `checked`/`selected`/`aria-expanded`/`disabled`/`value` 前后对比 →
+  `changed`/`unchanged`，元素什么都不发布时退 viewport 像素对比，再不行 `unverifiable` ——
+  **这条路径不再有 `OK`**。type 写完回读 `value`，**不相等就报 `FAILED:`**，读不到报 `unverifiable`。
+  contenteditable 先 `collapse(false)` 把光标放末尾不留选区，再 `Input.insertText`（不覆盖已有内容、
+  会触发框架监听），回读用三条标准（非空 + 长度对得上 + 关键句在中段），普通输入框仍用相等。
+  `Effect` 词汇表从 cua-engine-access 降到 `cua_core::policy`（两边同一套词，不是两套同义词）。
+  验证入库为真机测试 `readback_verdicts_on_a_real_page`（`#[ignore]`，起真 Chrome + 临时 fixture 页）：
+  3 项定向 + 2 条负控（会被大写的 input、会自清空的内容区）本机实测通过。
+  **本轮没做**：像素回退只比字节（动画会造假 `changed`，故仅在元素无状态时启用且话术如实写）；
+  `press`/`wait_for` 的裁决仍按原文案。
 - [x] `then:[…]` 服务端动作链：一次调用按序跑确定性图元动作，只回一份逐步 trace
   加一次观测；步骤继承 `observation_id`/`window`，失败即停在 `stopped_at`，
   模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 55%）

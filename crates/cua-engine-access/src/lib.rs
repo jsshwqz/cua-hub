@@ -9,6 +9,10 @@ pub mod atspi;
 use cua_core::Result;
 use serde::{Deserialize, Serialize};
 
+/// The `changed / unchanged / unverifiable` vocabulary lives in `cua_core::policy`
+/// so that the desktop engines and the browser one report with one word list, not two.
+pub use cua_core::policy::Effect;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiNode {
     /// Index assigned by the caller. `window_state` assigns indexes from a
@@ -171,42 +175,12 @@ pub struct ControlState {
     pub range_value: Option<f64>,
 }
 
-/// What the control itself looks like after an action the toolkit answered.
-///
-/// A pattern call answering successfully only means the toolkit processed the
-/// request. The audit found a panel button that answered, opened nothing, and left
-/// the tree without menu items, while the CLI reported "invoked via accessibility
-/// pattern" unconditionally (issue #11 item 8). This verdict is read back from the
-/// control, so a caller can tell "answered and something moved" from "answered and
-/// nothing observable moved" without taking a screenshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Effect {
-    /// A readable state of the control differs from before the action.
-    Changed,
-    /// Every readable state is identical to before the action.
-    Unchanged,
-    /// Too little was readable to claim either way.
-    Unverifiable,
-}
-
 /// An action the toolkit answered, plus the control's state read back after it.
 pub struct ActionReport {
     pub node: UiNode,
     pub effect: Effect,
     /// The state read back after the action, when the platform can read one.
     pub state: Option<ControlState>,
-}
-
-impl Effect {
-    /// The word a caller sees, and the word the documentation describes.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Effect::Changed => "changed",
-            Effect::Unchanged => "unchanged",
-            Effect::Unverifiable => "unverifiable",
-        }
-    }
 }
 
 /// The states an action is expected to be able to move.

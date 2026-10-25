@@ -5,11 +5,42 @@
 //! CLI applies to a single `Action`. Duplicating the ladder is how two entry points
 //! end up disagreeing about what `--yes` buys.
 
+use serde::Serialize;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::pin::Pin;
 
 use crate::Risk;
+
+/// What an action visibly did, judged from state read back off the target.
+///
+/// A pattern call or a click answering successfully only means the request was
+/// processed. The audits found a panel button that answered and opened nothing, and a
+/// page click that reported `OK` while the DOM stayed still -- both were reported as
+/// success, and callers that trusted it failed silently. The verdict is read back from
+/// the thing itself, so "answered and something moved" is never again the same word as
+/// "answered".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    /// A readable state of the target differs from before the action.
+    Changed,
+    /// Every readable state is identical to before the action.
+    Unchanged,
+    /// Too little was readable to claim either way.
+    Unverifiable,
+}
+
+impl Effect {
+    /// The word a caller sees, and the word the documentation describes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::Changed => "changed",
+            Effect::Unchanged => "unchanged",
+            Effect::Unverifiable => "unverifiable",
+        }
+    }
+}
 
 /// An async approval hook: given what is about to happen and how risky it is, say
 /// whether the caller may proceed. MCP wires this to a client elicitation.

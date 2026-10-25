@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -545,6 +546,36 @@ async fn launch_with(
     })
 }
 
+/// Shared element lookup, as a JavaScript expression that evaluates to the element or
+/// `null`. A plain selector reaches into same-origin iframes; `text=` searches the
+/// visible labels of the controls, because the model is asked for what it can see.
+const FIND_ELEMENT_JS: &str = r#"((root) => {
+    const deepOne = (r) => {
+        const e = r.querySelector(raw);
+        if (e) return e;
+        for (const f of r.querySelectorAll('iframe')) {
+            try { const d = f.contentDocument; if (d) { const g = deepOne(d); if (g) return g; } } catch (err) {}
+        }
+        return null;
+    };
+    const collect = (r, out) => {
+        out.push(...r.querySelectorAll('a,button,input,[role=button],[role=link]'));
+        for (const f of r.querySelectorAll('iframe')) {
+            try { const d = f.contentDocument; if (d) collect(d, out); } catch (err) {}
+        }
+        return out;
+    };
+    if (raw.startsWith('text=')) {
+        const needle = raw.slice(5).toLowerCase();
+        return collect(document, []).find(e => ((e.innerText || e.value || e.getAttribute('aria-label') || '').toLowerCase().includes(needle))) || null;
+    }
+    return deepOne(document);
+})(document)"#;
+
+/// Quality used only for the before/after comparison of a click. Cheap, and identical
+/// on both sides so the bytes mean something.
+const PIXEL_DIFF_QUALITY: u8 = 30;
+
 impl BrowserSession {
     async fn send(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
@@ -804,79 +835,254 @@ impl BrowserSession {
         Ok(())
     }
 
-    pub async fn click(&mut self, selector: &str) -> Result<String> {
+    /// What the element at `selector` says about itself, or `found: false`.
+    pub async fn read_state(&mut self, selector: &str) -> Result<ElementState> {
         let script = format!(
             r#"(() => {{
                 const raw = {sel};
-                const deepOne = (root) => {{
-                    let el = root.querySelector(raw);
-                    if (el) return el;
-                    for (const f of root.querySelectorAll('iframe')) {{
-                        try {{
-                            const d = f.contentDocument;
-                            if (d) {{ const r = deepOne(d); if (r) return r; }}
-                        }} catch (e) {{}}
-                    }}
-                    return null;
+                const el = {FIND};
+                if (!el) return {{ found: false }};
+                const tag = (el.tagName || '').toLowerCase();
+                const isCheck = tag === 'input' && (el.type === 'checkbox' || el.type === 'radio');
+                const kind = el.isContentEditable ? 'contenteditable'
+                    : isCheck ? 'checkbox'
+                    : tag === 'textarea' ? 'textarea'
+                    : ('value' in el) ? 'input'
+                    : 'other';
+                const num = (v) => (v === null || v === undefined) ? null : v;
+                const aria = el.getAttribute ? el.getAttribute('aria-expanded') : null;
+                return {{
+                    found: true,
+                    kind,
+                    checked: num('checked' in el ? el.checked : null),
+                    selected: num('selected' in el ? el.selected : null),
+                    expanded: num(aria === null ? null : aria === 'true'),
+                    disabled: num('disabled' in el ? el.disabled : null),
+                    value: num('value' in el ? String(el.value) : null),
+                    text: num(el.textContent === null ? null : String(el.textContent).trim()),
                 }};
-                const collect = (root, out) => {{
-                    out.push(...root.querySelectorAll('a,button,input,[role=button],[role=link]'));
-                    for (const f of root.querySelectorAll('iframe')) {{
-                        try {{
-                            const d = f.contentDocument;
-                            if (d) collect(d, out);
-                        }} catch (e) {{}}
-                    }}
-                    return out;
-                }};
-                let el = null;
-                if (raw.startsWith('text=')) {{
-                    const needle = raw.slice(5).toLowerCase();
-                    const candidates = collect(document, []);
-                    el = candidates.find(e => ((e.innerText || e.value || e.getAttribute('aria-label') || '').toLowerCase().includes(needle)));
-                }} else {{
-                    el = deepOne(document);
-                }}
+            }})()"#,
+            sel = serde_json::to_string(selector)?,
+            FIND = FIND_ELEMENT_JS,
+        );
+        let value = self.eval(&script).await?;
+        serde_json::from_value::<ElementState>(value)
+            .map_err(|e| anyhow!("unreadable element state: {e}"))
+    }
+
+    /// Click the target and report **what it did**, never a bare `ok`.
+    ///
+    /// The reading comes from the element's own semantic state (checked / selected /
+    /// expanded / disabled / value). An element that publishes nothing -- the styled
+    /// `<div>` that acts as a button -- falls back to a screenshot comparison, and if
+    /// even that says nothing the answer is `unverifiable`. A click that "succeeded"
+    /// while the page stayed still is the exact failure this engine was trusted for.
+    pub async fn click(&mut self, selector: &str) -> Result<String> {
+        let before = self.read_state(selector).await?;
+        if !before.found {
+            return Ok("NOT_FOUND".into());
+        }
+        // The pixels are only worth taking when the element cannot answer for itself.
+        let shot_before = if before.comparable() {
+            Vec::new()
+        } else {
+            self.screenshot_jpeg(PIXEL_DIFF_QUALITY)
+                .await
+                .unwrap_or_default()
+        };
+
+        let script = format!(
+            r#"(() => {{
+                const raw = {sel};
+                const el = ({FIND});
                 if (!el) return 'NOT_FOUND';
                 el.scrollIntoView({{ block: 'center' }});
                 el.click();
                 return 'OK';
             }})()"#,
-            sel = serde_json::to_string(selector)?
+            sel = serde_json::to_string(selector)?,
+            FIND = FIND_ELEMENT_JS,
         );
-        let result = self.eval(&script).await?;
-        Ok(result.as_str().unwrap_or("UNKNOWN").to_string())
+        let fired = self.eval(&script).await?;
+        if fired.as_str() == Some("NOT_FOUND") {
+            return Ok("NOT_FOUND".into());
+        }
+
+        // React and friends apply the state change on the next tick, so one immediate
+        // read would report `unchanged` for a click that did land. Bounded polling,
+        // and the last reading is the one reported.
+        let mut after = before.clone();
+        for attempt in 0..3 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            after = self.read_state(selector).await?;
+            if judge_element_states(Some(&before), Some(&after)) == Some(cua_core::Effect::Changed)
+            {
+                break;
+            }
+            let _ = attempt;
+        }
+        if let Some(effect) = judge_element_states(Some(&before), Some(&after)) {
+            let moved = before.moved_fields(&after);
+            let reading = if moved.is_empty() {
+                after.fields().join(",")
+            } else {
+                moved.join(",")
+            };
+            return Ok(format!(
+                "clicked {selector} [effect={}] ({reading})",
+                effect.as_str()
+            ));
+        }
+        let shot_after = self
+            .screenshot_jpeg(PIXEL_DIFF_QUALITY)
+            .await
+            .unwrap_or_default();
+        Ok(match judge_pixels(&shot_before, &shot_after) {
+            Some(effect) => format!(
+                "clicked {selector} [effect={}] (no state on this element; {} in the viewport)",
+                effect.as_str(),
+                if effect == cua_core::Effect::Changed {
+                    "pixels changed"
+                } else {
+                    "pixels identical"
+                }
+            ),
+            None => format!(
+                "clicked {selector} [effect=unverifiable] (this element publishes no state and the page could not be compared -- nothing here says the click did anything)"
+            ),
+        })
     }
 
-    pub async fn type_text(&mut self, selector: &str, text: &str) -> Result<String> {
+    /// Place the caret at the **end** of a contenteditable, with no selection range.
+    ///
+    /// `Input.insertText` writes over whatever is selected, so focusing alone is not
+    /// enough: without collapsing to the end, an editor holding existing text would
+    /// have that text replaced by ours -- the destruction this path exists to avoid.
+    pub async fn focus_end_of(&mut self, selector: &str) -> Result<bool> {
         let script = format!(
             r#"(() => {{
-                const sel = {sel};
-                const deepOne = (root) => {{
-                    let el = root.querySelector(sel);
-                    if (el) return el;
-                    for (const f of root.querySelectorAll('iframe')) {{
-                        try {{
-                            const d = f.contentDocument;
-                            if (d) {{ const r = deepOne(d); if (r) return r; }}
-                        }} catch (e) {{}}
-                    }}
-                    return null;
-                }};
-                const el = deepOne(document);
-                if (!el) return 'NOT_FOUND';
+                const raw = {sel};
+                const el = {FIND};
+                if (!el) return false;
+                el.scrollIntoView({{ block: 'center' }});
                 el.focus();
-                const value = {text};
-                if ('value' in el) {{ el.value = value; }} else {{ el.textContent = value; }}
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                return 'OK';
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                range.collapse(false);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                return document.activeElement === el;
             }})()"#,
             sel = serde_json::to_string(selector)?,
-            text = serde_json::to_string(text)?
+            FIND = FIND_ELEMENT_JS,
         );
-        let result = self.eval(&script).await?;
-        Ok(result.as_str().unwrap_or("UNKNOWN").to_string())
+        let focused = self.eval(&script).await?;
+        Ok(focused.as_bool().unwrap_or(false))
+    }
+
+    /// `Input.insertText` -- the browser's own "type this here", dispatched as a real
+    /// input event at the caret. It does not replace content and it does trigger the
+    /// framework listeners that setting `.value` from script silently skips.
+    pub async fn insert_text(&mut self, text: &str) -> Result<()> {
+        self.send("Input.insertText", json!({ "text": text }))
+            .await
+            .map(|_| ())
+    }
+
+    /// Write text into a field and **read it back before believing it**.
+    ///
+    /// A plain input is verified by equality: if the field does not hold what was
+    /// asked for, the step is reported as a failure -- an `ok` here would be the same
+    /// lie the desktop `invoke` used to tell. A contenteditable cannot be judged by
+    /// equality (it holds markup and the editor rewrites it), so it goes through
+    /// `insertText` at the caret and is judged by the three standards in
+    /// [`judge_inserted_text`].
+    pub async fn type_text(&mut self, selector: &str, text: &str) -> Result<String> {
+        let before = self.read_state(selector).await?;
+        if !before.found {
+            return Ok("NOT_FOUND".into());
+        }
+        let rich = before.kind == "contenteditable";
+        let expected_chars = text.chars().count();
+
+        if rich {
+            if !self.focus_end_of(selector).await? {
+                return Err(anyhow!(
+                    "FAILED: could not put the caret in the contenteditable {selector}; nothing was inserted"
+                ));
+            }
+            self.insert_text(text).await?;
+        } else {
+            let script = format!(
+                r#"(() => {{
+                    const raw = {sel};
+                    const el = {FIND};
+                    if (!el) return false;
+                    el.focus();
+                    const value = {text};
+                    if ('value' in el) {{ el.value = value; }} else {{ el.textContent = value; }}
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return true;
+                }})()"#,
+                sel = serde_json::to_string(selector)?,
+                FIND = FIND_ELEMENT_JS,
+                text = serde_json::to_string(text)?,
+            );
+            let written = self.eval(&script).await?;
+            if !written.as_bool().unwrap_or(false) {
+                return Ok("NOT_FOUND".into());
+            }
+        }
+
+        let mut after = self.read_state(selector).await?;
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let again = self.read_state(selector).await?;
+            after = again;
+            let ok = if rich {
+                insertion_ok(&before, &after, text)
+            } else {
+                after.value.as_deref() == Some(text)
+            };
+            if ok {
+                break;
+            }
+        }
+
+        if rich {
+            if insertion_ok(&before, &after, text) {
+                return Ok(format!(
+                    "inserted {expected_chars} chars into {selector} [verified: not empty, +{} chars, phrase present] content now {:?}",
+                    after
+                        .text
+                        .as_ref()
+                        .map(|t| t.chars().count())
+                        .unwrap_or(0)
+                        .saturating_sub(before.text.as_ref().map(|t| t.chars().count()).unwrap_or(0)),
+                    after.text.as_deref().map(|t| truncate(t, 60))
+                ));
+            }
+            return Err(anyhow!(
+                "FAILED: insertText into the contenteditable {selector} did not take -- content reads {:?} (was {:?}), expected at least {expected_chars} new characters and the phrase to be present",
+                after.text.as_deref().map(|t| truncate(t, 60)),
+                before.text.as_deref().map(|t| truncate(t, 60)),
+            ));
+        }
+
+        match judge_text_assignment(text, after.value.as_deref()) {
+            cua_core::Effect::Changed => Ok(format!(
+                "typed {expected_chars} chars into {selector} [verified: value reads as sent]"
+            )),
+            cua_core::Effect::Unchanged => Err(anyhow!(
+                "FAILED: {selector} reads {:?}, not {text:?} -- the text did not land, and this is not reported as a success",
+                after.value.as_deref().map(|v| truncate(v, 60))
+            )),
+            cua_core::Effect::Unverifiable => Ok(format!(
+                "typed {expected_chars} chars into {selector} [unverifiable: the element reads no value back -- not proof that it landed]"
+            )),
+        }
     }
 
     /// Press a key using the CDP input domain (Enter, Tab, ...).
@@ -921,6 +1127,203 @@ pub struct PageSummary {
     pub text: String,
     /// Flattened accessibility tree (role: name per line).
     pub ax: String,
+}
+
+/// The semantic state a page element publishes about itself.
+///
+/// This is what a click is checked against. A checkbox knows it got checked, an
+/// option knows it got selected, a field knows its value; a `<div>` styled to look
+/// like a button knows nothing, and that case is answered `unverifiable` rather
+/// than with an `ok` nobody earned.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ElementState {
+    pub found: bool,
+    /// `checkbox` / `input` / `textarea` / `contenteditable` / `other`.
+    pub kind: String,
+    pub checked: Option<bool>,
+    pub selected: Option<bool>,
+    pub expanded: Option<bool>,
+    pub disabled: Option<bool>,
+    pub value: Option<String>,
+    pub text: Option<String>,
+}
+
+impl ElementState {
+    /// Did the element tell us anything an action could have moved?
+    pub fn comparable(&self) -> bool {
+        self.found
+            && (self.checked.is_some()
+                || self.selected.is_some()
+                || self.expanded.is_some()
+                || self.disabled.is_some()
+                || self.value.is_some())
+    }
+
+    /// A short human-readable rendering, for the note the model reads back.
+    pub fn fields(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(c) = self.checked {
+            out.push(format!("checked={c}"));
+        }
+        if let Some(s) = self.selected {
+            out.push(format!("selected={s}"));
+        }
+        if let Some(e) = self.expanded {
+            out.push(format!("expanded={e}"));
+        }
+        if let Some(d) = self.disabled {
+            out.push(format!("disabled={d}"));
+        }
+        if let Some(v) = &self.value {
+            out.push(format!("value={}", truncate(v, 40)));
+        }
+        out
+    }
+
+    /// Only the fields that moved, as `name before->after`.
+    ///
+    /// The note is what the model reads next turn; a wall of unchanged fields buries
+    /// the one thing that happened, and an `unchanged` verdict should not pretend to
+    /// have found differences.
+    pub fn moved_fields(&self, after: &ElementState) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push = |name: &str, before: Option<bool>, after_v: Option<bool>| {
+            if before != after_v {
+                out.push(format!("{name} {:?}->{:?}", before, after_v));
+            }
+        };
+        push("checked", self.checked, after.checked);
+        push("selected", self.selected, after.selected);
+        push("expanded", self.expanded, after.expanded);
+        push("disabled", self.disabled, after.disabled);
+        if self.value != after.value {
+            let short =
+                |v: &Option<String>| v.as_deref().map(|s| truncate(s, 40)).unwrap_or_default();
+            out.push(format!(
+                "value {:?}->{:?}",
+                short(&self.value),
+                short(&after.value)
+            ));
+        }
+        out
+    }
+}
+
+/// Compare two readings of the same element.
+///
+/// `None` means neither side said anything, which is not a verdict: the caller falls
+/// back to pixels and, failing that, reports `unverifiable`. A field that appeared on
+/// one side only counts as a move -- `checked` flipping from absent to present is
+/// exactly what a checkbox click is supposed to do.
+pub fn judge_element_states(
+    before: Option<&ElementState>,
+    after: Option<&ElementState>,
+) -> Option<cua_core::Effect> {
+    use cua_core::Effect;
+    let before = before.filter(|s| s.comparable())?;
+    let after = after.filter(|s| s.comparable())?;
+    // `text` is deliberately not compared: it is the page's own wording and any
+    // re-render moves it, which would report `changed` for a click that did nothing.
+    let moved = before.checked != after.checked
+        || before.selected != after.selected
+        || before.expanded != after.expanded
+        || before.disabled != after.disabled
+        || before.value != after.value;
+    Some(if moved {
+        Effect::Changed
+    } else {
+        Effect::Unchanged
+    })
+}
+
+/// Compare two screenshots taken with the same encoder settings.
+///
+/// Coarse on purpose. The JPEG encoder here is deterministic for identical input, so
+/// identical bytes are a real signal that nothing in the viewport moved; different
+/// bytes only say "something in the picture changed", which an animation can also do.
+/// That is good enough as the fallback when an element publishes no state, and it is
+/// not presented as more than it is.
+pub fn judge_pixels(before: &[u8], after: &[u8]) -> Option<cua_core::Effect> {
+    use cua_core::Effect;
+    if before.is_empty() || after.is_empty() {
+        return None;
+    }
+    Some(if before == after {
+        Effect::Unchanged
+    } else {
+        Effect::Changed
+    })
+}
+
+/// Did the field end up holding exactly the text that was asked for?
+///
+/// A plain input is an equality test, because that is what "typed into it" means.
+pub fn judge_text_assignment(expected: &str, read_back: Option<&str>) -> cua_core::Effect {
+    use cua_core::Effect;
+    match read_back {
+        Some(actual) if actual == expected => Effect::Changed,
+        Some(_) => Effect::Unchanged,
+        None => Effect::Unverifiable,
+    }
+}
+
+/// The three standards for a rich-text insertion, checked instead of equality.
+///
+/// A contenteditable holds markup and the editor rewrites what it is given, so
+/// "equal to what we sent" is not the right test -- but "nothing appeared" must not
+/// pass either. The three are: the region is not empty, the length it gained accounts
+/// for what was inserted, and the distinctive phrase we sent is actually in there.
+/// `key_phrase` is a substring chosen by the caller, never the whole payload.
+pub fn judge_inserted_text(
+    before_len: usize,
+    after_len: usize,
+    inserted: &str,
+    key_phrase: &str,
+    after_text: &str,
+) -> cua_core::Effect {
+    use cua_core::Effect;
+    let gained = after_len.saturating_sub(before_len);
+    let wanted = inserted.chars().count();
+    let non_empty = !after_text.trim().is_empty();
+    let length_accounts = wanted == 0 || gained >= wanted;
+    let phrase_present = !key_phrase.trim().is_empty() && after_text.contains(key_phrase);
+    if non_empty && length_accounts && phrase_present {
+        Effect::Changed
+    } else {
+        Effect::Unchanged
+    }
+}
+
+/// The distinctive fragment of an insertion: the middle of it, so a placeholder or a
+/// leading/trailing space does not look like a successful write.
+pub fn key_phrase_of(text: &str) -> String {
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 8 {
+        return trimmed.to_string();
+    }
+    let start = chars.len() / 4;
+    chars
+        .iter()
+        .skip(start)
+        .take(chars.len() / 2)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The three standards applied to the two readings of a rich-text region.
+fn insertion_ok(before: &ElementState, after: &ElementState, inserted: &str) -> bool {
+    let before_text = before.text.clone().unwrap_or_default();
+    let after_text = after.text.clone().unwrap_or_default();
+    judge_inserted_text(
+        before_text.chars().count(),
+        after_text.chars().count(),
+        inserted,
+        &key_phrase_of(inserted),
+        &after_text,
+    ) == cua_core::Effect::Changed
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1191,5 +1594,222 @@ mod tests {
             before,
             "teardown left a profile directory in the temp dir"
         );
+    }
+    fn state(checked: Option<bool>, value: Option<&str>) -> ElementState {
+        ElementState {
+            found: true,
+            kind: "checkbox".into(),
+            checked,
+            selected: None,
+            expanded: None,
+            disabled: Some(false),
+            value: value.map(str::to_string),
+            text: Some("x".into()),
+        }
+    }
+
+    #[test]
+    fn a_state_move_on_the_element_is_the_verdict_for_a_click() {
+        use cua_core::Effect;
+        assert_eq!(
+            judge_element_states(
+                Some(&state(Some(false), None)),
+                Some(&state(Some(true), None))
+            ),
+            Some(Effect::Changed)
+        );
+        assert_eq!(
+            judge_element_states(
+                Some(&state(Some(true), None)),
+                Some(&state(Some(true), None))
+            ),
+            Some(Effect::Unchanged)
+        );
+        // The page's own wording is not evidence: `text` is left out on purpose, or
+        // every repaint would look like a click that did something.
+        let mut original = state(Some(true), None);
+        original.text = Some("x".into());
+        let mut reworded = state(Some(true), None);
+        reworded.text = Some("completely different wording".into());
+        assert_eq!(
+            judge_element_states(Some(&original), Some(&reworded)),
+            Some(Effect::Unchanged)
+        );
+    }
+
+    #[test]
+    fn an_element_that_says_nothing_gets_no_verdict_rather_than_a_free_ok() {
+        // `comparable()` false on both sides sends the caller to pixels, and failing
+        // that to `unverifiable` -- never the bare "OK" this used to return.
+        let mute = ElementState {
+            found: true,
+            kind: "other".into(),
+            ..Default::default()
+        };
+        assert!(!mute.comparable());
+        assert_eq!(judge_element_states(Some(&mute), Some(&mute)), None);
+        assert_eq!(judge_element_states(None, Some(&mute)), None);
+    }
+
+    #[test]
+    fn identical_pixels_are_a_real_signal_and_a_failed_capture_is_none() {
+        use cua_core::Effect;
+        assert_eq!(judge_pixels(b"abc", b"abc"), Some(Effect::Unchanged));
+        assert_eq!(judge_pixels(b"abc", b"abd"), Some(Effect::Changed));
+        assert_eq!(judge_pixels(b"", b"abc"), None);
+    }
+
+    #[test]
+    fn a_field_holding_other_text_did_not_take_the_text() {
+        use cua_core::Effect;
+        assert_eq!(judge_text_assignment("abc", Some("abc")), Effect::Changed);
+        assert_eq!(judge_text_assignment("abc", Some("ab")), Effect::Unchanged);
+        assert_eq!(judge_text_assignment("abc", None), Effect::Unverifiable);
+    }
+
+    #[test]
+    fn rich_text_is_judged_by_three_standards_not_by_equality() {
+        use cua_core::Effect;
+        let inserted = "追加的文字 APPENDED-OK";
+        let phrase = key_phrase_of(inserted);
+        assert!(
+            phrase.chars().count() >= 4,
+            "a slice of the payload, not the whole thing: {phrase}"
+        );
+        assert_eq!(
+            judge_inserted_text(
+                8,
+                8 + inserted.chars().count(),
+                inserted,
+                &phrase,
+                "已有内容 追加的文字 APPENDED-OK",
+            ),
+            Effect::Changed,
+            "existing content kept plus the phrase present is what append means"
+        );
+        assert_eq!(
+            judge_inserted_text(8, 8, inserted, &phrase, ""),
+            Effect::Unchanged,
+            "nothing appeared"
+        );
+        assert_eq!(
+            judge_inserted_text(
+                8,
+                8 + inserted.chars().count(),
+                inserted,
+                &phrase,
+                "已有内容 别的字",
+            ),
+            Effect::Unchanged,
+            "length alone is not proof: the phrase has to be in there"
+        );
+        assert_eq!(
+            judge_inserted_text(30, 12, inserted, &phrase, "truncated"),
+            Effect::Unchanged,
+            "the content went DOWN -- an overwrite that destroyed text is not a successful insert"
+        );
+    }
+
+    #[test]
+    fn a_short_payload_is_its_own_key_phrase() {
+        assert_eq!(key_phrase_of("  ok  "), "ok");
+        assert_eq!(key_phrase_of("12345678"), "12345678");
+    }
+
+    /// The three items of the urgent contract, against a real page.
+    ///
+    /// Ignored by default because it launches a browser. Run with
+    /// `cargo test -p cua-engine-browser -- --ignored readback_verdicts`.
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn readback_verdicts_on_a_real_page() {
+        let _slot = temp_slot().await;
+        let binary = find_browser().expect("set CUA_HUB_BROWSER to a Chrome/Edge executable");
+        let html = "<!doctype html><meta charset=utf-8><title>cua readback fixture</title>\n\
+             <input id=agree type=checkbox>\n\
+             <input id=field>\n\
+             <input id=upper>\n\
+             <div id=note contenteditable=true>已有内容 KEEP-ME</div>\n\
+             <div id=stub contenteditable=true>seed</div>\n\
+             <div id=plainbtn role=button>press me</div>\n\
+             <script>\n\
+               const up = document.getElementById('upper');\n\
+               up.addEventListener('input', () => { up.value = up.value.toUpperCase(); });\n\
+               const stub = document.getElementById('stub');\n\
+               stub.addEventListener('input', () => { stub.textContent = ''; });\n\
+             </script>";
+        let file = std::env::temp_dir().join("cua-readback-fixture.html");
+        std::fs::write(&file, html).unwrap();
+        let url = format!("file:///{}", file.display().to_string().replace('\\', "/"));
+
+        let mut session = launch_with(
+            &binary,
+            LaunchOptions {
+                ..Default::default()
+            },
+            80,
+        )
+        .await
+        .expect("launch a real browser");
+        // The same order `run_task` uses: the command-line URL is not a guarantee the
+        // attached tab is on that page, so navigate and check the page says so.
+        session.navigate(&url).await.unwrap();
+        let page = session.page_summary().await.unwrap();
+        assert!(
+            page.title.contains("cua readback fixture"),
+            "the fixture did not load: {}",
+            page.url
+        );
+
+        // 1. click a checkbox: the element's own state is the verdict.
+        let first = session.click("#agree").await.unwrap();
+        assert!(first.contains("[effect=changed]"), "{first}");
+        assert!(
+            first.contains("checked Some(false)->Some(true)"),
+            "the reading has to be in the note: {first}"
+        );
+        let second = session.click("#agree").await.unwrap();
+        assert!(
+            second.contains("checked Some(true)->Some(false)"),
+            "the second click has to show it going back: {second}"
+        );
+
+        // 2. type into a field: believed only when the field reads back what was sent.
+        let typed = session.type_text("#field", "HELLO-世界").await.unwrap();
+        assert!(typed.contains("[verified"), "{typed}");
+
+        // negative control: an input that rewrites what it is given must fail, not ok.
+        let note = session
+            .type_text("#upper", "abc")
+            .await
+            .expect_err("the fixture uppercases to ABC, which is not what was sent");
+        assert!(note.to_string().starts_with("FAILED:"), "{note}");
+        assert!(note.to_string().contains("ABC"), "{note}");
+
+        // 3. contenteditable: append at the caret and keep what was already there.
+        let rich = session
+            .type_text("#note", "追加的文字 APPENDED-OK")
+            .await
+            .unwrap();
+        assert!(rich.contains("[verified"), "{rich}");
+        let after = session.read_state("#note").await.unwrap();
+        let held = after.text.unwrap_or_default();
+        assert!(
+            held.contains("KEEP-ME"),
+            "the insertion replaced the content instead of appending: {held}"
+        );
+        assert!(held.contains("APPENDED-OK"), "{held}");
+
+        // negative control: an editor that drops the insertion is reported as a failure.
+        let note = session
+            .type_text("#stub", "应当留下痕迹的文字 SOME-PHRASE")
+            .await
+            .expect_err("the fixture clears the contenteditable on input");
+        assert!(note.to_string().starts_with("FAILED:"), "{note}");
+
+        // a control that publishes no state never gets a bare ok.
+        let mute = session.click("#plainbtn").await.unwrap();
+        assert_ne!(mute, "OK", "the answer this work exists to retire");
+        assert!(mute.contains("[effect="), "{mute}");
     }
 }

@@ -480,6 +480,53 @@ X11 的窗口激活实现仍在 ROADMAP backlog。
 - 桩脚本：`D:\Temp\2026-10-25_browser_model_stub.cjs`（要的话可以收进 `tests/`，
   现在还没入库——入库要放对目录并写清它只用于本地验证）。
 
+### 新增：浏览器 click / type 也要回读裁决，富文本走 insertText（急件契约三项）
+
+契约（issue #12 评论 6396246834）：**浏览器路径的"成功"必须是自己读回来的，不是动作返回的**。
+三项都落在引擎层（`cdp.rs`），`mcp.rs` 一行没动。
+
+- **click 回读裁决**：点击前后各读一次**目标元素自己的语义状态**
+  （`checked` / `selected` / `aria-expanded` / `disabled` / `value`），
+  答复变成 `clicked #agree [effect=changed] (checked Some(false)->Some(true))`；
+  二次点击给 `checked Some(true)->Some(false)`。
+  元素什么都不发布（比如 `role=button` 的 `<div>`）→ **退到像素对比**
+  （同一编码器、同质量的 viewport 截图前后各一张，字节相同=没变，不同=有变化）；
+  截图也拿不到 → `effect=unverifiable`。**旧答复 `OK` 在这条路径上不再可能出现**
+  （有一条真机断言直接 `assert_ne!(note, "OK")`）。
+  `textContent` 故意不参与比较：页面重绘会动文字，那会让"什么都没点的点击"看起来成功。
+- **type 回读**：写完重新读元素自己的 `value`，**与要写的完全一致才算数**；
+  不一致直接报失败（`FAILED: #upper reads "ABC", not "abc" -- ...is not reported as a success`），
+  读不到 value 报 `unverifiable`，绝不冒充 ok。为了让"下一步"能看到生效，回读带最多两次
+  120ms 的等待（React 下一 tick 才更新，立刻读会假报"没变"）。
+- **contenteditable 富文本**：先 `selectNodeContents + collapse(false)` 把光标放到**末尾且不留选区**，
+  再走 CDP `Input.insertText`（真输入事件，不整段替换、也不像 `el.value=` 那样跳过框架监听）；
+  回读用**三条标准**而不是逐字相等：内容非空 + 增长长度对得上插入量 + 关键句在场
+  （关键句取负载中段，不是整段）。普通 input/textarea 仍旧走"回读相等"。
+
+`Effect`（`changed` / `unchanged` / `unverifiable`）从 `cua-engine-access` 降到 `cua-core::policy`
+并由原处 re-export：桌面与浏览器现在报的是同一套词，不是两套同义词。
+
+### 测试与验证（急件三项）
+
+- 本机 6 条纯判据测试（状态移动 / 静音元素不给判据 / 像素同与异 / 字段相等 / 富文本三标准
+  含"内容变少=覆盖不是插入"这一格 / 关键句切片）。
+  workspace **172 passed / 0 failed / 2 ignored**（基线 166/0/1 + 6 条，无回归）。
+- **真机定向测试入库**：`readback_verdicts_on_a_real_page`（`#[ignore]`，
+  `cargo test -p cua-engine-browser -- --ignored readback_verdicts`）。它起真 Chrome、
+  开一个临时 fixture 页（checkbox / input / 会把自己改成大写的 input / 带已有内容的
+  contenteditable / 一输入就清空自己的 contenteditable / 无状态的 `role=button` div），
+  一条测试里跑完 3 项定向 + 2 条负控：
+  - click：`[effect=changed] (checked Some(false)->Some(true))`，再点回 `Some(true)->Some(false)`；
+  - type：`[verified`；
+  - **负控 1**：`#upper` 把 `abc` 变成 `ABC` → 必须 `FAILED:` 开头（回读不一致不许报 ok）；
+  - insertText：`KEEP-ME`（原有内容）**仍在** 且新句在内 → 证明是追加不是覆盖；
+  - **负控 2**：`#stub` 一输入就清空 → 必须 `FAILED:`；
+  - 无状态元素：断言 `!= "OK"` 且带 `[effect=`。
+  本机实测：`test result: ok. 1 passed; 0 failed`。
+- 没做（契约没要求，写清楚免得被当成做了）：click 的像素回退只比字节，不解码算像素差
+  （动画会造成假 `changed`，所以它只在元素自身无可读状态时启用，且话术里就写"pixels changed"）；
+  `wait_for_selector` / `press` 这类仍回原文案，本轮不扩。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。
