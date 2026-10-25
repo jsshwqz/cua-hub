@@ -1676,6 +1676,14 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             let submit = args["submit"].as_bool().unwrap_or(false);
             let interval_ms = args["interval_ms"].as_u64().unwrap_or(8);
+            // Validate the aim before touching the desktop: raising a window is a
+            // side effect, and a call that is about to be refused should never have
+            // changed what the user sees. It also means the containment answer
+            // arrives on platforms where focusing is not implemented at all.
+            let aim = match window_relative_point(&window, args["x"].as_i64(), args["y"].as_i64()) {
+                Ok(aim) => aim,
+                Err(e) => return e,
+            };
             if let Err(e) = cua_engine_access::focus_window(window.id) {
                 return tool_err(json!({
                     "ok": false,
@@ -1686,10 +1694,6 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     }
                 }));
             }
-            let aim = match window_relative_point(&window, args["x"].as_i64(), args["y"].as_i64()) {
-                Ok(aim) => aim,
-                Err(e) => return e,
-            };
             if let Some((px, py)) = aim {
                 let action = Action::Click {
                     at: Point::new(px, py),

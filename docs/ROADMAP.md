@@ -82,6 +82,11 @@
 - [x] 无鉴权远程绑定会大声说（issue #12 第 4 项）：穿过 `CUA_HUB_ALLOW_REMOTE=1` 这道 opt-in
   之后以前只打一行普通 `listening`；现在非回环 + 无 token 打醒目横幅 + `tracing::warn!`。
   回环或已设 token 不打——把假警告刷在每次正常启动上，只会让人跳过真警告那一条。
+- [ ] `window_input` 在 Linux 上整条不可用（本次做第 3 项时查出来的）：`focus_window` 只对
+  Windows 实现，AT-SPI 侧没有等价物，任何一次 `window_input` 都停在 `focus_failed`。
+  所以审计 #12 第 3 项那个坐标越界洞在 Linux 上"存在但不可达"——被前面那一步挡住了。
+  要么给 Linux 实现窗口激活（X11 `_NET_ACTIVE_WINDOW`），要么让 `window_input` 在没有聚焦
+  能力时明确降级成"不聚焦、只按坐标注入"并在结果里说明。定口径前不动。
 - [ ] issue #12 剩下两项，都需要先定契约（不打算自己拍）：
   ① **浏览器引擎零闸门**——四个入口（runner / orchestrator / `browser_task` / CLI）全部绕过
   `confirm()` 执行门，`BrowserAction::Eval` 是任意 JS（可读 cookie、可向外发请求），

@@ -518,9 +518,13 @@ def scenario(identity: str) -> None:
             "window_input",
             {"window": window["id"], "x": 30, "y": 30, "text": "WITHIN-W"},
         )
+        # This one cannot ask for success on Linux: `focus_window` is not implemented
+        # for AT-SPI, so a valid point still ends at focus_failed. What it does pin is
+        # that the containment check is not rejecting a point that lies inside the
+        # window -- a check that only ever says "no" would pass the two above.
         check(
-            f"[{identity}] a point inside the window is still accepted",
-            not aimed["is_error"],
+            f"[{identity}] a point inside the window is not refused by the aim check",
+            "offset_outside_window" not in aimed["text"] and "half_a_point" not in aimed["text"],
             f"{aimed['text'][:140]}",
         )
 
