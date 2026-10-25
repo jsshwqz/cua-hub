@@ -388,11 +388,12 @@ fn role_from_name(name: &str) -> u32 {
     }
 }
 
-fn walk(
-    max_nodes: usize,
-    max_depth: usize,
-    visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
-) -> Result<WalkReport> {
+/// One node as the walk reaches it: the connection to read more through, the node,
+/// the `(bus name, object path)` it came from, and the names of its enclosing
+/// nodes, nearest first -- what a `container:` filter is answered from.
+type Visit<'a> = &'a mut dyn FnMut(&Connection, &UiNode, &str, &str, &[String]) -> bool;
+
+fn walk(max_nodes: usize, max_depth: usize, visit: Visit<'_>) -> Result<WalkReport> {
     let conn = a11y_connection()?;
     let root_kids = children(&conn, REGISTRY, ROOT_PATH)?;
     walk_from(&conn, root_kids, max_nodes, max_depth, visit)
@@ -406,12 +407,17 @@ fn walk_from(
     starts: Vec<(String, OwnedObjectPath)>,
     max_nodes: usize,
     max_depth: usize,
-    visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
+    visit: Visit<'_>,
 ) -> Result<WalkReport> {
     let mut truncated = false;
     let mut unreadable: Vec<crate::Unreadable> = Vec::new();
     let mut visited = 0usize;
     let deadline = Instant::now() + WALK_BUDGET;
+    // Names of the nodes currently on the path down from the root, as (depth, name).
+    // A `container:` in a target is answered from this: without it, two panels that
+    // carry the same labels are indistinguishable and the walk can only say
+    // "ambiguous" where the caller actually said which one.
+    let mut trail: Vec<(usize, String)> = Vec::new();
     let mut stack: Vec<(String, String, usize)> = starts
         .into_iter()
         .rev()
@@ -475,12 +481,22 @@ fn walk_from(
             selected,
             checked,
         };
-        if visit(conn, &node, &dest, &path) {
+        while trail
+            .last()
+            .is_some_and(|(depth_seen, _)| *depth_seen >= depth)
+        {
+            trail.pop();
+        }
+        let ancestors: Vec<String> = trail.iter().rev().map(|(_, name)| name.clone()).collect();
+        if visit(conn, &node, &dest, &path, &ancestors) {
             return Ok(WalkReport {
                 truncated,
                 visited,
                 unreadable,
             });
+        }
+        if !node.name.is_empty() {
+            trail.push((depth, node.name.clone()));
         }
 
         if kids.len() + visited > max_nodes {
@@ -640,7 +656,7 @@ pub fn snapshot_window(
         vec![(dest, path)],
         max_nodes,
         max_depth,
-        &mut |_, node, _, _| {
+        &mut |_, node, _, _, _| {
             let mut node = node.clone();
             node.index = nodes.len();
             nodes.push(node);
@@ -685,7 +701,7 @@ fn title_matches(at_spi_name: &str, want: &str) -> bool {
 
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     let mut nodes = Vec::new();
-    let report = walk(max_nodes, max_depth, &mut |_, node, _, _| {
+    let report = walk(max_nodes, max_depth, &mut |_, node, _, _, _| {
         let mut node = node.clone();
         node.index = nodes.len();
         nodes.push(node);
@@ -768,7 +784,7 @@ fn pick(needle: &str, visited: impl Iterator<Item = UiNode>) -> Option<UiNode> {
 
 pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
     let mut visited = Vec::new();
-    walk(max_nodes, max_depth, &mut |_, node, _, _| {
+    walk(max_nodes, max_depth, &mut |_, node, _, _, _| {
         visited.push(node.clone());
         false
     })?;
@@ -838,7 +854,7 @@ pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
 pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<ActionReport>> {
     let mut hit = None;
     let mut silence: Option<String> = None;
-    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
+    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path, _| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
@@ -926,7 +942,7 @@ pub fn set_value_with(
 ) -> Result<Option<ActionReport>> {
     let mut hit = None;
     let mut silence: Option<String> = None;
-    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
+    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path, _| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
@@ -1109,7 +1125,7 @@ fn state_words(conn: &Connection, dest: &str, path: &str) -> Result<Vec<u32>> {
 pub fn state(name: &str) -> Result<Option<crate::ControlState>> {
     let mut found = None;
     let mut failure: Option<Error> = None;
-    walk(600, 10, &mut |conn, node, dest, path| {
+    walk(600, 10, &mut |conn, node, dest, path, _| {
         if node.name != name {
             return false;
         }
@@ -1123,6 +1139,194 @@ pub fn state(name: &str) -> Result<Option<crate::ControlState>> {
         Some(e) => Err(e),
         None => Ok(found),
     }
+}
+
+/// One node the walk reached, kept with what is needed to act on it again.
+///
+/// The identity is the `(bus name, object path)` pair the node was read through,
+/// which is exact. After a resolution there is deliberately no second lookup by
+/// name: that lookup would re-apply the ambiguous question to a tree that may have
+/// changed in between, which is how an address ends up on a different control.
+pub struct Hit {
+    pub node: UiNode,
+    pub dest: String,
+    pub path: String,
+}
+
+/// Say why the caller could not be answered, in the words it has to act on.
+fn miss_error(miss: crate::target::Miss, walked: &WalkReport) -> Error {
+    if walked.truncated && matches!(miss, crate::target::Miss::NotFound { .. }) {
+        // The walk ran out before it saw the whole desktop, so "no such control"
+        // would be a claim about a tree that was never fully looked at.
+        return Error::Lookup(format!(
+            "{} -- and note the walk stopped after {} node(s) with the tree still truncated (max_nodes was set); raise max_nodes before concluding the control is absent",
+            miss.to_reason(),
+            walked.visited
+        ));
+    }
+    Error::Lookup(format!(
+        "{}{}",
+        miss.to_reason(),
+        if miss.worth_one_retry() {
+            ""
+        } else {
+            "; this is not a stale-tree problem, so re-running will not resolve it"
+        }
+    ))
+}
+
+/// Resolve a `Target` against a live tree and act on the one node it names.
+fn with_hit<T>(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+    act: impl FnOnce(&Connection, &Hit) -> Result<T>,
+) -> Result<T> {
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut lines: Vec<Vec<String>> = Vec::new();
+    let report = walk(
+        max_nodes,
+        max_depth,
+        &mut |_, node, dest, path, ancestors| {
+            hits.push(Hit {
+                node: node.clone(),
+                dest: dest.to_string(),
+                path: path.to_string(),
+            });
+            lines.push(ancestors.to_vec());
+            false
+        },
+    )?;
+    let facts: Vec<crate::target::Facts<'_>> = hits
+        .iter()
+        .zip(lines.iter())
+        .map(|(hit, ancestors)| crate::target::Facts {
+            name: &hit.node.name,
+            role: &hit.node.control_type,
+            ancestors,
+        })
+        .collect();
+    let chosen = crate::target::select(&facts, target).map_err(|miss| miss_error(miss, &report))?;
+    let hit = &hits[chosen];
+    let conn = a11y_connection()?;
+    act(&conn, hit)
+}
+
+/// Find the one control a target names, without acting.
+pub fn find_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<UiNode> {
+    let mut picked: Option<UiNode> = None;
+    with_hit(target, max_nodes, max_depth, |_, hit| {
+        picked = Some(hit.node.clone());
+        Ok(())
+    })?;
+
+    // `with_hit` always resolves to exactly one node or returns an error, so the
+    // only way this is None is a walk that produced no hits -- which select would
+    // have reported. Unwrapping is a lie in that case; say what happened.
+    picked.ok_or_else(|| Error::Lookup(format!("no control matched {:?}", target.name)))
+}
+
+/// Read the state of the one control a target names.
+pub fn state_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<crate::ControlState>> {
+    with_hit(target, max_nodes, max_depth, |conn, hit| {
+        Ok(state_words(conn, &hit.dest, &hit.path)
+            .ok()
+            .map(|words| decode_state(&hit.node, &words)))
+    })
+}
+
+/// Fire the action of the one control a target names.
+///
+/// `None` keeps its old, single meaning: the walk reached this control and it does
+/// not expose the pattern. Anything else -- nobody answered, the search ran out, the
+/// name was ambiguous -- is an `Err`, because the caller's move for those is a
+/// coordinate click and that is the wrong move for all three.
+pub fn invoke_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<ActionReport>> {
+    with_hit(target, max_nodes, max_depth, |conn, hit| {
+        let before = read_state(conn, &hit.node, &hit.dest, &hit.path);
+        let dest = hit.dest.clone();
+        let path = hit.path.clone();
+        match attempted(conn, &hit.dest, move |conn| {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest,
+                &path,
+                "org.a11y.atspi.Action",
+                "DoAction",
+                &(0i32,),
+            )
+        }) {
+            Attempt::Answered(true) => {
+                let mut after = read_state(conn, &hit.node, &hit.dest, &hit.path);
+                let mut effect = crate::judge_effect(before.as_ref(), after.as_ref());
+                if effect == Effect::Unchanged {
+                    std::thread::sleep(Duration::from_millis(crate::EFFECT_SETTLE_MS));
+                    after = read_state(conn, &hit.node, &hit.dest, &hit.path);
+                    effect = crate::judge_effect(before.as_ref(), after.as_ref());
+                }
+                Ok(Some(ActionReport {
+                    node: hit.node.clone(),
+                    effect,
+                    state: after,
+                }))
+            }
+            // The toolkit answered "no". That is a refusal, not a missing pattern,
+            // and it is reported as nothing happened rather than as success.
+            Attempt::Answered(false) => Ok(None),
+            Attempt::Unanswered(reason) => Err(unanswered_call("invoke", &hit.node.name, &reason)),
+            Attempt::NoPattern(_) => Ok(None),
+        }
+    })
+}
+
+/// Set the text of the one control a target names.
+pub fn set_value_target(
+    target: &crate::target::Target,
+    text: &str,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<ActionReport>> {
+    with_hit(target, max_nodes, max_depth, |conn, hit| {
+        let dest = hit.dest.clone();
+        let path = hit.path.clone();
+        let owned = text.to_string();
+        match attempted(conn, &hit.dest, move |conn| {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest,
+                &path,
+                "org.a11y.atspi.EditableText",
+                "SetTextContents",
+                &(owned,),
+            )
+        }) {
+            Attempt::Answered(true) => {
+                let state = read_state(conn, &hit.node, &hit.dest, &hit.path);
+                Ok(Some(ActionReport {
+                    node: hit.node.clone(),
+                    effect: crate::judge_text_effect(state.as_ref(), text),
+                    state,
+                }))
+            }
+            Attempt::Answered(false) => Ok(None),
+            Attempt::Unanswered(reason) => {
+                Err(unanswered_call("set_value", &hit.node.name, &reason))
+            }
+            Attempt::NoPattern(_) => Ok(None),
+        }
+    })
 }
 
 #[cfg(test)]
