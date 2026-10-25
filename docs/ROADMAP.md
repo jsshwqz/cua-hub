@@ -153,8 +153,11 @@
   验证分三层：本机 10 条纯函数单测；**Windows 真机**用 WinForms 自写日志当独立 oracle
   （自禁用按钮→`changed`、只写日志的按钮→`unverifiable` 且动作确实发生、效果落在别的控件→`unverifiable`）；
   **Linux 真机**给夹具加 `Gtk.MenuButton`，断言是 `effect=changed` 当且仅当菜单项进了树——
-  跟独立的树证据比，而不是跟自己的回复比。`unchanged` 在 Windows 上没有真机样本（够不到发布
-  toggle/expanded 又能走 Invoke 模式的控件），那一格只有 Linux 钉住。
+  跟独立的树证据比，而不是跟自己的回复比。
+  **`unchanged` 至今没有真机样本**：GTK 的 MenuButton 被 `DoAction` 真的开了菜单（走 `changed`），
+  Windows 的普通按钮不发布状态位（走 `unverifiable`）。那一格目前只有本机单测钉住语义，
+  补它需要一个"发布状态、能走 Invoke、答了却不动"的真实控件（审计那台 Xfce 面板就是这种），
+  不是能凭空造的夹具——把夹具改成"故意不开"是在造我想让它红的样本，不算证据。
 - [x] AT-SPI 读不到时不再无声（issue #11 第 6 项，契约定为**带诊断的部分成功**）：
   `UiSnapshot` 多一本 `unreadable` 账（bus + 对象路径 + 哪几个读没应答），
   `accessibility_tree` 树尾点名（最多 6 条再给计数）、`window_state` 里条件性出现

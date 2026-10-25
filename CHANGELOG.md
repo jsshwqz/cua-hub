@@ -345,12 +345,28 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
   这正是审计那种"答了但看不到效果"的形状，现在不再冒充已验证；
   `cua-toggle-target` → `unverifiable`（效果落在别的控件上，按钮自己读不出来）。
   `unchanged` 在 Windows 上没有真机样本：普通按钮不发布 toggle / expanded，
-  本机够不到的控件才有；那一格由 Linux 真机（`ToggleButton "probe-menu"`）钉住。
+  本机够不到的控件才有；Linux 那一格实际走到了 `changed`（见下一条），所以 **`unchanged` 两平台
+  都没有真机样本**，只有本机单测钉住语义。
 - Linux 真机（CI 图形作业）：夹具新增 `Gtk.MenuButton`（accessible name `probe-menu`），
   断言不是"跟自己的回复比"，而是**跟树比对**：`effect=changed` 当且仅当菜单项真的进了树。
   红的那次（run `40147535682`）8 条失败全是新断言，原文点名旧回复里没有裁决：
   `invoked ToggleButton "probe-menu" via accessibility pattern`（`menu_item_in_tree=True`，
-  也就是"菜单开了但我们报不出这件事"）。
+  也就是"菜单开了但我们报不出这件事"）。绿的那次（run `40147819661`）真机原文：
+
+  ```
+  PASS  invoke reports the effect it read back            [CheckBox "probe-toggle" ...; effect=changed (toggle=on)]
+  PASS  the verdict agrees with whether the menu is on screen [ToggleButton "probe-menu" ...; effect=changed (toggle=on), menu_item_in_tree=True]
+  PASS  invoke_control fires DoAction on the button        [Button "probe-submit" ...; effect=unverifiable (no readable state on this control)]
+  PASS  a text write says it could not be read back here   [Text "probe-entry" ...; effect=unverifiable (this platform cannot read the field's text back)]
+  ```
+
+  **跟预期不一样的地方，如实记下来**：GTK 的 `MenuButton` 被 `DoAction` 真的打开了菜单，
+  所以那一格走 `changed`——审计在 Xfce 面板上撞到的"答了但什么都没出现"，在这两个 CI 的夹具上
+  都不复现。因此 **`unchanged` 至今没有真机样本**（Windows 没有、Linux 也没有），只有本机
+  `an_answered_action_that_moves_nothing_says_unchanged` 钉住它的语义；在那一格拿到真实控件样本之前，
+  它应当被读成"语义已定义、真机未观测"。我没有把夹具改成"故意不开菜单"去凑一个红——那是在造
+  一个我想让它红的样本，而不是在测真实工具包。真实面板控件（普通按钮）走的是 `unverifiable`，
+  那一格两平台都有真机样本（`probe-submit`、`cua-noop`）。
 
 ## 0.1.5 — 2026-10-23
 
