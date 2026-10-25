@@ -273,6 +273,12 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
 - 这条错误改用它自己的 `Error::Lookup`。第一版借的是 `Error::Capture`，CI 真机输出因此长成
   `capture failed: did not reach set_value on "probe-entry" …`——内容对、帽子错，
   读的人会以为截图环节出了问题。断言现在同时钉住这个前缀。
+  （这个类型是第 6 项的后续提交 `f2bdf76` 为"没人答"新建的：两种误读最后要的是同一顶帽子，
+  本支只是把 `capped()` 接上去。）
+- 文档把三种答案一次写清（`README.md` 的工具表 + `integrations/skill/SKILL.md`）：
+  `did not reach` = 预算不够、`did not get an answer` = 那个应用没回话、
+  只有走到控件后的 `None` = 真的没有该模式。前两种都明写了"不是降级成坐标点击的理由"——
+  第 7 项要防的误读发生在调用方读到的那句话上，光改返回值不够。
 - 验证：本机 1 条测文案（必须含 `did not reach` / `after 1 node(s)` / `max_nodes=1`，
   且不得再出现旧措辞）；CI 真树每场景两条——预算为 1 的 `set_control_text` 与
   `invoke_control` 必须报"没走到"，紧跟其后的正常调用必须成功。这一对是刻意配的，
