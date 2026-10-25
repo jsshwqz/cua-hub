@@ -4,7 +4,11 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
-## Unreleased — 已合入分支，尚未发版
+## 0.1.6 — 2026-10-26
+
+桌面与浏览器动作都改成"回读到什么就报什么"的一版：click/type 给 changed/unchanged/unverifiable，
+type 对不上直接 FAILED；身份寻址按 target 现解析，歧义报错、绝不取第一个；滚动内化进动作，
+自定义控件与 UEditor iframe 的类名/焦点协议化；另加质量门、并发保护和浏览器风险门。
 
 ### 身份寻址：歧义报错，解析到的节点就是动手的节点（PR #37）
 
