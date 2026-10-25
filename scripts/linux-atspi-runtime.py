@@ -399,15 +399,25 @@ def scenario(identity: str) -> None:
             f"tree head={body[:220]}",
         )
         # Two controls answer to `probe-ambiguous` and the walk meets the label
-        # first, so a find that stops at the first exact hit hands back something
-        # that cannot be pressed. The actionable role has to win.
+        # first. Picking the "better" role here was #11 batch 1's answer, and it is
+        # the wrong contract: choosing for the caller is how a wrong guess turns
+        # into a click on something they never named. Ambiguity is an error now, and
+        # the way out is for the caller to say which one they meant.
         found = call("find_control", {"name": "probe-ambiguous"})
-        found_json = found["json"] or {}
         check(
-            f"[{identity}] find_control prefers the button over a same-named label",
-            found_json.get("control_type") == "Button",
-            f"got {found_json.get('control_type')!r} "
-            f"name={found_json.get('name')!r} {found['text'][:120]}",
+            f"[{identity}] a name that fits two controls is refused, not resolved by us",
+            found["is_error"] and "match" in found["text"],
+            f"is_error={found['is_error']} {found['text'][:170]}",
+        )
+        aimed = call(
+            "find_control",
+            {"target": {"name": "probe-ambiguous", "role": "Button"}},
+        )
+        aimed_json = aimed["json"] or {}
+        check(
+            f"[{identity}] naming the role ends the ambiguity and reaches the button",
+            not aimed["is_error"] and aimed_json.get("control_type") == "Button",
+            f"got {aimed_json.get('control_type')!r} {aimed['text'][:170]}",
         )
         # The contract being checked is that a missing image is announced, not
         # that Xvfb can always produce one: window_state must not silently drop
