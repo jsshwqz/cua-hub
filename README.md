@@ -78,7 +78,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `cua-hub run "<task>" --dry-run` | 只规划一步，不操作机器 |
 | `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
 | `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
-| `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless） |
+| `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless）。确认门与桌面引擎同一套：`--yes` 放行中危、`--allow-high` 才放行 `eval`；`--dry-run` 只规划并打印档位 |
 | `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划；`--retries/--max-replans` 控制恢复） |
 | `cua-hub runs` | 列出 `.runs` 下的历史运行（任务、结果、步数） |
 | `cua-hub replay <run_dir>` | 按 `steps.jsonl` 逐步重放（`--dry-run` 预览） |
@@ -120,7 +120,7 @@ export OPENROUTER_API_KEY=sk-or-...
 |------|------|
 | `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径 |
 | `start_task` / `task_status` / `task_cancel` | 后台任务：立即返回 job_id，可查进度、可取消 |
-| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP） |
+| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false` |
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
@@ -132,7 +132,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `wait_for_change` | 阻塞等待窗口或其弹层真的发生变化，用来验证动作是否生效 |
 | `perform_secondary_action` | 调用控件除点击之外的无障碍动作：Expand/Collapse/Raise/Scroll Up·Down·Left·Right/Toggle/Select/Focus/Invoke；只接受该控件在树里 `actions=` 列出的名字，猜错返回 `unsupported_action` 与真实清单，执行后回读状态供验证 |
 | `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |
-| `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选。`x`/`y` 必须落在该窗口自己的矩形内，越界返回 `offset_outside_window`（这个工具不会点到窗口外），只给一个轴也拒绝 |
+| `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选。`x`/`y` 必须落在该窗口自己的矩形内，越界返回 `offset_outside_window`（这个工具不会点到窗口外），只给一个轴也拒绝。窗口激活只在 Windows 实现，Linux 上这条工具回 `unsupported` + `retry:false`（不拿可重试的错误糊过去） |
 | `accessibility_tree` | 带编号的桌面级 UIA 树（窗口/按钮/输入框 + 矩形）；日常观测请用 `window_state`。Linux 上如果某些应用没应答，树尾会列出 `! parts of this tree were not read:`（最多点名 6 个子树，其余给条数）——少节点不再无声 |
 | `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心。`invoke_control` 可选 `max_nodes`/`max_depth`，失败要按原话读：`did not reach` = 搜索被节点预算截断（提高 `max_nodes` 再来），`did not get an answer` = 那个应用没回话（Linux 单次调用最多等 1200ms），两者都**不**表示控件没有该模式；只有走到控件后的 `None` 才是"没有该模式"。三种都不该顺手降级成坐标点击。成功的答案还带**效果裁决** `effect=changed`/`unchanged`/`unverifiable`（回读控件自己的状态得出；普通按钮没有可读状态位，所以是 `unverifiable` 而不是"没变"——要看画面或树自己确认） |
 | `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |

@@ -366,7 +366,10 @@ pub fn secondary_action(window_id: u32, signature: &str, action: &str) -> Result
     #[cfg(not(windows))]
     {
         let _ = (window_id, signature, action);
-        Err(cua_core::Error::InvalidAction(
+        // `Unsupported`, not `InvalidAction`: this is a platform that has not
+        // implemented the operation, which is a different fact from an engine
+        // handing back a malformed action, and callers branch on it.
+        Err(cua_core::Error::Unsupported(
             "perform_secondary_action is only implemented on Windows".into(),
         ))
     }
@@ -665,7 +668,10 @@ fn wait_for_foreground(hwnd: windows::Win32::Foundation::HWND, timeout_ms: u64) 
 
 #[cfg(not(windows))]
 pub fn focus_window(_id: u32) -> Result<()> {
-    Err(cua_core::Error::InvalidAction(
+    // A caller that routes on the error kind needs to see "this platform does not do
+    // this", not "an engine produced a bad action" -- the first is a capability, the
+    // second is a bug report, and `window_input` reads exactly this difference.
+    Err(cua_core::Error::Unsupported(
         "focus_window is only implemented on Windows".into(),
     ))
 }

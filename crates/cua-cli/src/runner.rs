@@ -1,23 +1,35 @@
 //! Shared task runner used by the CLI and the MCP server.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
-use cua_core::{Action, Engine, EngineKind, Risk, StepRecord};
+use cua_core::{Action, Engine, EngineKind, StepRecord};
 use cua_engine_code::CodeEngine;
 use cua_engine_vision::{AnthropicConfig, OpenAiConfig, OpenAiVisionEngine, VisionEngine};
 use cua_router::{Router, RuleRouter};
 use tracing::{info, warn};
 
-/// Async approval hook for high-risk actions (used by MCP elicitation).
-pub type Approver = std::sync::Arc<
-    dyn Fn(Action) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
-        + Send
-        + Sync,
->;
+/// Async approval hook for actions that need a decision (used by MCP elicitation).
+///
+/// The shape lives in `cua_core::policy` now because the browser engine runs its own
+/// loop and has to ask through the same channel; keeping it here would have meant two
+/// gates disagreeing about what `yes` buys.
+pub type Approver = cua_core::policy::Approver;
+
+pub async fn confirm(
+    action: &Action,
+    yes: bool,
+    allow_high: bool,
+    approver: Option<&Approver>,
+) -> Result<bool> {
+    // One ladder, one implementation. The CLI adds nothing to it: this is the same
+    // gate the browser loop consults before it fires an action.
+    cua_core::policy::confirm(action.risk(), &describe(action), yes, allow_high, approver).await?;
+    Ok(true)
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum EngineArg {
@@ -140,7 +152,9 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
         );
     }
 
-    // Browser tasks run in their own CDP session and action space.
+    // Browser tasks run in their own CDP session and action space -- and now carry
+    // the same switches, because a gate that only guards the single-action path is a
+    // gate with a door in it.
     if decision.kind == EngineKind::Browser {
         let report = cua_engine_browser::run_task(cua_engine_browser::BrowserRunOptions {
             task: opts.task.clone(),
@@ -151,6 +165,9 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             start_url: None,
             run_dir: opts.run_dir.clone(),
             screenshot_quality: 70,
+            yes: opts.yes,
+            allow_high: opts.allow_high,
+            approver: opts.approver.clone(),
         })
         .await?;
         let outcome = match report.outcome {
@@ -253,7 +270,7 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             break;
         }
 
-        if let Action::RunCommand { command, shell } = &action {
+        if let Action::RunCommand { command, shell, .. } = &action {
             match cua_io::run_command(command, *shell).await {
                 Ok(out) => record.note = Some(out.to_note()),
                 Err(e) => record.note = Some(format!("error: {e}")),
@@ -363,72 +380,6 @@ fn build_engine(
     }
 }
 
-pub async fn confirm(
-    action: &Action,
-    yes: bool,
-    allow_high: bool,
-    approver: Option<&Approver>,
-) -> Result<bool> {
-    let risk = action.risk();
-    if risk == Risk::High {
-        // `allow_high` is the explicit permission for destructive work, so it has
-        // to be sufficient on its own. It used to fall through to the medium-risk
-        // path, which then demanded `--yes` as well — while the error message told
-        // the user to re-run with `--allow-high`. A gate whose stated escape does
-        // not work teaches callers to set every switch at once.
-        if allow_high {
-            return Ok(true);
-        }
-        if let Some(approve) = approver {
-            if approve(action.clone()).await {
-                return Ok(true);
-            }
-            bail!("high-risk action declined by client: {}", describe(action));
-        }
-        bail!(
-            "high-risk action blocked: {}. Re-run with --allow-high / allow_high=true if intended",
-            describe(action)
-        );
-    }
-    if risk < Risk::Medium || yes {
-        return Ok(true);
-    }
-    // Medium without `yes`: ask through whatever channel the caller has. An MCP
-    // client that can answer an elicitation should get one, not an error that
-    // teaches it to send `yes: true` next time — which is how a gate gets trained
-    // out of existence.
-    if let Some(approve) = approver {
-        return if approve(action.clone()).await {
-            Ok(true)
-        } else {
-            bail!(
-                "{} risk action declined by client: {}",
-                risk.as_str(),
-                describe(action)
-            )
-        };
-    }
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "{} risk action requires --yes / yes=true, or a client that can answer confirmations: {}",
-            risk.as_str(),
-            describe(action)
-        );
-    }
-    print!(
-        "about to run a {} risk action: {}\nconfirm? [y/N] ",
-        risk.as_str(),
-        describe(action)
-    );
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(matches!(
-        line.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 fn write_record(file: &mut std::fs::File, record: &StepRecord) -> Result<()> {
     let line = serde_json::to_string(record)?;
     writeln!(file, "{line}")?;
@@ -459,9 +410,20 @@ pub fn describe(action: &Action) -> String {
             format!("scroll ({dx}, {dy}) at ({}, {})", at.x, at.y)
         }
         Action::Wait { ms } => format!("wait {ms}ms"),
-        Action::RunCommand { command, shell } => {
+        Action::RunCommand {
+            command,
+            shell,
+            from_reasoning,
+        } => {
             let preview: String = command.chars().take(120).collect();
-            format!("run [{shell:?}] {preview}")
+            // Whoever reads the prompt has to be able to see that this line did not
+            // come from what the model chose to say.
+            let origin = if *from_reasoning {
+                " (from reasoning)"
+            } else {
+                ""
+            };
+            format!("run [{shell:?}] {preview}{origin}")
         }
         Action::Done { summary } => format!("done: {summary}"),
         Action::Fail { reason } => format!("fail: {reason}"),
@@ -487,7 +449,7 @@ mod tests {
     use cua_core::ShellKind;
 
     fn approver(answer: bool) -> Approver {
-        std::sync::Arc::new(move |_action| {
+        std::sync::Arc::new(move |_risk, _description| {
             Box::pin(async move { answer })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         })
@@ -497,6 +459,7 @@ mod tests {
         Action::RunCommand {
             command: text.to_string(),
             shell: ShellKind::Auto,
+            from_reasoning: false,
         }
     }
 

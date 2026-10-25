@@ -10,6 +10,7 @@
 pub mod action;
 pub mod error;
 pub mod observation;
+pub mod policy;
 
 pub use action::{Action, MouseButton, Point, Risk, ShellKind};
 pub use error::{Error, Result};

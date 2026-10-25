@@ -91,12 +91,16 @@ fn elicitor() -> &'static OnceLock<Elicitor> {
 
 fn approver_from_elicitor() -> Option<runner::Approver> {
     let elicitor = elicitor().get()?.clone();
-    Some(Arc::new(move |action| {
+    Some(Arc::new(move |risk, description| {
         let elicitor = elicitor.clone();
         Box::pin(async move {
-            let description = runner::describe(&action);
+            // The tier travels with the question: an elicitation that just says
+            // "approve this?" is how a confirmation becomes an Enter key.
             elicitor
-                .ask(&format!("Approve high-risk action? {description}"))
+                .ask(&format!(
+                    "Approve this {} risk action? {description}",
+                    risk.as_str()
+                ))
                 .await
                 .unwrap_or(false)
         })
@@ -1175,6 +1179,11 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 start_url: args["start_url"].as_str().map(str::to_string),
                 run_dir: None,
                 screenshot_quality: 70,
+                // Same defaults as `run_task`: a caller that lets a model drive a real
+                // browser has to say so, or be able to answer a confirmation.
+                yes: args["yes"].as_bool().unwrap_or(false),
+                allow_high: args["allow_high"].as_bool().unwrap_or(false),
+                approver: approver_from_elicitor(),
             };
             match cua_engine_browser::run_task(opts).await {
                 Ok(report) => {
@@ -1685,12 +1694,17 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 Err(e) => return e,
             };
             if let Err(e) = cua_engine_access::focus_window(window.id) {
+                // A platform that has not implemented window activation is not a
+                // transient failure: retrying `focus_failed` forever is how a caller
+                // ends up believing the tool almost works. Say which one it is.
+                let unsupported = matches!(e, cua_core::Error::Unsupported(_));
                 return tool_err(json!({
                     "ok": false,
                     "error": {
-                        "code": "focus_failed",
+                        "code": if unsupported { "unsupported" } else { "focus_failed" },
                         "message": e.to_string(),
-                        "retry": true,
+                        "hint": unsupported.then_some("window_input needs window activation, which this platform has not implemented; use click with screen coordinates and type_text instead"),
+                        "retry": !unsupported,
                     }
                 }));
             }
@@ -2323,14 +2337,16 @@ fn tool_defs() -> Value {
         },
         {
             "name": "browser_task",
-            "description": "Drive a headless Chromium browser through a natural-language task using CDP (navigate, click, type, eval). Runs in an isolated temporary profile. Requires an OpenAI-compatible model key.",
+            "description": "Drive a headless Chromium browser through a natural-language task using CDP (navigate, click, type, eval). Runs in an isolated temporary profile. Requires an OpenAI-compatible model key. Every step passes the same confirmation gate as the desktop engines: eval is high risk and needs allow_high, a cross-site navigate, a click on a submit-looking target and any Enter press are medium risk and need yes; a blocked step stops the run and names the switch that would have allowed it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "Goal in natural language" },
                     "start_url": { "type": "string", "description": "Optional page opened before the loop" },
                     "max_steps": { "type": "integer", "default": 15 },
-                    "dry_run": { "type": "boolean", "default": false },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Plan one step and report its risk tier without acting" },
+                    "yes": { "type": "boolean", "default": false, "description": "Accept medium-risk steps without asking. Never buys a high-risk step" },
+                    "allow_high": { "type": "boolean", "default": false, "description": "Permit high-risk steps (arbitrary JavaScript in the page)" },
                     "headed": { "type": "boolean", "default": false, "description": "Show the browser window" },
                     "model": { "type": "string" }
                 },
@@ -2487,7 +2503,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "window_input",
-            "description": "Atomically focus a window, optionally click a window-relative physical point, type text, and optionally press Return. The window must resolve to exactly one target; ambiguous or missing targets return candidates and never fall back to an unrelated app. The window-relative point is enforced: it has to land inside that window's own rectangle, otherwise the call is refused with offset_outside_window rather than clicking something else, and both axes must be given together.",
+            "description": "Atomically focus a window, optionally click a window-relative physical point, type text, and optionally press Return. The window must resolve to exactly one target; ambiguous or missing targets return candidates and never fall back to an unrelated app. The window-relative point is enforced: it has to land inside that window's own rectangle, otherwise the call is refused with offset_outside_window rather than clicking something else, and both axes must be given together. Activation is implemented on Windows only; on other platforms the call answers code=unsupported with retry=false before it touches anything.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

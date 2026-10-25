@@ -518,14 +518,20 @@ def scenario(identity: str) -> None:
             "window_input",
             {"window": window["id"], "x": 30, "y": 30, "text": "WITHIN-W"},
         )
-        # This one cannot ask for success on Linux: `focus_window` is not implemented
-        # for AT-SPI, so a valid point still ends at focus_failed. What it does pin is
-        # that the containment check is not rejecting a point that lies inside the
-        # window -- a check that only ever says "no" would pass the two above.
+        # Linux has no window activation, so a valid point still cannot complete --
+        # but it must now say so as `unsupported` rather than the ambiguous
+        # `focus_failed` it used to answer. Together with the check above this pins
+        # both halves of the aim gate: it refuses escapes, and it does not refuse
+        # points that are inside.
         check(
             f"[{identity}] a point inside the window is not refused by the aim check",
             "offset_outside_window" not in aimed["text"] and "half_a_point" not in aimed["text"],
             f"{aimed['text'][:140]}",
+        )
+        check(
+            f"[{identity}] a window action this platform cannot do says unsupported, not a retryable failure",
+            '"unsupported"' in aimed["text"] and '"retry":false' in aimed["text"],
+            f"{aimed['text'][:170]}",
         )
 
         # The honest retry: same target, roomy budget, must work -- which is what

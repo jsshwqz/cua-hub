@@ -165,7 +165,7 @@ pub async fn replay(opts: ReplayOptions) -> Result<ReplayReport> {
             continue;
         }
 
-        if let Action::RunCommand { command, shell } = action {
+        if let Action::RunCommand { command, shell, .. } = action {
             let out = cua_io::run_command(command, *shell).await?;
             eprintln!("      -> {}", out.to_note().replace('\n', " | "));
             executed += 1;
