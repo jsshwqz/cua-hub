@@ -15,6 +15,7 @@ pub mod policy;
 pub use action::{Action, MouseButton, Point, Risk, ShellKind};
 pub use error::{Error, Result};
 pub use observation::Observation;
+pub use policy::Effect;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
