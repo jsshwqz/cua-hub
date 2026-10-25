@@ -659,6 +659,743 @@ fn window_state_hash(window: &cua_io::WindowInfo) -> std::result::Result<u64, Va
     Ok(composite)
 }
 
+/// Result of attempting to snapshot a window's accessibility tree with a
+/// single automatic recovery (rebuild client / reset wedged cooldown + refocus
+/// window) when the initial read returns an error or an empty node list.
+#[derive(Debug)]
+enum SnapshotAttempt {
+    Available {
+        snapshot: cua_engine_access::UiSnapshot,
+        retried: bool,
+    },
+    CoordinateOnly {
+        retried: bool,
+        reason: String,
+    },
+}
+
+fn snapshot_with_retry<F, R>(mut fetch: F, mut recover: R) -> SnapshotAttempt
+where
+    F: FnMut() -> cua_core::Result<cua_engine_access::UiSnapshot>,
+    R: FnMut(),
+{
+    let first_reason = match fetch() {
+        Ok(snap) if !snap.nodes.is_empty() => {
+            return SnapshotAttempt::Available {
+                snapshot: snap,
+                retried: false,
+            };
+        }
+        Ok(_) => "accessibility snapshot returned 0 nodes".to_string(),
+        Err(e) => e.to_string(),
+    };
+
+    recover();
+
+    match fetch() {
+        Ok(snap) if !snap.nodes.is_empty() => SnapshotAttempt::Available {
+            snapshot: snap,
+            retried: true,
+        },
+        Ok(_) => SnapshotAttempt::CoordinateOnly {
+            retried: true,
+            reason: format!("{first_reason}; retry also returned 0 nodes"),
+        },
+        Err(e) => SnapshotAttempt::CoordinateOnly {
+            retried: true,
+            reason: format!("{first_reason}; retry failed: {e}"),
+        },
+    }
+}
+
+fn coordinate_only_accessibility(retried: bool, reason: &str) -> Value {
+    let notice = if retried {
+        format!(
+            "accessibility tree unavailable after 1 retry (rebuilt client and refocused window: {reason}); degraded to coordinate-only mode"
+        )
+    } else {
+        format!("accessibility tree disabled ({reason}); operating in coordinate-only mode")
+    };
+    json!({
+        "mode": "coordinate-only",
+        "available": false,
+        "retried": retried,
+        "node_count": 0,
+        "reason": reason,
+        "notice": notice,
+    })
+}
+
+fn related_title_summaries(related: &[cua_io::WindowInfo]) -> Vec<Value> {
+    related
+        .iter()
+        .map(|rel| {
+            json!({
+                "id": rel.id,
+                "title": rel.title,
+            })
+        })
+        .collect()
+}
+
+fn append_related_titles_only(mut tree: String, related: &[cua_io::WindowInfo]) -> String {
+    for rel in related {
+        if !tree.is_empty() && !tree.ends_with('\n') {
+            tree.push('\n');
+        }
+        tree.push_str(&format!("# related window {} \"{}\"\n", rel.id, rel.title));
+    }
+    tree
+}
+
+/// Default consecutive failures allowed on the same question before stopping.
+const DEFAULT_MAX_QUESTION_RETRIES: usize = 3;
+
+/// Default pixel padding around a target rectangle when cropping an
+/// `unverifiable` verification screenshot.
+const TARGET_CROP_MARGIN_PX: i32 = 48;
+
+static QUESTION_FAILURE_COUNTS: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn reset_question_retries() {
+    if let Ok(mut guard) = QUESTION_FAILURE_COUNTS.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.clear();
+        }
+    }
+}
+
+fn extract_question_id(args: &Value) -> Option<String> {
+    for key in ["question", "question_id", "question_number"] {
+        if let Some(s) = args[key].as_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Some(n) = args[key].as_u64() {
+            return Some(n.to_string());
+        }
+    }
+    None
+}
+
+fn max_retries_from_args(args: &Value) -> usize {
+    args["max_retries"]
+        .as_u64()
+        .map(|n| n.clamp(1, 20) as usize)
+        .unwrap_or(DEFAULT_MAX_QUESTION_RETRIES)
+}
+
+fn retry_limit_error(question: &str, attempts: usize, max_retries: usize) -> Value {
+    tool_err(json!({
+        "ok": false,
+        "error": {
+            "code": "retry_limit_exceeded",
+            "question": question,
+            "attempts": attempts,
+            "max_retries": max_retries,
+            "message": format!(
+                "question {question} failed {attempts} consecutive times (limit {max_retries}); stopping at question {question} instead of blindly continuing or skipping"
+            ),
+            "retry": false,
+        }
+    }))
+}
+
+fn check_question_retry_budget(
+    question: &str,
+    max_retries: usize,
+) -> std::result::Result<(), Value> {
+    let attempts = QUESTION_FAILURE_COUNTS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|map| map.get(question).copied()))
+        .unwrap_or(0);
+    if attempts >= max_retries {
+        return Err(retry_limit_error(question, attempts, max_retries));
+    }
+    Ok(())
+}
+
+fn record_question_attempt(
+    question: &str,
+    succeeded: bool,
+    max_retries: usize,
+) -> std::result::Result<usize, Value> {
+    let mut guard = QUESTION_FAILURE_COUNTS
+        .lock()
+        .map_err(|_| tool_err("question retry lock poisoned"))?;
+    let map = guard.get_or_insert_with(Default::default);
+    if succeeded {
+        map.remove(question);
+        return Ok(0);
+    }
+    let count = map.entry(question.to_string()).or_insert(0);
+    *count += 1;
+    let current = *count;
+    if current >= max_retries {
+        return Err(retry_limit_error(question, current, max_retries));
+    }
+    Ok(current)
+}
+
+fn action_result_succeeded(result: &Value) -> bool {
+    if result["isError"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    if let Some(parts) = result["content"].as_array() {
+        for part in parts {
+            if let Some(text) = part["text"].as_str() {
+                if text.contains("effect=unchanged") {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Only `Effect::Unverifiable` warrants a verification screenshot; `Changed`
+/// and `Unchanged` are already decided from accessibility state readback.
+fn should_capture_verification_crop(effect: cua_engine_access::Effect) -> bool {
+    matches!(effect, cua_engine_access::Effect::Unverifiable)
+}
+
+/// Compute a small bounding box around `target_rect` (in physical screen pixels)
+/// within a captured surface at `screen_origin` of size `screen_size`. Never
+/// returns a full-screen region when the target is a control.
+fn compute_target_crop_bounds(
+    screen_origin: (i32, i32),
+    screen_size: (u32, u32),
+    target_rect: (i32, i32, i32, i32),
+    margin: i32,
+) -> Option<(u32, u32, u32, u32)> {
+    let (tx, ty, tw, th) = target_rect;
+    if tw <= 0 || th <= 0 || screen_size.0 == 0 || screen_size.1 == 0 {
+        return None;
+    }
+    let rel_x = tx - screen_origin.0;
+    let rel_y = ty - screen_origin.1;
+    let pad = margin.max(0);
+    let left = (rel_x - pad).clamp(0, screen_size.0 as i32);
+    let top = (rel_y - pad).clamp(0, screen_size.1 as i32);
+    let right = (rel_x + tw + pad).clamp(0, screen_size.0 as i32);
+    let bottom = (rel_y + th + pad).clamp(0, screen_size.1 as i32);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((
+        left as u32,
+        top as u32,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    ))
+}
+
+/// Extract a sub-rectangle `(cx, cy, cw, ch)` from an RGBA8 image buffer.
+fn crop_rgba_region(
+    rgba: &[u8],
+    img_w: u32,
+    img_h: u32,
+    crop: (u32, u32, u32, u32),
+) -> Option<Vec<u8>> {
+    let (cx, cy, cw, ch) = crop;
+    if cw == 0
+        || ch == 0
+        || cx.checked_add(cw)? > img_w
+        || cy.checked_add(ch)? > img_h
+        || rgba.len() < (img_w as usize) * (img_h as usize) * 4
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity((cw as usize) * (ch as usize) * 4);
+    let stride = (img_w as usize) * 4;
+    let row_bytes = (cw as usize) * 4;
+    for row in 0..ch {
+        let start = ((cy + row) as usize) * stride + (cx as usize) * 4;
+        out.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+    Some(out)
+}
+
+fn crc32_png(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+fn adler32_zlib(bytes: &[u8]) -> u32 {
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in bytes {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let crc_start = out.len();
+    out.extend_from_slice(tag);
+    out.extend_from_slice(data);
+    let crc = crc32_png(&out[crc_start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Encode a small RGBA8 buffer as a valid PNG image using stored deflate blocks.
+fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut raw_scanlines = Vec::with_capacity((height as usize) * (1 + (width as usize) * 4));
+    let row_bytes = (width as usize) * 4;
+    for y in 0..(height as usize) {
+        raw_scanlines.push(0u8); // filter type 0 (None)
+        let start = y * row_bytes;
+        raw_scanlines.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+
+    let mut zlib = Vec::with_capacity(raw_scanlines.len() + 64);
+    zlib.extend_from_slice(&[0x78, 0x01]); // zlib header (CM=8, CINFO=7, no preset dict)
+    let chunks: Vec<&[u8]> = if raw_scanlines.is_empty() {
+        vec![&[][..]]
+    } else {
+        raw_scanlines.chunks(65_535).collect()
+    };
+    for (idx, block) in chunks.iter().enumerate() {
+        let is_last = idx + 1 == chunks.len();
+        zlib.push(if is_last { 0x01 } else { 0x00 });
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32_zlib(&raw_scanlines).to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_png_chunk(&mut png, b"IDAT", &zlib);
+    write_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Build the MCP tool response for an accessibility action report:
+/// - For `Changed` and `Unchanged`: returns text only (never captures a screenshot).
+/// - For `Unverifiable`: captures ONLY a small cropped neighborhood around the
+///   target control's rectangle (never a full-screen screenshot).
+fn action_outcome_with_verification_crop(
+    message: String,
+    report: &cua_engine_access::ActionReport,
+) -> Value {
+    if !should_capture_verification_crop(report.effect) {
+        return tool_ok(message);
+    }
+    if let Ok(screen) = cua_io::capture_primary() {
+        if let Some(crop) = compute_target_crop_bounds(
+            screen.origin,
+            (screen.width, screen.height),
+            report.node.rect,
+            TARGET_CROP_MARGIN_PX,
+        ) {
+            if let Some(cropped_rgba) =
+                crop_rgba_region(screen.image.as_raw(), screen.width, screen.height, crop)
+            {
+                let png = encode_rgba_png(crop.2, crop.3, &cropped_rgba);
+                let crop_meta = json!({
+                    "text": message,
+                    "effect": "unverifiable",
+                    "verification_crop": {
+                        "x": screen.origin.0 + crop.0 as i32,
+                        "y": screen.origin.1 + crop.1 as i32,
+                        "width": crop.2,
+                        "height": crop.3,
+                        "full_screen": false,
+                    }
+                });
+                return tool_ok(json!([
+                    {
+                        "type": "image",
+                        "data": encode_base64(&png),
+                        "mimeType": "image/png",
+                    },
+                    {
+                        "type": "text",
+                        "text": crop_meta.to_string(),
+                    }
+                ]));
+            }
+        }
+    }
+    tool_ok(message)
+}
+
+#[derive(Debug, Clone)]
+struct SubmissionAudit {
+    total_questions: usize,
+    answered_count: usize,
+    missing_questions: Vec<String>,
+    differences: Vec<Value>,
+    checked_controls: Vec<String>,
+    filled_controls: Vec<String>,
+    passed: bool,
+}
+
+fn normalize_answer_tokens(value: &Value) -> Vec<String> {
+    match value {
+        Value::Null => Vec::new(),
+        Value::Bool(b) => vec![b.to_string()],
+        Value::Number(n) => vec![n.to_string()],
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        Value::Array(arr) => {
+            let mut out: Vec<String> = arr
+                .iter()
+                .flat_map(normalize_answer_tokens)
+                .filter(|s| !s.is_empty())
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn infer_question_key(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("第")
+        .and_then(|s| s.split("题").next())
+    {
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return Some(digits);
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["question ", "question_", "question-", "q", "题"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return Some(digits);
+            }
+        }
+    }
+    let leading_digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !leading_digits.is_empty() {
+        let after = &trimmed[leading_digits.len()..];
+        if after.starts_with('.')
+            || after.starts_with('、')
+            || after.starts_with(')')
+            || after.starts_with('）')
+            || after.starts_with(':')
+        {
+            return Some(leading_digits);
+        }
+    }
+    None
+}
+
+fn extract_node_answer(node: &cua_engine_access::UiNode) -> Option<String> {
+    if node.checked == Some(true) || node.selected {
+        if !node.name.trim().is_empty() {
+            return Some(node.name.trim().to_string());
+        }
+        if !node.value.trim().is_empty() {
+            return Some(node.value.trim().to_string());
+        }
+        return Some("true".to_string());
+    }
+    if matches!(
+        node.control_type.as_str(),
+        "Edit" | "Document" | "ComboBox" | "Entry"
+    ) && !node.value.trim().is_empty()
+    {
+        return Some(node.value.trim().to_string());
+    }
+    None
+}
+
+fn answers_match(expected: &[String], actual: &[String]) -> bool {
+    if expected.is_empty() || actual.is_empty() || expected.len() != actual.len() {
+        return false;
+    }
+    let mut exp_norm: Vec<String> = expected.iter().map(|s| s.trim().to_lowercase()).collect();
+    let mut act_norm: Vec<String> = actual.iter().map(|s| s.trim().to_lowercase()).collect();
+    exp_norm.sort();
+    act_norm.sort();
+    exp_norm
+        .iter()
+        .zip(act_norm.iter())
+        .all(|(e, a)| e == a || a.starts_with(&format!("{e}.")) || a.starts_with(&format!("{e} ")))
+}
+
+/// Audit the current page's accessibility nodes against `planned_answers`:
+/// 1) Full-page check: compares every selected/checked option and filled input
+///    against the planned answers and lists all discrepancies in `differences`.
+/// 2) Coverage check: counts `answered_count` vs `total_questions` and lists any
+///    unanswered question numbers in `missing_questions`.
+fn audit_submission_nodes(
+    nodes: &[cua_engine_access::UiNode],
+    planned_answers: &Value,
+    total_questions_override: Option<usize>,
+) -> SubmissionAudit {
+    let mut checked_controls = Vec::new();
+    let mut filled_controls = Vec::new();
+    let mut by_question: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut current_question: Option<String> = None;
+
+    for node in nodes {
+        if let Some(q) =
+            infer_question_key(&node.automation_id).or_else(|| infer_question_key(&node.name))
+        {
+            current_question = Some(q);
+        }
+        if node.checked == Some(true) || node.selected {
+            checked_controls.push(format!(
+                "[{}] {} {:?}",
+                node.index, node.control_type, node.name
+            ));
+        } else if !node.value.trim().is_empty() {
+            filled_controls.push(format!(
+                "[{}] {} {:?} value={:?}",
+                node.index, node.control_type, node.name, node.value
+            ));
+        }
+        if let Some(ans) = extract_node_answer(node) {
+            if let Some(q) = current_question.clone() {
+                let entry = by_question.entry(q).or_default();
+                if !entry.contains(&ans) {
+                    entry.push(ans);
+                }
+            }
+        }
+    }
+
+    struct PlannedItem {
+        question: String,
+        expected: Vec<String>,
+        explicit_actual: Option<Vec<String>>,
+        element_index: Option<usize>,
+    }
+
+    let mut planned: Vec<PlannedItem> = Vec::new();
+    if let Some(arr) = planned_answers.as_array() {
+        for (idx, item) in arr.iter().enumerate() {
+            let q = item["question"]
+                .as_str()
+                .or_else(|| item["id"].as_str())
+                .or_else(|| item["number"].as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    item["question"]
+                        .as_u64()
+                        .or_else(|| item["id"].as_u64())
+                        .or_else(|| item["number"].as_u64())
+                        .map(|n| n.to_string())
+                })
+                .unwrap_or_else(|| (idx + 1).to_string());
+            let expected_val = item
+                .get("expected")
+                .or_else(|| item.get("answer"))
+                .or_else(|| item.get("value"))
+                .unwrap_or(&Value::Null);
+            let expected = normalize_answer_tokens(expected_val);
+            let explicit_actual = item.get("actual").map(normalize_answer_tokens);
+            let element_index = item["element_index"]
+                .as_u64()
+                .or_else(|| item["index"].as_u64())
+                .map(|n| n as usize);
+            planned.push(PlannedItem {
+                question: q,
+                expected,
+                explicit_actual,
+                element_index,
+            });
+        }
+    } else if let Some(map) = planned_answers.as_object() {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort_by_key(|k| (k.parse::<usize>().unwrap_or(usize::MAX), (*k).clone()));
+        for key in keys {
+            planned.push(PlannedItem {
+                question: key.clone(),
+                expected: normalize_answer_tokens(&map[key]),
+                explicit_actual: None,
+                element_index: None,
+            });
+        }
+    }
+
+    let total_questions = total_questions_override
+        .unwrap_or(planned.len())
+        .max(planned.len());
+    let mut missing_questions = Vec::new();
+    let mut differences = Vec::new();
+    let mut answered_count = 0usize;
+    let mut seen_questions = std::collections::HashSet::new();
+
+    for item in &planned {
+        seen_questions.insert(item.question.clone());
+        let actual: Vec<String> = if let Some(explicit) = &item.explicit_actual {
+            explicit.clone()
+        } else if let Some(index) = item.element_index {
+            nodes
+                .iter()
+                .find(|n| n.index == index)
+                .and_then(extract_node_answer)
+                .into_iter()
+                .collect()
+        } else if let Some(found) = by_question.get(&item.question) {
+            found.clone()
+        } else if by_question.is_empty() {
+            // Fallback when the page has no question headers: check if any active control matches
+            nodes
+                .iter()
+                .filter_map(extract_node_answer)
+                .filter(|ans| answers_match(&item.expected, std::slice::from_ref(ans)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if item.expected.is_empty() || actual.is_empty() {
+            missing_questions.push(item.question.clone());
+            differences.push(json!({
+                "question": item.question,
+                "expected": item.expected,
+                "actual": actual,
+                "reason": "unanswered",
+            }));
+        } else {
+            answered_count += 1;
+            if !answers_match(&item.expected, &actual) {
+                differences.push(json!({
+                    "question": item.question,
+                    "expected": item.expected,
+                    "actual": actual,
+                    "reason": "mismatch",
+                }));
+            }
+        }
+    }
+
+    for q_num in 1..=total_questions {
+        let key = q_num.to_string();
+        if !seen_questions.contains(&key) {
+            if let Some(actual) = by_question.get(&key).filter(|v| !v.is_empty()) {
+                let _ = actual;
+                answered_count += 1;
+            } else {
+                missing_questions.push(key);
+            }
+        }
+    }
+
+    let passed =
+        missing_questions.is_empty() && differences.is_empty() && answered_count >= total_questions;
+
+    SubmissionAudit {
+        total_questions,
+        answered_count,
+        missing_questions,
+        differences,
+        checked_controls,
+        filled_controls,
+        passed,
+    }
+}
+
+fn submission_audit_to_json(audit: &SubmissionAudit) -> Value {
+    json!({
+        "ok": audit.passed,
+        "can_submit": audit.passed,
+        "coverage": {
+            "answered": audit.answered_count,
+            "total": audit.total_questions,
+            "missing_questions": audit.missing_questions,
+        },
+        "differences": audit.differences,
+        "checked_controls": audit.checked_controls,
+        "filled_controls": audit.filled_controls,
+    })
+}
+
+fn enforce_submission_gate(args: &Value) -> std::result::Result<Option<Value>, Value> {
+    let Some(planned) = args
+        .get("planned_answers")
+        .or_else(|| args.get("expected_answers"))
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(None);
+    };
+    let total_override = args["total_questions"].as_u64().map(|n| n as usize);
+    let nodes: Vec<cua_engine_access::UiNode> = if let Some(raw_nodes) = args.get("nodes") {
+        serde_json::from_value(raw_nodes.clone()).unwrap_or_default()
+    } else if !args["window"].is_null() {
+        let win = resolve_window_arg(&args["window"])?;
+        cua_engine_access::snapshot_window(win.id, &win.app, &win.title, win.pid, 600, 16)
+            .map(|s| s.nodes)
+            .unwrap_or_default()
+    } else if let Some(obs_id) = args["observation_id"].as_str() {
+        let Some(obs) = observations::get(obs_id) else {
+            return Err(stale_err(format!(
+                "observation `{obs_id}` is no longer held; re-run window_state before submitting"
+            )));
+        };
+        obs.nodes
+    } else {
+        cua_engine_access::snapshot(600, 12)
+            .map(|s| s.nodes)
+            .unwrap_or_default()
+    };
+
+    let audit = audit_submission_nodes(&nodes, planned, total_override);
+    let payload = submission_audit_to_json(&audit);
+    if !audit.passed {
+        return Err(tool_err(json!({
+            "ok": false,
+            "error": {
+                "code": "submission_quality_gate_failed",
+                "message": format!(
+                    "submission blocked by quality gate: answered {}/{} questions, missing {:?}, differences: {}",
+                    audit.answered_count,
+                    audit.total_questions,
+                    audit.missing_questions,
+                    audit.differences.len()
+                ),
+                "audit": payload,
+                "retry": false,
+            }
+        })));
+    }
+    Ok(Some(payload))
+}
+
 /// An index or pixel that came from an observation the server no longer holds,
 /// or that does not exist in it. Treated as retryable but never silently
 /// re-resolved: the caller must re-observe and choose again.
@@ -775,11 +1512,161 @@ struct ResolvedNode {
     /// The window to activate before acting, if any. Activating the owner of an
     /// open menu dismisses the menu, so popup nodes carry `None` here.
     focus_window: Option<u32>,
+    /// True when the pre-action foreground check already verified (or refocused
+    /// and re-resolved) `focus_window`.
+    already_focused: bool,
+}
+
+/// Outcome of verifying that the target window still owns the foreground before
+/// an action executes. If another window stole focus, the target window is
+/// refocused and its accessibility tree is re-parsed so the target control's
+/// rectangle and state are freshly resolved.
+#[derive(Debug, Clone)]
+struct ForegroundVerification {
+    node: cua_engine_access::UiNode,
+    #[allow(dead_code)]
+    was_foreground: bool,
+    #[allow(dead_code)]
+    refocused: bool,
+    #[allow(dead_code)]
+    reresolved: bool,
+}
+
+/// Re-resolve a previously observed `UiNode` inside a freshly parsed window
+/// snapshot after refocusing. Matches by structural signature first, then by
+/// `(control_type, automation_id)` or `(control_type, name)`.
+fn reresolve_node_in_snapshot(
+    nodes: &[cua_engine_access::UiNode],
+    original: &cua_engine_access::UiNode,
+) -> Option<cua_engine_access::UiNode> {
+    let found = if !original.signature.is_empty() {
+        nodes
+            .iter()
+            .find(|n| n.signature == original.signature)
+            .or_else(|| {
+                (!original.automation_id.is_empty()).then(|| {
+                    nodes.iter().find(|n| {
+                        n.control_type == original.control_type
+                            && n.automation_id == original.automation_id
+                    })
+                })?
+            })
+            .or_else(|| {
+                (!original.name.is_empty()).then(|| {
+                    nodes.iter().find(|n| {
+                        n.control_type == original.control_type && n.name == original.name
+                    })
+                })?
+            })
+    } else if !original.automation_id.is_empty() {
+        nodes.iter().find(|n| {
+            n.control_type == original.control_type && n.automation_id == original.automation_id
+        })
+    } else if !original.name.is_empty() {
+        nodes
+            .iter()
+            .find(|n| n.control_type == original.control_type && n.name == original.name)
+    } else {
+        nodes
+            .iter()
+            .find(|n| n.index == original.index && n.control_type == original.control_type)
+    };
+    found.map(|n| {
+        let mut updated = n.clone();
+        updated.index = original.index;
+        updated
+    })
+}
+
+fn ensure_foreground_and_reresolve_with<IsFg, Focus, Snap>(
+    window_id: u32,
+    node: &cua_engine_access::UiNode,
+    mut is_fg: IsFg,
+    mut focus: Focus,
+    mut snapshot: Snap,
+) -> std::result::Result<ForegroundVerification, Value>
+where
+    IsFg: FnMut(u32) -> bool,
+    Focus: FnMut(u32) -> cua_core::Result<()>,
+    Snap: FnMut(u32) -> cua_core::Result<cua_engine_access::UiSnapshot>,
+{
+    if is_fg(window_id) {
+        return Ok(ForegroundVerification {
+            node: node.clone(),
+            was_foreground: true,
+            refocused: false,
+            reresolved: false,
+        });
+    }
+    focus(window_id).map_err(|e| {
+        tool_err(json!({
+            "ok": false,
+            "error": {
+                "code": "focus_failed",
+                "message": e.to_string(),
+                "retry": true,
+            }
+        }))
+    })?;
+    match snapshot(window_id) {
+        Ok(fresh) if !fresh.nodes.is_empty() => {
+            if let Some(updated) = reresolve_node_in_snapshot(&fresh.nodes, node) {
+                Ok(ForegroundVerification {
+                    node: updated,
+                    was_foreground: false,
+                    refocused: true,
+                    reresolved: true,
+                })
+            } else {
+                Err(stale_err(format!(
+                    "window {window_id} was not in the foreground; after refocusing and re-parsing, control {} {:?} is no longer present — re-run window_state",
+                    node.control_type, node.name
+                )))
+            }
+        }
+        _ => Ok(ForegroundVerification {
+            node: node.clone(),
+            was_foreground: false,
+            refocused: true,
+            reresolved: false,
+        }),
+    }
+}
+
+fn ensure_foreground_and_reresolve(
+    window_id: u32,
+    node: &cua_engine_access::UiNode,
+) -> std::result::Result<ForegroundVerification, Value> {
+    ensure_foreground_and_reresolve_with(
+        window_id,
+        node,
+        cua_engine_access::is_foreground_window,
+        |id| {
+            cua_engine_access::focus_window(id)?;
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            Ok(())
+        },
+        |id| {
+            let (app, title, pid) = cua_io::list_windows(None, true)
+                .ok()
+                .and_then(|wins| {
+                    wins.into_iter()
+                        .find(|w| w.id == id)
+                        .map(|w| (w.app, w.title, w.pid))
+                })
+                .unwrap_or_default();
+            cua_engine_access::snapshot_window(id, &app, &title, pid, 400, 12)
+        },
+    )
 }
 
 /// Resolve an element index, preferring the observation it was read from so the
 /// index cannot drift onto a different control. Falls back to a fresh desktop
 /// snapshot only when the caller did not pass an observation at all.
+///
+/// Before returning a window-owned target, verifies that its window is still in
+/// the foreground; if not, refocuses the window and re-resolves the target
+/// control from a fresh accessibility snapshot.
 fn resolve_indexed_node(args: &Value, index: usize, tool: &str) -> Result<ResolvedNode, Value> {
     if let Some(id) = args["observation_id"].as_str() {
         let Some(obs) = observations::get(id) else {
@@ -793,19 +1680,39 @@ fn resolve_indexed_node(args: &Value, index: usize, tool: &str) -> Result<Resolv
             )));
         };
         let focus_window = (node_window == obs.window_id).then_some(obs.window_id);
+        if let Some(win_id) = focus_window {
+            let verified = ensure_foreground_and_reresolve(win_id, &node)?;
+            return Ok(ResolvedNode {
+                node: verified.node,
+                node_window: Some(node_window),
+                focus_window,
+                already_focused: true,
+            });
+        }
         return Ok(ResolvedNode {
             node,
             node_window: Some(node_window),
             focus_window,
+            already_focused: false,
         });
     }
     match cua_engine_access::node_at(index, 400, 8) {
         Ok(Some(node)) => {
             let window = window_arg_id(&args["window"]);
+            if let Some(win_id) = window {
+                let verified = ensure_foreground_and_reresolve(win_id, &node)?;
+                return Ok(ResolvedNode {
+                    node: verified.node,
+                    node_window: window,
+                    focus_window: window,
+                    already_focused: true,
+                });
+            }
             Ok(ResolvedNode {
                 node,
                 node_window: window,
                 focus_window: window,
+                already_focused: false,
             })
         }
         Ok(None) => Err(tool_err(format!(
@@ -819,7 +1726,7 @@ fn resolve_indexed_node(args: &Value, index: usize, tool: &str) -> Result<Resolv
 /// minutes, and are what a chain is meant to replace: letting one of them be a
 /// step would hide a whole agent loop inside a single call, with no intermediate
 /// state left for the caller to see or stop.
-const NON_CHAINABLE: [&str; 8] = [
+const NON_CHAINABLE: [&str; 9] = [
     "run_task",
     "orchestrate",
     "browser_task",
@@ -828,6 +1735,7 @@ const NON_CHAINABLE: [&str; 8] = [
     "task_cancel",
     "replay_run",
     "list_runs",
+    "resume_chain",
 ];
 
 /// A longer sequence belongs in a planned task. Past this many actions the
@@ -999,15 +1907,280 @@ fn step_record(tool: &str, result: &Value) -> Value {
     record
 }
 
+/// Maximum cursor drift (in physical pixels) tolerated between chain steps
+/// before we treat the movement as external (non-agent) user mouse activity.
+const EXTERNAL_CURSOR_TOLERANCE_PX: i32 = 6;
+
+static NEXT_PAUSE_ID: AtomicU64 = AtomicU64::new(1);
+static LAST_AGENT_CURSOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static EXTERNAL_INPUT_EVENTS: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+static PAUSED_CHAINS: Mutex<Option<HashMap<String, PausedChain>>> = Mutex::new(None);
+
+#[derive(Debug, Clone)]
+struct PausedChain {
+    token: String,
+    window_id: Option<u32>,
+    all_steps: Vec<(String, Value)>,
+    stopped_at: usize,
+    last_verified_step: Option<usize>,
+    settle_ms: u64,
+    observe: Option<Value>,
+}
+
+fn record_agent_cursor(expected: (i32, i32)) {
+    let actual = cua_io::cursor_position().ok().unwrap_or(expected);
+    if let Ok(mut guard) = LAST_AGENT_CURSOR.lock() {
+        *guard = Some(actual);
+    }
+}
+
+/// Signal that non-agent mouse or keyboard input was observed before `step_index`.
+#[allow(dead_code)]
+pub fn notify_external_input(step_index: usize, detail: impl Into<String>) {
+    if let Ok(mut guard) = EXTERNAL_INPUT_EVENTS.lock() {
+        guard
+            .get_or_insert_with(Default::default)
+            .insert(step_index, detail.into());
+    }
+}
+
+#[cfg(test)]
+fn reset_concurrency_state() {
+    if let Ok(mut g) = LAST_AGENT_CURSOR.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = EXTERNAL_INPUT_EVENTS.lock() {
+        if let Some(m) = g.as_mut() {
+            m.clear();
+        }
+    }
+    if let Ok(mut g) = PAUSED_CHAINS.lock() {
+        if let Some(m) = g.as_mut() {
+            m.clear();
+        }
+    }
+}
+
+/// Check whether non-agent mouse or keyboard input occurred before `step_index`.
+fn check_external_user_activity(
+    step_index: usize,
+    step_args: &Value,
+    baseline_cursor: Option<(i32, i32)>,
+) -> Option<String> {
+    if let Some(reason) = step_args["external_input_detected"].as_str() {
+        return Some(reason.to_string());
+    }
+    if step_args["external_input_detected"].as_bool() == Some(true) {
+        return Some("external mouse/keyboard activity reported before step".to_string());
+    }
+    if let Ok(mut guard) = EXTERNAL_INPUT_EVENTS.lock() {
+        if let Some(reason) = guard
+            .as_mut()
+            .and_then(|map| map.remove(&step_index).or_else(|| map.remove(&usize::MAX)))
+        {
+            return Some(reason);
+        }
+    }
+    if let Some((bx, by)) = baseline_cursor {
+        if let Ok((cx, cy)) = cua_io::cursor_position() {
+            let dx = (cx - bx).abs();
+            let dy = (cy - by).abs();
+            if dx > EXTERNAL_CURSOR_TOLERANCE_PX || dy > EXTERNAL_CURSOR_TOLERANCE_PX {
+                return Some(format!(
+                    "non-agent mouse movement detected before step {step_index}: cursor moved from ({bx},{by}) to ({cx},{cy})"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Determine whether a completed step produced a verified effect on the target.
+///
+/// Only steps with an explicit verified state change (`effect=changed`, readback
+/// `state` from `perform_secondary_action`, passed `verify_submission`, or
+/// explicit `"verified_effect": true`) advance `last_verified_step`. Steps that
+/// report `effect=unchanged`, `effect=unverifiable`, or unverified blind input
+/// do NOT count as verified, so a resumed chain will re-run from the last
+/// verified step rather than blindly continuing from where it paused.
+fn step_has_verified_effect(tool: &str, step_args: &Value, result: &Value) -> bool {
+    if result["isError"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    if let Some(explicit) = step_args["verified_effect"].as_bool() {
+        return explicit;
+    }
+    if let Some(parts) = result["content"].as_array() {
+        for part in parts {
+            if let Some(text) = part["text"].as_str() {
+                if text.contains("effect=unchanged") || text.contains("effect=unverifiable") {
+                    return false;
+                }
+                if text.contains("effect=changed") {
+                    return true;
+                }
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    if parsed["verified_effect"].as_bool() == Some(false) {
+                        return false;
+                    }
+                    if parsed["verified_effect"].as_bool() == Some(true) {
+                        return true;
+                    }
+                    if tool == "perform_secondary_action"
+                        && parsed["ok"].as_bool() == Some(true)
+                        && !parsed["state"].is_null()
+                    {
+                        return true;
+                    }
+                    if tool == "verify_submission" && parsed["ok"].as_bool() == Some(true) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    matches!(
+        tool,
+        "window_state"
+            | "control_state"
+            | "screen_info"
+            | "list_windows"
+            | "clipboard_get"
+            | "clipboard_set"
+    )
+}
+
+fn store_paused_chain(paused: PausedChain) {
+    if let Ok(mut guard) = PAUSED_CHAINS.lock() {
+        guard
+            .get_or_insert_with(Default::default)
+            .insert(paused.token.clone(), paused);
+    }
+}
+
+fn take_paused_chain(token: &str) -> Option<PausedChain> {
+    PAUSED_CHAINS
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.as_mut()?.remove(token))
+}
+
+async fn resume_paused_chain(args: &Value) -> Value {
+    let token = match required_str(args, "resume_token") {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let Some(paused) = take_paused_chain(&token) else {
+        return tool_err(json!({
+            "ok": false,
+            "error": {
+                "code": "invalid_resume_token",
+                "message": format!("no paused chain found for resume_token `{token}`"),
+                "retry": false,
+            }
+        }));
+    };
+
+    // Resume strictly from the step after `last_verified_step`, never blindly
+    // from `stopped_at` when an unverified step ran in between.
+    let resume_from = paused.last_verified_step.map(|s| s + 1).unwrap_or(0);
+    let win_id = paused
+        .window_id
+        .or_else(|| window_arg_id(&args["window"]))
+        .unwrap_or(0);
+
+    // Always take a brand-new observation (`disable_diffing: true`) before
+    // resuming so indices and control states are freshly resolved.
+    let fresh_obs_id = if let Some(raw_nodes) = args.get("fresh_nodes") {
+        let nodes: Vec<cua_engine_access::UiNode> =
+            serde_json::from_value(raw_nodes.clone()).unwrap_or_default();
+        let target_win = if win_id == 0 { 1 } else { win_id };
+        let mut snap = cua_engine_access::UiSnapshot {
+            nodes: nodes.clone(),
+            truncated: false,
+            unreadable: Vec::new(),
+        };
+        let parts = vec![elements::TreePart {
+            window_id: target_win,
+            title: "resumed".to_string(),
+            related: false,
+            snapshot: &mut snap,
+        }];
+        let _ = elements::observe_group(target_win, parts, true);
+        let indexed_nodes = snap.nodes;
+        let node_windows = vec![target_win; indexed_nodes.len()];
+        observations::record(observations::Observation {
+            id: observations::next_id(),
+            window_id: target_win,
+            hash: None,
+            shots: Vec::new(),
+            nodes: indexed_nodes,
+            node_windows,
+        })
+    } else if win_id != 0 {
+        let obs_call = call_tool_single(
+            "window_state",
+            &json!({
+                "window": win_id,
+                "disable_diffing": true,
+                "include_screenshot": false,
+                "include_text": true,
+            }),
+        )
+        .await;
+        obs_call["content"]
+            .as_array()
+            .and_then(|parts| parts.first())
+            .and_then(|p| p["text"].as_str())
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .and_then(|v| v["observation_id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| {
+                observations::record(observations::Observation {
+                    id: observations::next_id(),
+                    window_id: win_id,
+                    hash: None,
+                    shots: Vec::new(),
+                    nodes: Vec::new(),
+                    node_windows: Vec::new(),
+                })
+            })
+    } else {
+        observations::record(observations::Observation {
+            id: observations::next_id(),
+            window_id: 0,
+            hash: None,
+            shots: Vec::new(),
+            nodes: Vec::new(),
+            node_windows: Vec::new(),
+        })
+    };
+
+    execute_chain_sequence(
+        paused.all_steps,
+        resume_from,
+        paused.last_verified_step,
+        paused.settle_ms,
+        paused.observe,
+        paused.window_id,
+        Some(paused.stopped_at),
+        Some(fresh_obs_id),
+    )
+    .await
+}
+
 /// Dispatch a tool call. Without `then` this is exactly the single tool, so no
 /// existing caller changes behaviour. With `then`, the head action and every
 /// step run in order on this machine and one consolidated result comes back:
 /// a per-step trace, then a single observation of where things ended up.
 ///
-/// The chain never re-observes between steps: element indices stay valid across
-/// observations of the same window by construction, and a chain that stopped to
-/// look after every action would buy back none of the round trips it saves.
+/// If non-agent mouse or keyboard activity is detected before any step, the
+/// chain immediately pauses, reports `stopped_at` and `last_verified_step`, and
+/// returns a `resume_token` that `resume_chain` uses to take a fresh observation
+/// and resume strictly from `last_verified_step + 1`.
 async fn call_tool(name: &str, args: &Value) -> Value {
+    if name == "resume_chain" {
+        return resume_paused_chain(args).await;
+    }
     if args.get("then").is_none() {
         return call_tool_single(name, args).await;
     }
@@ -1016,40 +2189,139 @@ async fn call_tool(name: &str, args: &Value) -> Value {
         Err(e) => return e,
     };
 
-    let mut trace: Vec<Value> = Vec::with_capacity(plan.steps.len() + 1);
-    let mut failure: Option<(usize, String)> = None;
-
-    let head = call_tool_single(name, &plan.head).await;
-    trace.push(step_record(name, &head));
-    if head["isError"].as_bool().unwrap_or(false) {
-        failure = Some((0, error_text(&head)));
+    let mut all_steps: Vec<(String, Value)> = Vec::with_capacity(plan.steps.len() + 1);
+    all_steps.push((name.to_string(), plan.head.clone()));
+    for (tool, step_args) in &plan.steps {
+        let mut inherited = step_args.clone();
+        inherit_from(&mut inherited, &plan.head);
+        all_steps.push((tool.clone(), inherited));
     }
 
-    for (i, (tool, step_args)) in plan.steps.iter().enumerate() {
-        if failure.is_some() {
+    let window = chain_window(all_steps.iter().map(|(_, a)| a.clone()));
+    execute_chain_sequence(
+        all_steps,
+        0,
+        None,
+        plan.settle_ms,
+        plan.observe,
+        window,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_chain_sequence(
+    all_steps: Vec<(String, Value)>,
+    start_index: usize,
+    initial_last_verified: Option<usize>,
+    settle_ms: u64,
+    observe: Option<Value>,
+    window: Option<u32>,
+    resumed_from_stopped_at: Option<usize>,
+    fresh_observation_id: Option<String>,
+) -> Value {
+    let planned = all_steps.len();
+    let mut trace: Vec<Value> = Vec::with_capacity(planned.saturating_sub(start_index));
+    let mut failure: Option<(usize, String)> = None;
+    let mut paused_info: Option<(usize, String, String)> = None;
+    let mut last_verified_step: Option<usize> = initial_last_verified;
+    let mut baseline_cursor: Option<(i32, i32)> = None;
+
+    for (idx, (tool, raw_step_args)) in all_steps.iter().enumerate().skip(start_index) {
+        if idx > start_index && settle_ms > 0 {
+            baseline_cursor = LAST_AGENT_CURSOR
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .or_else(|| cua_io::cursor_position().ok());
+            tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+        }
+
+        if let Some(activity) = check_external_user_activity(idx, raw_step_args, baseline_cursor) {
+            let token = format!("pause-{}", NEXT_PAUSE_ID.fetch_add(1, Ordering::Relaxed));
+            store_paused_chain(PausedChain {
+                token: token.clone(),
+                window_id: window,
+                all_steps: all_steps.clone(),
+                stopped_at: idx,
+                last_verified_step,
+                settle_ms,
+                observe: observe.clone(),
+            });
+            paused_info = Some((idx, activity, token));
             break;
         }
-        if plan.settle_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(plan.settle_ms)).await;
+
+        let mut step_args = raw_step_args.clone();
+        if let Some(fresh_obs) = &fresh_observation_id {
+            if let Some(map) = step_args.as_object_mut() {
+                if map.contains_key("observation_id") {
+                    map.insert("observation_id".to_string(), json!(fresh_obs));
+                }
+            }
         }
-        let mut step_args = step_args.clone();
-        inherit_from(&mut step_args, &plan.head);
+
         let result = call_tool_single(tool, &step_args).await;
-        trace.push(step_record(tool, &result));
+        let mut rec = step_record(tool, &result);
+        rec["step"] = json!(idx);
+        let verified = step_has_verified_effect(tool, &step_args, &result);
+        rec["verified_effect"] = json!(verified);
+        trace.push(rec);
+
         if result["isError"].as_bool().unwrap_or(false) {
-            failure = Some((i + 1, error_text(&result)));
+            failure = Some((idx, error_text(&result)));
+            break;
         }
+        if verified {
+            last_verified_step = Some(idx);
+        }
+        baseline_cursor = LAST_AGENT_CURSOR.lock().ok().and_then(|g| *g);
     }
 
-    let planned = plan.steps.len() + 1;
+    if let Some((stopped_at, activity, token)) = paused_info {
+        let resume_from = last_verified_step.map(|s| s + 1).unwrap_or(0);
+        let summary = json!({
+            "ok": false,
+            "paused": true,
+            "pause_reason": "external_input_detected",
+            "activity": activity,
+            "ran": trace.len(),
+            "planned": planned,
+            "stopped_at": stopped_at,
+            "last_verified_step": last_verified_step,
+            "resume_from_step": resume_from,
+            "resume_token": token,
+            "chain": trace,
+            "next": format!(
+                "paused at step {stopped_at} due to non-agent input; call resume_chain with resume_token to take a fresh observation and resume from step {resume_from} (after last_verified_step {:?})",
+                last_verified_step
+            ),
+        });
+        return json!({
+            "content": [{ "type": "text", "text": summary.to_string() }],
+            "isError": true,
+        });
+    }
+
     let mut summary = json!({
         "ok": failure.is_none(),
         "ran": trace.len(),
         "planned": planned,
         // 0 is the tool named in this call; steps are numbered from 1.
         "stopped_at": failure.as_ref().map(|(at, _)| *at),
+        "last_verified_step": last_verified_step,
         "chain": trace,
     });
+    if let Some(prev_stop) = resumed_from_stopped_at {
+        summary["resumed"] = json!(true);
+        summary["resumed_from_step"] = json!(start_index);
+        summary["previous_stopped_at"] = json!(prev_stop);
+    }
+    if let Some(obs_id) = &fresh_observation_id {
+        summary["fresh_observation_id"] = json!(obs_id);
+    }
     if let Some((_, message)) = &failure {
         summary["error"] = json!(message);
         summary["next"] = json!(
@@ -1058,11 +2330,7 @@ async fn call_tool(name: &str, args: &Value) -> Value {
     }
 
     let mut content = vec![json!({ "type": "text", "text": summary.to_string() })];
-    if let Some(obs_args) = &plan.observe {
-        let window = chain_window(
-            std::iter::once(plan.head.clone())
-                .chain(plan.steps.iter().map(|(_, args)| args.clone())),
-        );
+    if let Some(obs_args) = &observe {
         match window {
             Some(id) => {
                 let mut args = obs_args.clone();
@@ -1100,7 +2368,69 @@ fn error_text(result: &Value) -> String {
 }
 
 async fn call_tool_single(name: &str, args: &Value) -> Value {
+    let question_id = extract_question_id(args);
+    let max_retries = max_retries_from_args(args);
+    if let Some(q) = &question_id {
+        if let Err(limit_err) = check_question_retry_budget(q, max_retries) {
+            return limit_err;
+        }
+    }
+    if name != "verify_submission" {
+        if let Err(gate_err) = enforce_submission_gate(args) {
+            return gate_err;
+        }
+    }
+    let result = call_tool_single_inner(name, args).await;
+    if let Some(q) = &question_id {
+        let succeeded = action_result_succeeded(&result);
+        if let Err(limit_err) = record_question_attempt(q, succeeded, max_retries) {
+            return limit_err;
+        }
+    }
+    result
+}
+
+async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
     match name {
+        "verify_submission" => {
+            let planned = args
+                .get("planned_answers")
+                .or_else(|| args.get("expected_answers"))
+                .unwrap_or(&Value::Null);
+            if planned.is_null() {
+                return tool_err("verify_submission requires `planned_answers`");
+            }
+            let total_override = args["total_questions"].as_u64().map(|n| n as usize);
+            let nodes: Vec<cua_engine_access::UiNode> = if let Some(raw_nodes) = args.get("nodes") {
+                serde_json::from_value(raw_nodes.clone()).unwrap_or_default()
+            } else if !args["window"].is_null() {
+                let win = match resolve_window_arg(&args["window"]) {
+                    Ok(w) => w,
+                    Err(e) => return e,
+                };
+                cua_engine_access::snapshot_window(win.id, &win.app, &win.title, win.pid, 600, 16)
+                    .map(|s| s.nodes)
+                    .unwrap_or_default()
+            } else if let Some(obs_id) = args["observation_id"].as_str() {
+                let Some(obs) = observations::get(obs_id) else {
+                    return stale_err(format!(
+                        "observation `{obs_id}` is no longer held; re-run window_state"
+                    ));
+                };
+                obs.nodes
+            } else {
+                cua_engine_access::snapshot(600, 12)
+                    .map(|s| s.nodes)
+                    .unwrap_or_default()
+            };
+            let audit = audit_submission_nodes(&nodes, planned, total_override);
+            let payload = submission_audit_to_json(&audit);
+            if audit.passed {
+                tool_ok(payload)
+            } else {
+                tool_err(payload)
+            }
+        }
         "start_task" => {
             let opts = match run_options_from_args(args) {
                 Ok(o) => o,
@@ -1348,7 +2678,8 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 Err(e) => return e,
             };
             let include_screenshot = args["include_screenshot"].as_bool().unwrap_or(true);
-            let include_text = args["include_text"].as_bool().unwrap_or(false);
+            let include_text = args["include_text"].as_bool().unwrap_or(true);
+            let include_related = args["include_related"].as_bool().unwrap_or(false);
             let disable_diffing = args["disable_diffing"].as_bool().unwrap_or(false);
             let max_edge = args["max_edge"].as_u64().unwrap_or(1280) as u32;
             let quality = args["quality"].as_u64().unwrap_or(75) as u8;
@@ -1362,10 +2693,11 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             let observation_id = observations::next_id();
 
             // Menus, tooltips and dialogs are separate windows owned by the same
-            // process. They are observed together with the target so a popup can
-            // be read — and clicked by index — as part of one observation.
+            // process. By default only their titles are listed; pass
+            // include_related=true to expand their full trees and screenshots.
             let related =
                 cua_io::related_windows(window.pid, window.id, MAX_RELATED).unwrap_or_default();
+            let related_titles = related_title_summaries(&related);
 
             if include_screenshot {
                 match cua_io::capture_window(&window.id.to_string(), max_edge, quality) {
@@ -1396,40 +2728,47 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                         // window that owns it.
                         let mut composite = cap.hash;
                         let mut related_meta = Vec::new();
-                        for (n, rel) in related.iter().enumerate() {
-                            if let Ok(rel_cap) =
-                                cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
-                            {
-                                let rel_shot_id = format!("{observation_id}:s{}", n + 1);
-                                composite = composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
-                                let mut meta = window_capture_meta(&rel_cap);
-                                if let Some(map) = meta.as_object_mut() {
-                                    map.insert("role".into(), json!("related"));
-                                    map.insert("screenshot_id".into(), json!(rel_shot_id));
+                        if include_related {
+                            for (n, rel) in related.iter().enumerate() {
+                                if let Ok(rel_cap) =
+                                    cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
+                                {
+                                    let rel_shot_id = format!("{observation_id}:s{}", n + 1);
+                                    composite =
+                                        composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
+                                    let mut meta = window_capture_meta(&rel_cap);
+                                    if let Some(map) = meta.as_object_mut() {
+                                        map.insert("role".into(), json!("related"));
+                                        map.insert("screenshot_id".into(), json!(rel_shot_id));
+                                    }
+                                    shots.push(observations::Shot {
+                                        id: rel_shot_id,
+                                        window_id: rel.id,
+                                        role: "related",
+                                        origin: (rel_cap.info.x, rel_cap.info.y),
+                                        scale: rel_cap.frame.scale,
+                                        size: (
+                                            rel_cap.frame.observation.width,
+                                            rel_cap.frame.observation.height,
+                                        ),
+                                        hash: rel_cap.hash,
+                                    });
+                                    related_meta.push(meta);
+                                    content.push(json!({
+                                        "type": "image",
+                                        "data": encode_base64(&rel_cap.frame.observation.image),
+                                        "mimeType": rel_cap.frame.observation.media_type,
+                                    }));
                                 }
-                                shots.push(observations::Shot {
-                                    id: rel_shot_id,
-                                    window_id: rel.id,
-                                    role: "related",
-                                    origin: (rel_cap.info.x, rel_cap.info.y),
-                                    scale: rel_cap.frame.scale,
-                                    size: (
-                                        rel_cap.frame.observation.width,
-                                        rel_cap.frame.observation.height,
-                                    ),
-                                    hash: rel_cap.hash,
-                                });
-                                related_meta.push(meta);
-                                content.push(json!({
-                                    "type": "image",
-                                    "data": encode_base64(&rel_cap.frame.observation.image),
-                                    "mimeType": rel_cap.frame.observation.media_type,
-                                }));
                             }
                         }
                         if !related_meta.is_empty() {
                             if let Some(map) = screenshot.as_mut().and_then(Value::as_object_mut) {
                                 map.insert("related".into(), json!(related_meta));
+                            }
+                        } else if !related_titles.is_empty() {
+                            if let Some(map) = screenshot.as_mut().and_then(Value::as_object_mut) {
+                                map.insert("related_titles".into(), json!(related_titles));
                             }
                         }
                         hash = Some(composite);
@@ -1448,40 +2787,41 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
 
             let mut nodes: Vec<cua_engine_access::UiNode> = Vec::new();
             let mut node_windows: Vec<u32> = Vec::new();
-            let mut accessibility: Option<Value> = None;
-            if include_text {
-                match cua_engine_access::snapshot_window(
-                    window.id,
-                    &window.app,
-                    &window.title,
-                    window.pid,
-                    max_nodes,
-                    depth,
+            let mut accessibility: Value = if include_text {
+                match snapshot_with_retry(
+                    || {
+                        cua_engine_access::snapshot_window(
+                            window.id,
+                            &window.app,
+                            &window.title,
+                            window.pid,
+                            max_nodes,
+                            depth,
+                        )
+                    },
+                    || {
+                        cua_engine_access::atspi::reset_wedged();
+                        let _ = cua_engine_access::focus_window(window.id);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    },
                 ) {
-                    Ok(mut snap) => {
+                    SnapshotAttempt::Available {
+                        snapshot: mut snap,
+                        retried,
+                    } => {
                         // Popups contribute their own tree section under a header
-                        // line, sharing one index namespace with the target, so an
-                        // element_index is unambiguous across the observation.
+                        // line only when include_related=true; otherwise only their
+                        // titles are reported so unrelated windows do not bloat the
+                        // observation.
                         let mut related_snaps: Vec<(
                             cua_io::WindowInfo,
                             cua_engine_access::UiSnapshot,
                         )> = Vec::new();
-                        // UIA already parents most popups inside the owning
-                        // window's logical tree. Re-reading those through their
-                        // own HWND would duplicate every menu item under a second
-                        // index, so a popup only gets its own section when the
-                        // target tree does not already show that area. Overlap,
-                        // not equality: a menu's HWND is a few pixels larger than
-                        // the UIA node for the same menu, and its drop shadow
-                        // larger again.
                         let shown: Vec<(i32, i32, i32, i32)> =
                             snap.nodes.iter().map(|n| n.rect).collect();
                         let target_area = window.width as i64 * window.height as i64;
+                        let mut uncovered_related: Vec<cua_io::WindowInfo> = Vec::new();
                         for rel in &related {
-                            // A popup is smaller than the window it belongs to.
-                            // Something bigger is the owner: observing a modal
-                            // dialog should not drag the whole parent window's
-                            // tree — and therefore a copy of the dialog — along.
                             if rel.width as i64 * rel.height as i64 > target_area {
                                 continue;
                             }
@@ -1489,15 +2829,18 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                             if covered_by(&shown, popup) {
                                 continue;
                             }
-                            if let Ok(rel_snap) = cua_engine_access::snapshot_window(
-                                rel.id,
-                                &rel.app,
-                                &rel.title,
-                                rel.pid,
-                                MAX_POPUP_NODES,
-                                depth,
-                            ) {
-                                related_snaps.push((rel.clone(), rel_snap));
+                            uncovered_related.push(rel.clone());
+                            if include_related {
+                                if let Ok(rel_snap) = cua_engine_access::snapshot_window(
+                                    rel.id,
+                                    &rel.app,
+                                    &rel.title,
+                                    rel.pid,
+                                    MAX_POPUP_NODES,
+                                    depth,
+                                ) {
+                                    related_snaps.push((rel.clone(), rel_snap));
+                                }
                             }
                         }
                         let mut parts: Vec<elements::TreePart> =
@@ -1516,9 +2859,12 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                                 snapshot: rel_snap,
                             });
                         }
-                        // observe_group takes the parts by value, so the borrows
-                        // end with the call and the snapshots are readable again.
                         let view = elements::observe_group(window.id, parts, disable_diffing);
+                        let tree_text = if !include_related && !uncovered_related.is_empty() {
+                            append_related_titles_only(view.text, &uncovered_related)
+                        } else {
+                            view.text
+                        };
                         nodes = snap.nodes.clone();
                         node_windows = vec![window.id; snap.nodes.len()];
                         let mut truncated = snap.truncated;
@@ -1529,29 +2875,26 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                             truncated |= rel_snap.truncated;
                             unreadable.extend(rel_snap.unreadable.iter().cloned());
                         }
-                        accessibility = Some(json!({
+                        let mut acc = json!({
                             "mode": view.mode.as_str(),
-                            "tree": view.text,
+                            "tree": tree_text,
                             "node_count": view.node_count,
                             "changed_lines": view.changed_lines,
                             "truncated": truncated,
+                            "retried": retried,
+                            "include_related": include_related,
+                            "related": related_titles,
                             "notice": view.notice,
-                        }));
-                        // Only present when something went unanswered: a tree
-                        // that is shorter than the window needs to say which
-                        // parts it is missing, not just be shorter.
+                        });
                         if let Some(note) = cua_engine_access::unreadable_note(&unreadable) {
-                            if let Some(map) = accessibility.as_mut().and_then(Value::as_object_mut)
-                            {
+                            if let Some(map) = acc.as_object_mut() {
                                 map.insert("unreadable".to_string(), json!(note.trim_end()));
                             }
                         }
-                        // Selection and document text save a second observation
-                        // when the task is "what is selected / what does it say".
                         let text_ctx =
                             cua_engine_access::text_context(window.id).unwrap_or_default();
                         let selected_lines = snap.selected_lines();
-                        if let Some(map) = accessibility.as_mut().and_then(Value::as_object_mut) {
+                        if let Some(map) = acc.as_object_mut() {
                             if let Some(selected) = text_ctx.selected_text {
                                 map.insert("selected_text".into(), json!(selected));
                             }
@@ -1562,8 +2905,18 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                                 map.insert("selected_elements".into(), json!(selected_lines));
                             }
                         }
+                        acc
                     }
-                    Err(e) => return tool_err(e),
+                    SnapshotAttempt::CoordinateOnly { retried, reason } => {
+                        coordinate_only_accessibility(retried, &reason)
+                    }
+                }
+            } else {
+                coordinate_only_accessibility(false, "include_text=false")
+            };
+            if let Some(map) = accessibility.as_object_mut() {
+                if !map.contains_key("related") && !related_titles.is_empty() {
+                    map.insert("related".into(), json!(related_titles));
                 }
             }
 
@@ -1777,13 +3130,16 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             let (max_nodes, max_depth) = action_limits(args);
             match cua_engine_access::set_value_with(&name, &text, max_nodes, max_depth) {
-                Ok(Some(report)) => tool_ok(format!(
-                    "set text of {} \"{}\" ({} chars){}",
-                    report.node.control_type,
-                    report.node.name,
-                    text.chars().count(),
-                    effect_note(&report, true)
-                )),
+                Ok(Some(report)) => action_outcome_with_verification_crop(
+                    format!(
+                        "set text of {} \"{}\" ({} chars){}",
+                        report.node.control_type,
+                        report.node.name,
+                        text.chars().count(),
+                        effect_note(&report, true)
+                    ),
+                    &report,
+                ),
                 Ok(None) => tool_err(format!(
                     "control {name:?} has no Value/EditableText pattern; focus it and use type_text"
                 )),
@@ -1809,11 +3165,13 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 Ok(r) => r,
                 Err(e) => return e,
             };
-            if let Some(id) = resolved.focus_window {
-                if let Err(e) = cua_engine_access::focus_window(id) {
-                    return tool_err(e);
+            if !resolved.already_focused {
+                if let Some(id) = resolved.focus_window {
+                    if let Err(e) = cua_engine_access::focus_window(id) {
+                        return tool_err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(60));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(60));
             }
             let Some(selector) = selector_for_node(&resolved.node) else {
                 return tool_err(format!(
@@ -1821,12 +3179,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 ));
             };
             match cua_engine_access::invoke(&selector) {
-                Ok(Some(report)) => tool_ok(format!(
-                    "invoked {} \"{}\" via accessibility pattern{}",
-                    report.node.control_type,
-                    report.node.name,
-                    effect_note(&report, false)
-                )),
+                Ok(Some(report)) => action_outcome_with_verification_crop(
+                    format!(
+                        "invoked {} \"{}\" via accessibility pattern{}",
+                        report.node.control_type,
+                        report.node.name,
+                        effect_note(&report, false)
+                    ),
+                    &report,
+                ),
                 Ok(None) => {
                     let Some(center) = control_center(resolved.node.rect) else {
                         return tool_err(format!(
@@ -1839,10 +3200,13 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                         double: false,
                     };
                     match cua_io::apply(&action, 1.0) {
-                        Ok(()) => tool_ok(format!(
-                            "clicked {} \"{}\" at ({},{})",
-                            resolved.node.control_type, resolved.node.name, center.0, center.1
-                        )),
+                        Ok(()) => {
+                            record_agent_cursor(center);
+                            tool_ok(format!(
+                                "clicked {} \"{}\" at ({},{})",
+                                resolved.node.control_type, resolved.node.name, center.0, center.1
+                            ))
+                        }
                         Err(e) => tool_err(e),
                     }
                 }
@@ -1855,16 +3219,18 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 Ok(v) => v,
                 Err(e) => return e,
             };
-            let (node, focus_target) = match resolve_indexed_node(args, index, "set_element_value")
-            {
-                Ok(r) => (r.node, r.focus_window),
+            let resolved = match resolve_indexed_node(args, index, "set_element_value") {
+                Ok(r) => r,
                 Err(e) => return e,
             };
-            if let Some(id) = focus_target {
-                if let Err(e) = cua_engine_access::focus_window(id) {
-                    return tool_err(e);
+            let node = resolved.node;
+            if !resolved.already_focused {
+                if let Some(id) = resolved.focus_window {
+                    if let Err(e) = cua_engine_access::focus_window(id) {
+                        return tool_err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(60));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(60));
             }
             let Some(selector) = selector_for_node(&node) else {
                 return tool_err(format!(
@@ -1872,12 +3238,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 ));
             };
             match cua_engine_access::set_value(&selector, &text) {
-                Ok(Some(report)) => tool_ok(format!(
-                    "set {} \"{}\" via Value/EditableText{}",
-                    report.node.control_type,
-                    report.node.name,
-                    effect_note(&report, true)
-                )),
+                Ok(Some(report)) => action_outcome_with_verification_crop(
+                    format!(
+                        "set {} \"{}\" via Value/EditableText{}",
+                        report.node.control_type,
+                        report.node.name,
+                        effect_note(&report, true)
+                    ),
+                    &report,
+                ),
                 Ok(None) => tool_err(format!(
                     "control at index {index} has no Value/EditableText pattern; use type_text"
                 )),
@@ -1949,11 +3318,13 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
 
             // Most patterns only work on the window that owns the foreground; a
             // popup is already up, so leave the foreground alone for its nodes.
-            if let Some(id) = resolved.focus_window {
-                if let Err(e) = cua_engine_access::focus_window(id) {
-                    return tool_err(e);
+            if !resolved.already_focused {
+                if let Some(id) = resolved.focus_window {
+                    if let Err(e) = cua_engine_access::focus_window(id) {
+                        return tool_err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(60));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(60));
             }
 
             match cua_engine_access::secondary_action(window_id, &node.signature, requested) {
@@ -1984,12 +3355,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             let (max_nodes, max_depth) = action_limits(args);
             match cua_engine_access::invoke_with(&name, max_nodes, max_depth) {
                 Ok(Some(report)) => {
-                    return tool_ok(format!(
-                        "invoked {} \"{}\" via accessibility pattern{}",
-                        report.node.control_type,
-                        report.node.name,
-                        effect_note(&report, false)
-                    ))
+                    return action_outcome_with_verification_crop(
+                        format!(
+                            "invoked {} \"{}\" via accessibility pattern{}",
+                            report.node.control_type,
+                            report.node.name,
+                            effect_note(&report, false)
+                        ),
+                        &report,
+                    )
                 }
                 Ok(None) => {}
                 Err(e) => return tool_err(e),
@@ -2007,10 +3381,13 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                         double: false,
                     };
                     match cua_io::apply(&action, 1.0) {
-                        Ok(()) => tool_ok(format!(
-                            "clicked {} \"{}\" at ({},{})",
-                            node.control_type, node.name, center.0, center.1
-                        )),
+                        Ok(()) => {
+                            record_agent_cursor(center);
+                            tool_ok(format!(
+                                "clicked {} \"{}\" at ({},{})",
+                                node.control_type, node.name, center.0, center.1
+                            ))
+                        }
                         Err(e) => tool_err(e),
                     }
                 }
@@ -2022,6 +3399,7 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             let observation_id = args["observation_id"].as_str();
             let element_index = args["element_index"].as_u64();
             let target_window: Option<u32>;
+            let mut already_focused = false;
             let point: (i32, i32) = if let Some(index) = element_index {
                 let resolved = match resolve_indexed_node(args, index as usize, "click") {
                     Ok(r) => r,
@@ -2036,6 +3414,7 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 // A node inside a popup must not trigger activation of the
                 // owner window: that closes the menu before the click lands.
                 target_window = resolved.focus_window;
+                already_focused = resolved.already_focused;
                 (x, y)
             } else if let (Some(x), Some(y)) = (args["x"].as_f64(), args["y"].as_f64()) {
                 let shot_id = args["screenshot_id"].as_str();
@@ -2076,21 +3455,25 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                     "click needs element_index + observation_id, or x/y (optionally with observation_id)",
                 );
             };
-            if let Some(id) = target_window {
-                if let Err(e) = cua_engine_access::focus_window(id) {
-                    return tool_err(json!({
-                        "ok": false,
-                        "error": {
-                            "code": "focus_failed",
-                            "message": e.to_string(),
-                            "retry": true,
+            if !already_focused {
+                if let Some(id) = target_window {
+                    if !cua_engine_access::is_foreground_window(id) {
+                        if let Err(e) = cua_engine_access::focus_window(id) {
+                            return tool_err(json!({
+                                "ok": false,
+                                "error": {
+                                    "code": "focus_failed",
+                                    "message": e.to_string(),
+                                    "retry": true,
+                                }
+                            }));
                         }
-                    }));
+                        // Let the activation settle before the pointer moves: a click
+                        // delivered to a window that has not come forward yet lands on
+                        // whatever was in front.
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                    }
                 }
-                // Let the activation settle before the pointer moves: a click
-                // delivered to a window that has not come forward yet lands on
-                // whatever was in front.
-                std::thread::sleep(std::time::Duration::from_millis(60));
             }
             let button = if args["middle"].as_bool().unwrap_or(false) {
                 cua_core::MouseButton::Middle
@@ -2105,13 +3488,16 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 double: args["double"].as_bool().unwrap_or(false),
             };
             match cua_io::apply(&action, 1.0) {
-                Ok(()) => tool_ok(json!({
-                    "ok": true,
-                    "x": point.0,
-                    "y": point.1,
-                    "window": target_window,
-                    "element_index": element_index,
-                })),
+                Ok(()) => {
+                    record_agent_cursor(point);
+                    tool_ok(json!({
+                        "ok": true,
+                        "x": point.0,
+                        "y": point.1,
+                        "window": target_window,
+                        "element_index": element_index,
+                    }))
+                }
                 Err(e) => tool_err(e),
             }
         }
@@ -2416,7 +3802,8 @@ fn tool_defs() -> Value {
                 "properties": {
                     "window": { "description": "Window id, selector, or {app,id}", "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 }, { "type": "object", "properties": { "app": { "type": "string" }, "id": { "type": "integer", "minimum": 1 } }, "required": ["id"] } ] },
                     "include_screenshot": { "type": "boolean", "default": true },
-                    "include_text": { "type": "boolean", "default": false, "description": "Add the window-scoped accessibility tree with element indexes" },
+                    "include_text": { "type": "boolean", "default": true, "description": "Add the window-scoped accessibility tree with element indexes (defaults to true; retries once on empty/null and explicitly reports coordinate-only mode when unavailable)" },
+                    "include_related": { "type": "boolean", "default": false, "description": "Expand full accessibility trees and screenshots for related same-process windows; defaults to false (titles only)" },
                     "disable_diffing": { "type": "boolean", "default": false, "description": "Return the complete tree and rebuild the numbering baseline; use it when you no longer have the baseline needed to apply a diff" },
                     "max_edge": { "type": "integer", "default": 1280 },
                     "quality": { "type": "integer", "default": 75 },
@@ -2740,6 +4127,41 @@ fn tool_defs() -> Value {
                 "properties": { "combo": { "type": "string" } },
                 "required": ["combo"]
             }
+        },
+        {
+            "name": "verify_submission",
+            "description": "Pre-submit quality gate for web quizzes/forms: re-reads all checked/selected/filled controls on the page, compares against `planned_answers`, checks coverage (`answered_count`/`total_questions`), and blocks submission if any questions are missing or mismatched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "description": "Window id or selector to re-read before submitting",
+                        "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ]
+                    },
+                    "observation_id": { "type": "string", "description": "Fallback observation id when no live window is specified" },
+                    "planned_answers": {
+                        "description": "Planned answers keyed by question number/label (object or array), compared against actual checked/selected/value state on screen",
+                        "oneOf": [ { "type": "object" }, { "type": "array" } ]
+                    },
+                    "total_questions": { "type": "integer", "minimum": 1, "description": "Total expected question count on the page for coverage verification" }
+                },
+                "required": ["planned_answers"]
+            }
+        },
+        {
+            "name": "resume_chain",
+            "description": "Resume a `then` chain that was paused due to non-agent mouse/keyboard activity: performs a fresh observation first and resumes strictly from `last_verified_step + 1` (never blindly continuing from the unverified step or stale plan position).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "resume_token": { "type": "string", "description": "Token returned in `resume_token` when the chain paused" },
+                    "window": {
+                        "description": "Optional window id or selector to re-observe before resuming",
+                        "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ]
+                    }
+                },
+                "required": ["resume_token"]
+            }
         }
     ]);
     add_chain_controls(&mut defs);
@@ -2772,6 +4194,21 @@ fn add_chain_controls(defs: &mut Value) {
         "description": "Milliseconds to wait between chain steps, so the previous action has landed. Only used with `then`."
     });
 
+    let question_schema = json!({
+        "description": "Question identifier/number for bounded per-question retry tracking; stops after N consecutive failures on the same question.",
+        "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ]
+    });
+    let max_retries_schema = json!({
+        "type": "integer",
+        "minimum": 1,
+        "default": DEFAULT_MAX_QUESTION_RETRIES,
+        "description": "Maximum consecutive failed attempts allowed on the same question before stopping and reporting the question number."
+    });
+    let planned_answers_schema = json!({
+        "description": "When passed on a submit action, runs full-page pre-submit answer and coverage verification before allowing the action.",
+        "oneOf": [ { "type": "object" }, { "type": "array" } ]
+    });
+
     let Some(tools) = defs.as_array_mut() else {
         return;
     };
@@ -2782,7 +4219,7 @@ fn add_chain_controls(defs: &mut Value) {
         let name = tool["name"].as_str().unwrap_or_default();
         if !chainable(name) {
             continue;
-        }
+        };
         let Some(schema) = tool
             .entry("inputSchema")
             .or_insert_with(|| json!({ "type": "object" }))
@@ -2800,6 +4237,15 @@ fn add_chain_controls(defs: &mut Value) {
         properties.insert("then".to_string(), then_schema.clone());
         properties.insert("observe".to_string(), observe_schema.clone());
         properties.insert("settle_ms".to_string(), settle_schema.clone());
+        properties
+            .entry("question".to_string())
+            .or_insert_with(|| question_schema.clone());
+        properties
+            .entry("max_retries".to_string())
+            .or_insert_with(|| max_retries_schema.clone());
+        properties
+            .entry("planned_answers".to_string())
+            .or_insert_with(|| planned_answers_schema.clone());
     }
 }
 
@@ -3263,5 +4709,486 @@ mod tests {
         let orchestrated = orchestrate_options_from_args(&json!({ "task": "x", "yes": true }))
             .expect("orchestrate options");
         assert!(orchestrated.yes);
+    }
+
+    fn sample_ui_node(index: usize, control_type: &str, name: &str) -> cua_engine_access::UiNode {
+        cua_engine_access::UiNode {
+            index,
+            depth: 0,
+            control_type: control_type.into(),
+            name: name.into(),
+            automation_id: String::new(),
+            rect: (10, 20, 80, 30),
+            signature: format!("/{index}:{control_type}"),
+            value: String::new(),
+            actions: Vec::new(),
+            focused: false,
+            selected: false,
+            checked: None,
+        }
+    }
+
+    #[test]
+    fn accessibility_null_retries_once_and_recovers_or_degrades_to_coordinate_only() {
+        let mut attempts = 0usize;
+        let mut recovered = 0usize;
+        let recovered_attempt = snapshot_with_retry(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(cua_engine_access::UiSnapshot {
+                        nodes: Vec::new(),
+                        truncated: false,
+                        unreadable: Vec::new(),
+                    })
+                } else {
+                    Ok(cua_engine_access::UiSnapshot {
+                        nodes: vec![sample_ui_node(0, "Window", "Quiz")],
+                        truncated: false,
+                        unreadable: Vec::new(),
+                    })
+                }
+            },
+            || {
+                recovered += 1;
+            },
+        );
+        assert_eq!(
+            attempts, 2,
+            "must retry once when initial snapshot is empty"
+        );
+        assert_eq!(
+            recovered, 1,
+            "must invoke client rebuild/refocus before retry"
+        );
+        match recovered_attempt {
+            SnapshotAttempt::Available { snapshot, retried } => {
+                assert!(retried);
+                assert_eq!(snapshot.nodes.len(), 1);
+            }
+            other => panic!("expected recovered snapshot, got {other:?}"),
+        }
+
+        let mut fail_attempts = 0usize;
+        let mut fail_recovered = 0usize;
+        let degraded = snapshot_with_retry(
+            || {
+                fail_attempts += 1;
+                Err(cua_core::Error::Capture("UIA root unavailable".into()))
+            },
+            || {
+                fail_recovered += 1;
+            },
+        );
+        assert_eq!(fail_attempts, 2);
+        assert_eq!(fail_recovered, 1);
+        match degraded {
+            SnapshotAttempt::CoordinateOnly { retried, reason } => {
+                assert!(retried);
+                let payload = coordinate_only_accessibility(retried, &reason);
+                assert!(
+                    !payload.is_null(),
+                    "accessibility must never be silent null"
+                );
+                assert_eq!(payload["mode"], "coordinate-only");
+                assert_eq!(payload["available"], false);
+                assert_eq!(payload["retried"], true);
+                assert!(payload["notice"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("coordinate-only"));
+            }
+            other => panic!("expected coordinate-only fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn related_windows_default_to_titles_only_until_include_related_is_true() {
+        let defs = tool_defs();
+        let def = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "window_state")
+            .expect("window_state tool");
+        assert_eq!(
+            def["inputSchema"]["properties"]["include_related"]["default"],
+            json!(false)
+        );
+        assert_eq!(
+            def["inputSchema"]["properties"]["include_text"]["default"],
+            json!(true)
+        );
+
+        let related = vec![
+            test_window(91, "browser", "Confirm Submission"),
+            test_window(92, "browser", "Helper Tooltip"),
+        ];
+        let titles = related_title_summaries(&related);
+        assert_eq!(
+            titles,
+            vec![
+                json!({ "id": 91, "title": "Confirm Submission" }),
+                json!({ "id": 92, "title": "Helper Tooltip" }),
+            ]
+        );
+        let tree_with_titles =
+            append_related_titles_only("[0] Window \"Quiz\"\n".to_string(), &related);
+        assert!(tree_with_titles.contains("# related window 91 \"Confirm Submission\"\n"));
+        assert!(tree_with_titles.contains("# related window 92 \"Helper Tooltip\"\n"));
+        assert!(!tree_with_titles.contains("[1]"));
+    }
+
+    #[test]
+    fn submission_quality_gate_reports_missing_questions_and_answer_differences() {
+        let mut q1 = sample_ui_node(1, "Group", "1. Rust ownership");
+        q1.depth = 1;
+        let mut q1_opt_a = sample_ui_node(2, "RadioButton", "A. Borrow checker");
+        q1_opt_a.depth = 2;
+        q1_opt_a.checked = Some(false);
+        let mut q1_opt_b = sample_ui_node(3, "RadioButton", "B. Garbage collector");
+        q1_opt_b.depth = 2;
+        q1_opt_b.checked = Some(true);
+
+        let mut q2 = sample_ui_node(4, "Group", "2. Memory safety");
+        q2.depth = 1;
+        let mut q2_opt_true = sample_ui_node(5, "RadioButton", "True");
+        q2_opt_true.depth = 2;
+        q2_opt_true.checked = Some(true);
+
+        let mut q3 = sample_ui_node(6, "Group", "3. Fill in the blank");
+        q3.depth = 1;
+        let mut q3_edit = sample_ui_node(7, "Edit", "Question 3 answer");
+        q3_edit.depth = 2;
+        q3_edit.value = String::new();
+
+        let nodes = vec![q1, q1_opt_a, q1_opt_b, q2, q2_opt_true.clone(), q3, q3_edit];
+        let planned = json!({
+            "1": "A",
+            "2": "True",
+            "3": "Result<T, E>",
+            "4": "B"
+        });
+
+        let audit = audit_submission_nodes(&nodes, &planned, Some(4));
+        assert!(
+            !audit.passed,
+            "audit must fail when questions are missing or mismatched"
+        );
+        assert_eq!(audit.total_questions, 4);
+        assert_eq!(audit.answered_count, 2);
+        assert_eq!(
+            audit.missing_questions,
+            vec!["3".to_string(), "4".to_string()]
+        );
+        assert_eq!(audit.differences.len(), 3);
+        assert_eq!(audit.differences[0]["question"], json!("1"));
+
+        // Verify that verify_submission tool returns an error listing missing_questions & differences,
+        // and passes once all questions match the plan.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let failed_gate = rt.block_on(call_tool_single(
+            "verify_submission",
+            &json!({
+                "nodes": nodes,
+                "planned_answers": planned,
+                "total_questions": 4
+            }),
+        ));
+        assert_eq!(failed_gate["isError"], json!(true));
+        let failed_body: Value =
+            serde_json::from_str(failed_gate["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(failed_body["ok"], json!(false));
+        assert_eq!(failed_body["can_submit"], json!(false));
+        assert_eq!(
+            failed_body["coverage"]["missing_questions"],
+            json!(["3", "4"])
+        );
+        assert_eq!(failed_body["differences"].as_array().unwrap().len(), 3);
+
+        // Fix answers and verify gate passes.
+        let mut fixed_q1_a = sample_ui_node(2, "RadioButton", "A. Borrow checker");
+        fixed_q1_a.depth = 2;
+        fixed_q1_a.checked = Some(true);
+        let mut fixed_q3_edit = sample_ui_node(7, "Edit", "Question 3 answer");
+        fixed_q3_edit.depth = 2;
+        fixed_q3_edit.value = "Result<T, E>".into();
+        let fixed_nodes = vec![
+            sample_ui_node(1, "Group", "1. Rust ownership"),
+            fixed_q1_a,
+            sample_ui_node(4, "Group", "2. Memory safety"),
+            q2_opt_true,
+            sample_ui_node(6, "Group", "3. Fill in the blank"),
+            fixed_q3_edit,
+        ];
+        let passed_gate = rt.block_on(call_tool_single(
+            "verify_submission",
+            &json!({
+                "nodes": fixed_nodes,
+                "planned_answers": {
+                    "1": "A. Borrow checker",
+                    "2": "True",
+                    "3": "Result<T, E>"
+                },
+                "total_questions": 3
+            }),
+        ));
+        assert_eq!(passed_gate["isError"], json!(false));
+        let passed_body: Value =
+            serde_json::from_str(passed_gate["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(passed_body["ok"], json!(true));
+        assert_eq!(passed_body["can_submit"], json!(true));
+        assert_eq!(passed_body["coverage"]["answered"], json!(3));
+        assert_eq!(passed_body["coverage"]["total"], json!(3));
+        assert_eq!(passed_body["coverage"]["missing_questions"], json!([]));
+        assert_eq!(passed_body["differences"], json!([]));
+    }
+
+    #[test]
+    fn bounded_question_retry_stops_after_n_failures_and_reports_question_number() {
+        reset_question_retries();
+
+        // Fail twice on question 7 with max_retries = 2.
+        assert!(record_question_attempt("7", false, 2).is_ok());
+        let err = record_question_attempt("7", false, 2)
+            .expect_err("second failure on question 7 must hit retry limit 2");
+        assert_eq!(err["isError"], json!(true));
+        let body: Value =
+            serde_json::from_str(err["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], json!("retry_limit_exceeded"));
+        assert_eq!(body["error"]["question"], json!("7"));
+        assert_eq!(body["error"]["attempts"], json!(2));
+        assert_eq!(body["error"]["max_retries"], json!(2));
+
+        // Any subsequent attempt on question 7 is blocked before execution.
+        let blocked = check_question_retry_budget("7", 2)
+            .expect_err("further attempts on exhausted question must be blocked");
+        let blocked_body: Value =
+            serde_json::from_str(blocked["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(blocked_body["error"]["code"], json!("retry_limit_exceeded"));
+        assert_eq!(blocked_body["error"]["question"], json!("7"));
+
+        // A different question is unaffected, and a success resets its counter.
+        assert!(record_question_attempt("8", false, 2).is_ok());
+        assert!(record_question_attempt("8", true, 2).is_ok());
+        assert!(record_question_attempt("8", false, 2).is_ok());
+        reset_question_retries();
+    }
+
+    #[test]
+    fn verification_crop_only_fires_on_unverifiable_and_crops_target_neighborhood() {
+        let mut node = sample_ui_node(12, "RadioButton", "Option C");
+        node.rect = (200, 300, 80, 30);
+
+        assert!(!should_capture_verification_crop(
+            cua_engine_access::Effect::Changed
+        ));
+        assert!(!should_capture_verification_crop(
+            cua_engine_access::Effect::Unchanged
+        ));
+        assert!(should_capture_verification_crop(
+            cua_engine_access::Effect::Unverifiable
+        ));
+
+        // Screen is 1920x1080; target is (200, 300, 80, 30).
+        // Crop must be a small bounded box around the target, never the full 1920x1080 screen.
+        let (cx, cy, cw, ch) =
+            compute_target_crop_bounds((0, 0), (1920, 1080), node.rect, TARGET_CROP_MARGIN_PX)
+                .expect("valid crop bounds");
+        assert!(cw <= 400 && ch <= 400);
+        assert!(cw < 1920 && ch < 1080);
+        assert!(cx <= 200 && cy <= 300);
+        assert!(cx + cw >= 280 && cy + ch >= 330);
+
+        // Verify RGBA sub-region extraction + PNG encoding produces a valid small PNG.
+        let full_w = 100u32;
+        let full_h = 100u32;
+        let raw = vec![128u8; (full_w * full_h * 4) as usize];
+        let cropped =
+            crop_rgba_region(&raw, full_w, full_h, (10, 20, 24, 16)).expect("valid rgba crop");
+        assert_eq!(cropped.len(), (24 * 16 * 4) as usize);
+        let png = encode_rgba_png(24, 16, &cropped);
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn external_input_pauses_chain_with_step_number_and_resumes_from_last_verified_effect() {
+        reset_concurrency_state();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Build a 3-step chain:
+        // - Step 0 (head): verified effect (`verified_effect: true`)
+        // - Step 1 (`then[0]`): unverified effect (`verified_effect: false`)
+        // - Step 2 (`then[1]`): external mouse/keyboard input detected before step 2 runs!
+        //
+        // When external input occurs before Step 2:
+        // 1. Chain must pause immediately and report `stopped_at: 2`, `last_verified_step: 0`.
+        // 2. When resumed via `resume_chain`, it must take a fresh observation (`fresh_observation_id`)
+        //    and resume from step 1 (`last_verified_step + 1`), NOT blindly from step 2 (`stopped_at`)!
+        notify_external_input(2, "user moved mouse during quiz chain");
+
+        let stale_obs = observations::record(observations::Observation {
+            id: observations::next_id(),
+            window_id: 77,
+            hash: None,
+            shots: Vec::new(),
+            nodes: Vec::new(),
+            node_windows: Vec::new(),
+        });
+        let paused_response = rt.block_on(call_tool(
+            "verify_submission",
+            &json!({
+                "nodes": [],
+                "planned_answers": {},
+                "total_questions": 0,
+                "verified_effect": true,
+                "settle_ms": 0,
+                "observe": false,
+                "then": [
+                    {
+                        "do": "verify_submission",
+                        "nodes": [],
+                        "planned_answers": {},
+                        "total_questions": 0,
+                        "verified_effect": false
+                    },
+                    {
+                        "do": "verify_submission",
+                        "nodes": [],
+                        "planned_answers": {},
+                        "total_questions": 0,
+                        "verified_effect": true
+                    }
+                ]
+            }),
+        ));
+
+        assert_eq!(paused_response["isError"], json!(true));
+        let paused_summary: Value =
+            serde_json::from_str(paused_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(paused_summary["ok"], json!(false));
+        assert_eq!(paused_summary["paused"], json!(true));
+        assert_eq!(
+            paused_summary["pause_reason"],
+            json!("external_input_detected")
+        );
+        assert_eq!(paused_summary["stopped_at"], json!(2));
+        assert_eq!(paused_summary["last_verified_step"], json!(0));
+        assert_eq!(paused_summary["resume_from_step"], json!(1));
+        assert_eq!(paused_summary["ran"], json!(2));
+        assert_eq!(paused_summary["planned"], json!(3));
+
+        let resume_token = paused_summary["resume_token"]
+            .as_str()
+            .expect("resume_token must be returned")
+            .to_string();
+
+        // Resume the paused chain with fresh nodes for the new observation.
+        let mut fresh_node = sample_ui_node(0, "RadioButton", "Option A");
+        fresh_node.signature = "/0:RadioButton#opt-a".into();
+        let resumed_response = rt.block_on(call_tool(
+            "resume_chain",
+            &json!({
+                "resume_token": resume_token,
+                "fresh_nodes": [fresh_node]
+            }),
+        ));
+
+        assert_eq!(resumed_response["isError"], json!(false));
+        let resumed_summary: Value =
+            serde_json::from_str(resumed_response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(resumed_summary["ok"], json!(true));
+        assert_eq!(resumed_summary["resumed"], json!(true));
+        assert_eq!(
+            resumed_summary["resumed_from_step"],
+            json!(1),
+            "must resume from last_verified_step + 1 (step 1), never blindly from stopped_at (step 2)"
+        );
+        assert_eq!(resumed_summary["previous_stopped_at"], json!(2));
+        let fresh_obs_id = resumed_summary["fresh_observation_id"]
+            .as_str()
+            .expect("fresh_observation_id must be minted on resume");
+        assert_ne!(
+            fresh_obs_id, stale_obs,
+            "resume must create a brand-new observation instead of reusing the stale one"
+        );
+        // Steps 1 and 2 must both have run during the resume.
+        let chain = resumed_summary["chain"].as_array().unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0]["step"], json!(1));
+        assert_eq!(chain[1]["step"], json!(2));
+        reset_concurrency_state();
+    }
+
+    #[test]
+    fn pre_action_foreground_check_refocuses_and_reresolves_when_window_lost_focus() {
+        let mut stale_node = sample_ui_node(5, "RadioButton", "A. Ownership");
+        stale_node.signature = "/0:Group/1:RadioButton#opt-a".into();
+        stale_node.rect = (100, 100, 80, 24);
+
+        // Case 1: Window is already in the foreground -> no refocus or re-parse needed.
+        let mut focus_calls = 0usize;
+        let mut snap_calls = 0usize;
+        let already_fg = ensure_foreground_and_reresolve_with(
+            42,
+            &stale_node,
+            |_| true,
+            |_| {
+                focus_calls += 1;
+                Ok(())
+            },
+            |_| {
+                snap_calls += 1;
+                Ok(cua_engine_access::UiSnapshot {
+                    nodes: Vec::new(),
+                    truncated: false,
+                    unreadable: Vec::new(),
+                })
+            },
+        )
+        .expect("foreground window succeeds");
+        assert!(already_fg.was_foreground);
+        assert!(!already_fg.refocused);
+        assert!(!already_fg.reresolved);
+        assert_eq!(focus_calls, 0);
+        assert_eq!(snap_calls, 0);
+
+        // Case 2: Window lost foreground status -> must refocus AND re-resolve target node
+        // from a fresh snapshot (picking up its new moved rectangle).
+        let mut moved_node = stale_node.clone();
+        moved_node.index = 99;
+        moved_node.rect = (340, 520, 80, 24);
+
+        let recovered = ensure_foreground_and_reresolve_with(
+            42,
+            &stale_node,
+            |_| false,
+            |win_id| {
+                assert_eq!(win_id, 42);
+                focus_calls += 1;
+                Ok(())
+            },
+            |win_id| {
+                assert_eq!(win_id, 42);
+                snap_calls += 1;
+                Ok(cua_engine_access::UiSnapshot {
+                    nodes: vec![sample_ui_node(0, "Window", "Quiz"), moved_node.clone()],
+                    truncated: false,
+                    unreadable: Vec::new(),
+                })
+            },
+        )
+        .expect("refocused and reresolved");
+        assert!(!recovered.was_foreground);
+        assert!(recovered.refocused);
+        assert!(recovered.reresolved);
+        assert_eq!(focus_calls, 1);
+        assert_eq!(snap_calls, 1);
+        assert_eq!(
+            recovered.node.rect,
+            (340, 520, 80, 24),
+            "re-resolved node must carry updated rectangle from fresh snapshot"
+        );
+        assert_eq!(recovered.node.index, 5);
     }
 }
