@@ -15,8 +15,10 @@ Run inside a session bus with DISPLAY set:
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,7 +37,7 @@ failures: list[str] = []
 TAG = "aligned"
 
 
-def call(tool: str, arguments: dict) -> dict:
+def call(tool: str, arguments: dict, timeout: int = 60) -> dict:
     """One MCP tools/call, returned as the parsed JSON the server sent back."""
     global rpc_id
     rpc_id += 1
@@ -52,7 +54,7 @@ def call(tool: str, arguments: dict) -> dict:
         method="POST",
     )
     started = time.time()
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         reply = json.loads(response.read())
     elapsed_ms = int((time.time() - started) * 1000)
     parts = reply.get("result", {}).get("content", [])
@@ -110,6 +112,21 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         text=True,
     )
+
+    # The pipe must be drained continuously: it is never read again before
+    # `server.wait()`, so once 64 KB of log accumulates the server blocks on
+    # writing to it and every later request stalls. Measured 2026-10-25 on run
+    # 40117301727, where the freeze phase timed out at 180s and looked exactly
+    # like an AT-SPI read that never returns. Draining into a file also keeps
+    # the server side of the evidence.
+    server_log = open(EVIDENCE / "server.log", "w", encoding="utf-8")
+
+    def drain(pipe):
+        for line in iter(pipe.readline, ""):
+            server_log.write(line)
+            server_log.flush()
+
+    threading.Thread(target=drain, args=(server.stdout,), daemon=True).start()
     try:
         if not wait_for_server(30):
             print("the MCP server never answered /health")
@@ -121,6 +138,7 @@ def main() -> int:
         # the script, Electron reports `electron`), and matching those names is
         # how the window used to be found.
         scenario("mismatch")
+        hung_application()
     finally:
         server.terminate()
         try:
@@ -130,6 +148,159 @@ def main() -> int:
 
     print(f"\n{len(failures)} failed check(s); evidence in {EVIDENCE}")
     return 1 if failures else 0
+
+
+def hung_application() -> None:
+    """One application that stops answering, next to one that keeps working.
+
+    This is the contract issue #11 asked for: a tree that could not be fully read
+    must still arrive, and it must say which part is missing -- instead of either
+    failing the whole observation or quietly returning a shorter tree that looks
+    complete. A frozen process is the cheapest way to make the bus stop answering:
+    SIGSTOP keeps the D-Bus socket open, so every call to that application hangs
+    until the timeout, exactly like a real wedged toolkit.
+    """
+    global TAG
+
+    TAG = "hung"
+    print("\n== phase: one application hangs")
+
+    results = {name: EVIDENCE / f"probe_result_{name}.txt" for name in ("hung", "good")}
+    for path in results.values():
+        if path.exists():
+            path.unlink()
+
+    procs = {}
+    logs = []
+    for name in ("hung", "good"):
+        log = open(EVIDENCE / f"probe_{name}.log", "w", encoding="utf-8")
+        logs.append(log)
+        procs[name] = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "tests" / "linux_atspi" / "probe_gtk.py"),
+                str(results[name]),
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PROBE_IDENTITY": "aligned"},
+        )
+
+    window = None
+    deadline = time.time() + 40
+    while time.time() < deadline and window is None:
+        listed = call("list_windows", {"query": PROBE_TITLE})
+        windows = (listed["json"] or {}).get("windows", [])
+        if windows:
+            window = windows[0]
+        else:
+            time.sleep(1.0)
+    check("[hung] the probe applications are on the bus", window is not None, f"window={window}")
+    if window is None:
+        for proc in procs.values():
+            proc.terminate()
+        return
+
+    # Both registrations have to be listed before the freeze, otherwise this phase
+    # would be testing an application that never joined the walk.
+    time.sleep(3.0)
+    os.kill(procs["hung"].pid, signal.SIGSTOP)
+
+    # Is the *server* still alive, or did the freeze take it down too? X11 window
+    # listing never touches the accessibility bus, so this separates "the bus read
+    # hangs" from "the whole process is stuck" -- the two need different fixes and
+    # the first run could not tell them apart.
+    x11_started = time.time()
+    alive = call("list_windows", {"query": PROBE_TITLE}, timeout=20)
+    x11_elapsed = time.time() - x11_started
+    check(
+        "[hung] the server still answers a non-AT-SPI call while the app is frozen",
+        not alive["is_error"] and x11_elapsed < 5,
+        f"list_windows took {x11_elapsed:.2f}s",
+    )
+
+    started = time.time()
+    # A generous HTTP timeout on purpose: before the fix the walk burns the ~25s
+    # D-Bus default per unanswered call, and that has to show up as a slow but
+    # *returned* observation, not as this script crashing.
+    #
+    # And if it does not come back at all, that belongs in the PASS/FAIL table --
+    # measured 2026-10-24 on run 40115985180, where the pre-fix read exceeded even
+    # 180s and killed the harness with a socket timeout instead of reporting.
+    try:
+        tree = call("accessibility_tree", {"max_nodes": 200, "depth": 6}, timeout=180)
+    except (urllib.error.URLError, OSError) as exc:
+        elapsed = time.time() - started
+        check(
+            "[hung] the tree comes back at all while an application is frozen",
+            False,
+            f"no reply after {elapsed:.1f}s: {exc}",
+        )
+        tree = {"is_error": True, "json": None, "text": "", "images": 0}
+    elapsed = time.time() - started
+    body = tree["text"]
+
+    check(
+        "[hung] the tree still comes back, holding the responsive application",
+        not tree["is_error"] and "probe-entry" in body,
+        f"elapsed={elapsed:.1f}s err={tree['is_error']} {body[:150]}",
+    )
+    check(
+        "[hung] the observation names the part it could not read",
+        "parts of this tree were not read" in body,
+        f"tail={body[-300:]}",
+    )
+    check(
+        "[hung] a frozen application costs a bounded timeout, not 25s per call",
+        elapsed < 10,
+        f"elapsed={elapsed:.1f}s",
+    )
+
+    # The tree is not the only thing that can be pinned by a frozen peer, so this
+    # checks the invariant holds for the action calls too: either an answer, or an
+    # explicit "nobody replied" -- never a wait that outlasts the caller's patience.
+    #
+    # Honest about what this is NOT: it is a guard, not the proof of the fix. With
+    # the tree already skipping the deaf application, an action only ever reaches
+    # the live one here, so these lines would pass without the action deadline as
+    # well. The thing that actually pins the three-way classification -- reply /
+    # "no such interface" / silence -- is the local unit test
+    # `a_silent_toolkit_is_not_reported_as_a_missing_pattern`, which can force all
+    # three cases and does not depend on which application the walk happens to
+    # reach first.
+    for tool, arguments in (
+        ("invoke_control", {"name": "probe-toggle"}),
+        ("set_control_text", {"name": "probe-entry", "text": "STILL-BOUNDED"}),
+        ("control_state", {"name": "probe-toggle"}),
+    ):
+        started_at = time.time()
+        try:
+            outcome = call(tool, arguments, timeout=90)
+        except (urllib.error.URLError, OSError) as exc:
+            outcome = {
+                "is_error": True,
+                "text": f"never returned: {exc}",
+                "json": None,
+                "images": 0,
+            }
+        took = time.time() - started_at
+        replied = (not outcome["is_error"]) or "did not get an answer" in outcome["text"]
+        check(
+            f"[hung] {tool} against a frozen peer answers or says silence, never hangs",
+            replied and took < 30,
+            f"elapsed={took:.1f}s {outcome['text'][:140]}",
+        )
+
+    os.kill(procs["hung"].pid, signal.SIGCONT)
+    for proc in procs.values():
+        proc.terminate()
+    for proc in procs.values():
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    for log in logs:
+        log.close()
 
 
 def scenario(identity: str) -> None:
@@ -217,6 +388,15 @@ def scenario(identity: str) -> None:
             f"[{identity}] the tree is scoped to this window, not the whole desktop",
             "type into the entry below" in body,
             "the label only exists inside the probe frame",
+        )
+        # The false-positive control. Reporting a hole for every control that
+        # legitimately has no Component interface would bury the one application
+        # that is really stuck -- and CI caught exactly that on the first run
+        # (an UnknownMethod reply listed as unreadable).
+        check(
+            f"[{identity}] a responsive window reports nothing unreadable",
+            "not read" not in body,
+            f"tree head={body[:220]}",
         )
         # Two controls answer to `probe-ambiguous` and the walk meets the label
         # first, so a find that stops at the first exact hit hands back something

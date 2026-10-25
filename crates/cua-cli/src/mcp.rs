@@ -1359,10 +1359,12 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                         nodes = snap.nodes.clone();
                         node_windows = vec![window.id; snap.nodes.len()];
                         let mut truncated = snap.truncated;
+                        let mut unreadable = snap.unreadable.clone();
                         for (rel, rel_snap) in &related_snaps {
                             nodes.extend(rel_snap.nodes.iter().cloned());
                             node_windows.extend(std::iter::repeat_n(rel.id, rel_snap.nodes.len()));
                             truncated |= rel_snap.truncated;
+                            unreadable.extend(rel_snap.unreadable.iter().cloned());
                         }
                         accessibility = Some(json!({
                             "mode": view.mode.as_str(),
@@ -1372,6 +1374,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                             "truncated": truncated,
                             "notice": view.notice,
                         }));
+                        // Only present when something went unanswered: a tree
+                        // that is shorter than the window needs to say which
+                        // parts it is missing, not just be shorter.
+                        if let Some(note) = cua_engine_access::unreadable_note(&unreadable) {
+                            if let Some(map) = accessibility.as_mut().and_then(Value::as_object_mut)
+                            {
+                                map.insert("unreadable".to_string(), json!(note.trim_end()));
+                            }
+                        }
                         // Selection and document text save a second observation
                         // when the task is "what is selected / what does it say".
                         let text_ctx =
