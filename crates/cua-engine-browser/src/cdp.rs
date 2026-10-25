@@ -551,15 +551,19 @@ async fn launch_with(
 /// visible labels of the controls, because the model is asked for what it can see.
 const FIND_ELEMENT_JS: &str = r#"((root) => {
     const deepOne = (r) => {
-        const e = r.querySelector(raw);
-        if (e) return e;
+        try {
+            const e = r.querySelector(raw);
+            if (e) return e;
+        } catch (err) {}
         for (const f of r.querySelectorAll('iframe')) {
             try { const d = f.contentDocument; if (d) { const g = deepOne(d); if (g) return g; } } catch (err) {}
         }
         return null;
     };
     const collect = (r, out) => {
-        out.push(...r.querySelectorAll('a,button,input,[role=button],[role=link]'));
+        try {
+            out.push(...r.querySelectorAll('a,button,input,[role=button],[role=link],li,div,label'));
+        } catch (err) {}
         for (const f of r.querySelectorAll('iframe')) {
             try { const d = f.contentDocument; if (d) collect(d, out); } catch (err) {}
         }
@@ -571,6 +575,154 @@ const FIND_ELEMENT_JS: &str = r#"((root) => {
     }
     return deepOne(document);
 })(document)"#;
+
+/// Four-layer visibility verification with single-shot sticky/fixed header compensation.
+///
+/// Returns an object indicating success or failure code (HIDDEN_BY_CSS, ZERO_DIMENSION,
+/// OFFSCREEN_UNSCROLLABLE, OCCLUDED_BY_FIXED_ELEMENT, POINTER_EVENTS_DISABLED) and occluder info.
+const ENSURE_VISIBLE_AND_HIT_TEST_JS: &str = r#"((root, rawSel, allowRemediate) => {
+    const raw = rawSel;
+    const findEl = (r) => {
+        try {
+            const e = r.querySelector(raw);
+            if (e) return e;
+        } catch (err) {}
+        for (const f of r.querySelectorAll('iframe')) {
+            try { const d = f.contentDocument; if (d) { const g = findEl(d); if (g) return g; } } catch (err) {}
+        }
+        return null;
+    };
+    const collect = (r, out) => {
+        try {
+            out.push(...r.querySelectorAll('a,button,input,[role=button],[role=link],li,div,label'));
+        } catch (err) {}
+        for (const f of r.querySelectorAll('iframe')) {
+            try { const d = f.contentDocument; if (d) collect(d, out); } catch (err) {}
+        }
+        return out;
+    };
+    let el = null;
+    if (raw.startsWith('text=')) {
+        const needle = raw.slice(5).toLowerCase();
+        el = collect(document, []).find(e => ((e.innerText || e.value || e.getAttribute('aria-label') || '').toLowerCase().includes(needle))) || null;
+    } else {
+        el = findEl(document);
+    }
+    if (!el) return { ok: false, code: 'NOT_FOUND', remedy: 're_query_selector' };
+
+    // Layer 2: CSS Render Tree
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || parseFloat(style.opacity) <= 0.05) {
+        return { ok: false, code: 'HIDDEN_BY_CSS', remedy: 'expand_parent_or_check_visibility' };
+    }
+    if (style.pointerEvents === 'none') {
+        return { ok: false, code: 'POINTER_EVENTS_DISABLED', remedy: 'target_interactive_parent_or_label' };
+    }
+
+    // Click proxy detection (e.g. .numberCover, label, radio within custom containers)
+    const proxy = el.querySelector ? (el.querySelector('.numberCover, [onclick*="choose"], input, label') || el) : el;
+    const targetEl = proxy || el;
+
+    // Action-internalized scroll
+    if (el.ownerDocument !== document) {
+        try {
+            const host = el.ownerDocument.defaultView.frameElement;
+            if (host) {
+                host.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+            }
+        } catch (e) {}
+    }
+    try {
+        targetEl.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    } catch (e) {
+        targetEl.scrollIntoView(true);
+    }
+
+    // Layer 1: Geometry bounds
+    let rect = targetEl.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+        return { ok: false, code: 'ZERO_DIMENSION', remedy: 'wait_for_render_or_parent_expanded' };
+    }
+
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+
+    const visibleWidth = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+    const visibleHeight = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+    const visibleRatio = (visibleWidth * visibleHeight) / (rect.width * rect.height);
+
+    if (visibleRatio < 0.5) {
+        return {
+            ok: false,
+            code: 'OFFSCREEN_UNSCROLLABLE',
+            remedy: 'container_overflow_or_page_scrolled_to_edge',
+            visible_ratio: visibleRatio
+        };
+    }
+
+    // Layer 3: Hit-testing & single-shot sticky/fixed header compensation
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let hit = document.elementFromPoint(cx, cy);
+
+    const isHitTarget = (h) => {
+        if (!h) return false;
+        if (h === targetEl || targetEl.contains(h) || h === el || el.contains(h)) return true;
+        if ((targetEl.tagName === 'LABEL' && h === targetEl.control) || (el.tagName === 'LABEL' && h === el.control)) return true;
+        try {
+            if (h.tagName === 'IFRAME' && (h.contentDocument === el.ownerDocument || h.contentDocument === targetEl.ownerDocument)) return true;
+        } catch (e) {}
+        return false;
+    };
+
+    if (hit && !isHitTarget(hit)) {
+        const hitStyle = window.getComputedStyle(hit);
+        const isFixed = hitStyle.position === 'fixed' || hitStyle.position === 'sticky';
+        const hitRect = hit.getBoundingClientRect();
+
+        if (allowRemediate && (isFixed || hitRect.top <= 10)) {
+            const deltaY = Math.max(hitRect.bottom - rect.top + 24, 60);
+            window.scrollBy(0, -Math.abs(deltaY));
+
+            rect = targetEl.getBoundingClientRect();
+            const ncx = rect.left + rect.width / 2;
+            const ncy = rect.top + rect.height / 2;
+            hit = document.elementFromPoint(ncx, ncy);
+            if (hit && !isHitTarget(hit)) {
+                return {
+                    ok: false,
+                    code: 'OCCLUDED_BY_FIXED_ELEMENT',
+                    remedy: 'scroll_offset_adjustment_failed_dismiss_header_or_expand',
+                    occluded_by: {
+                        tag: hit.tagName,
+                        id: hit.id || null,
+                        class_name: hit.className || null,
+                        height: hitRect.height
+                    }
+                };
+            }
+        } else if (isFixed) {
+            return {
+                ok: false,
+                code: 'OCCLUDED_BY_FIXED_ELEMENT',
+                remedy: 'dismiss_modal_or_overlay',
+                occluded_by: {
+                    tag: hit.tagName,
+                    id: hit.id || null,
+                    class_name: hit.className || null,
+                    height: hitRect.height
+                }
+            };
+        }
+    }
+
+    return {
+        ok: true,
+        cx: rect.left + rect.width / 2,
+        cy: rect.top + rect.height / 2,
+        visible_ratio: visibleRatio
+    };
+})"#;
 
 /// Quality used only for the before/after comparison of a click. Cheap, and identical
 /// on both sides so the bytes mean something.
@@ -835,6 +987,29 @@ impl BrowserSession {
         Ok(())
     }
 
+    /// Ensure the element at `selector` is scrolled into view and visible through 4 layers
+    /// of verification: geometry bounds, CSS visibility, hit-testing against occluders
+    /// (with single-shot sticky/fixed header scrollBy offset remediation), and settling.
+    pub async fn ensure_visible(
+        &mut self,
+        selector: &str,
+        allow_remediation: bool,
+    ) -> Result<ScrollVisibilityResult> {
+        let script = format!(
+            r#"(() => {{
+                const rawSel = {sel};
+                const allowRemediate = {allow};
+                return ({ENSURE_VISIBLE_AND_HIT_TEST_JS})(document, rawSel, allowRemediate);
+            }})()"#,
+            sel = serde_json::to_string(selector)?,
+            allow = allow_remediation,
+            ENSURE_VISIBLE_AND_HIT_TEST_JS = ENSURE_VISIBLE_AND_HIT_TEST_JS,
+        );
+        let value = self.eval(&script).await?;
+        serde_json::from_value::<ScrollVisibilityResult>(value)
+            .map_err(|e| anyhow!("unreadable scroll visibility result: {e}"))
+    }
+
     /// What the element at `selector` says about itself, or `found: false`.
     pub async fn read_state(&mut self, selector: &str) -> Result<ElementState> {
         let script = format!(
@@ -844,22 +1019,53 @@ impl BrowserSession {
                 if (!el) return {{ found: false }};
                 const tag = (el.tagName || '').toLowerCase();
                 const isCheck = tag === 'input' && (el.type === 'checkbox' || el.type === 'radio');
-                const kind = el.isContentEditable ? 'contenteditable'
+                const isIframeEditor = tag === 'iframe' && el.contentDocument && el.contentDocument.body &&
+                    (el.contentDocument.body.isContentEditable || el.contentDocument.designMode === 'on' || el.contentDocument.body.getAttribute('contenteditable') === 'true');
+                const isRich = el.isContentEditable || el.getAttribute('contenteditable') === 'true' || isIframeEditor || (tag === 'body' && el.ownerDocument !== document) || tag === 'iframe';
+                const kind = isRich ? 'contenteditable'
                     : isCheck ? 'checkbox'
                     : tag === 'textarea' ? 'textarea'
-                    : ('value' in el) ? 'input'
+                    : (('value' in el) && (tag === 'input' || tag === 'textarea' || 'form' in el)) ? 'input'
                     : 'other';
                 const num = (v) => (v === null || v === undefined) ? null : v;
                 const aria = el.getAttribute ? el.getAttribute('aria-expanded') : null;
+
+                // Layer 5: Custom component highlight classes (answer-title, active, selected, checked, etc.)
+                const activeClasses = ['answer-title', 'active', 'selected', 'checked', 'is-active', 'is-checked', 'layui-form-radioed'];
+                let customSelected = false;
+                if (el.classList) {{
+                    for (const c of activeClasses) {{
+                        if (el.classList.contains(c)) {{ customSelected = true; break; }}
+                    }}
+                }}
+                if (!customSelected && el.closest) {{
+                    const parent = el.closest('li, label, div');
+                    if (parent && parent.classList) {{
+                        for (const c of activeClasses) {{
+                            if (parent.classList.contains(c)) {{ customSelected = true; break; }}
+                        }}
+                    }}
+                }}
+                const ariaChecked = el.getAttribute ? (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true') : false;
+
+                const finalChecked = ('checked' in el && el.checked !== null && el.checked !== undefined) 
+                    ? el.checked 
+                    : (ariaChecked || customSelected ? true : null);
+
+                const finalSelected = ('selected' in el && el.selected !== null && el.selected !== undefined)
+                    ? el.selected
+                    : (customSelected ? true : null);
+
+                const textSource = (tag === 'iframe' && el.contentDocument && el.contentDocument.body) ? el.contentDocument.body : el;
                 return {{
                     found: true,
                     kind,
-                    checked: num('checked' in el ? el.checked : null),
-                    selected: num('selected' in el ? el.selected : null),
+                    checked: num(finalChecked),
+                    selected: num(finalSelected),
                     expanded: num(aria === null ? null : aria === 'true'),
                     disabled: num('disabled' in el ? el.disabled : null),
                     value: num('value' in el ? String(el.value) : null),
-                    text: num(el.textContent === null ? null : String(el.textContent).trim()),
+                    text: num(textSource.innerText ? String(textSource.innerText).trim() : (textSource.textContent ? String(textSource.textContent).trim() : null)),
                 }};
             }})()"#,
             sel = serde_json::to_string(selector)?,
@@ -872,16 +1078,37 @@ impl BrowserSession {
 
     /// Click the target and report **what it did**, never a bare `ok`.
     ///
-    /// The reading comes from the element's own semantic state (checked / selected /
-    /// expanded / disabled / value). An element that publishes nothing -- the styled
-    /// `<div>` that acts as a button -- falls back to a screenshot comparison, and if
-    /// even that says nothing the answer is `unverifiable`. A click that "succeeded"
-    /// while the page stayed still is the exact failure this engine was trusted for.
+    /// Automatically ensures target element is scrolled into view, resolves any
+    /// sticky header occlusion via single-shot compensation, and supports click proxying.
     pub async fn click(&mut self, selector: &str) -> Result<String> {
         let before = self.read_state(selector).await?;
         if !before.found {
             return Ok("NOT_FOUND".into());
         }
+
+        // Layer 1-4: Action-internalized scroll & visibility gate
+        let vis = self.ensure_visible(selector, true).await?;
+        if !vis.ok {
+            if vis.code == "NOT_FOUND" {
+                return Ok("NOT_FOUND".into());
+            }
+            if vis.code == "OCCLUDED_BY_FIXED_ELEMENT" {
+                let occluder = vis
+                    .occluded_by
+                    .map(|o| format!("by <{}> id={:?} class={:?}", o.tag, o.id, o.class_name))
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "FAILED: could not scroll element into view (OCCLUDED_BY_FIXED_ELEMENT {occluder}): {}",
+                    vis.remedy
+                ));
+            }
+            return Err(anyhow!(
+                "FAILED: could not scroll element into view ({}): {}",
+                vis.code,
+                vis.remedy
+            ));
+        }
+
         // The pixels are only worth taking when the element cannot answer for itself.
         let shot_before = if before.comparable() {
             Vec::new()
@@ -896,8 +1123,9 @@ impl BrowserSession {
                 const raw = {sel};
                 const el = ({FIND});
                 if (!el) return 'NOT_FOUND';
-                el.scrollIntoView({{ block: 'center' }});
-                el.click();
+                // Click proxy detection (e.g. .numberCover, label)
+                const proxy = el.querySelector ? (el.querySelector('.numberCover, [onclick*="choose"], input, label') || el) : el;
+                proxy.click();
                 return 'OK';
             }})()"#,
             sel = serde_json::to_string(selector)?,
@@ -953,32 +1181,86 @@ impl BrowserSession {
         })
     }
 
-    /// Place the caret at the **end** of a contenteditable, with no selection range.
+    /// Place the caret at the **end** of a contenteditable or iframe body, with no selection range.
     ///
-    /// `Input.insertText` writes over whatever is selected, so focusing alone is not
-    /// enough: without collapsing to the end, an editor holding existing text would
-    /// have that text replaced by ours -- the destruction this path exists to avoid.
-    pub async fn focus_end_of(&mut self, selector: &str) -> Result<bool> {
+    /// Supports both `"replace"` (resetting content) and `"append"` (preserving existing content,
+    /// collapsing to the document end) modes. Cross-iframe aware: automatically scrolls and focuses
+    /// the host iframe before targeting the inner editable body using the inner document's own APIs.
+    pub async fn focus_end_of_frame(&mut self, selector: &str, mode: &str) -> Result<bool> {
         let script = format!(
             r#"(() => {{
                 const raw = {sel};
-                const el = {FIND};
-                if (!el) return false;
-                el.scrollIntoView({{ block: 'center' }});
-                el.focus();
-                const range = document.createRange();
-                range.selectNodeContents(el);
+                const mode = {mode};
+                const findEl = (r) => {{
+                    try {{
+                        const e = r.querySelector(raw);
+                        if (e) return e;
+                    }} catch (err) {{}}
+                    for (const f of r.querySelectorAll('iframe')) {{
+                        try {{ const d = f.contentDocument; if (d) {{ const g = findEl(d); if (g) return g; }} }} catch (err) {{}}
+                    }}
+                    return null;
+                }};
+                let target = findEl(document);
+                if (!target) return false;
+
+                let doc = document;
+                let win = window;
+                let editBody = target;
+
+                if (target.tagName === 'IFRAME') {{
+                    try {{
+                        doc = target.contentDocument;
+                        win = target.contentWindow;
+                        editBody = doc.body;
+                    }} catch (e) {{
+                        return false;
+                    }}
+                    target.scrollIntoView({{ block: 'center' }});
+                    target.focus();
+                }} else {{
+                    doc = target.ownerDocument || document;
+                    win = doc.defaultView || window;
+                    editBody = target;
+                    try {{
+                        const host = win.frameElement;
+                        if (host) {{
+                            host.scrollIntoView({{ block: 'center' }});
+                            host.focus();
+                        }}
+                    }} catch (e) {{}}
+                    target.scrollIntoView({{ block: 'center' }});
+                }}
+
+                if (!doc || !editBody) return false;
+                win.focus();
+                editBody.focus();
+
+                if (mode === "replace") {{
+                    editBody.innerHTML = '<p><br></p>';
+                }}
+
+                const range = doc.createRange();
+                range.selectNodeContents(editBody);
                 range.collapse(false);
-                const sel = window.getSelection();
+                const sel = win.getSelection();
                 sel.removeAllRanges();
                 sel.addRange(range);
-                return document.activeElement === el;
+
+                const inDocActive = doc.activeElement === editBody || editBody.contains(doc.activeElement);
+                const hasRange = sel.rangeCount > 0;
+                return inDocActive || hasRange;
             }})()"#,
             sel = serde_json::to_string(selector)?,
-            FIND = FIND_ELEMENT_JS,
+            mode = serde_json::to_string(mode)?,
         );
         let focused = self.eval(&script).await?;
         Ok(focused.as_bool().unwrap_or(false))
+    }
+
+    /// Place the caret at the **end** of a contenteditable, appending to any existing text.
+    pub async fn focus_end_of(&mut self, selector: &str) -> Result<bool> {
+        self.focus_end_of_frame(selector, "append").await
     }
 
     /// `Input.insertText` -- the browser's own "type this here", dispatched as a real
@@ -992,22 +1274,45 @@ impl BrowserSession {
 
     /// Write text into a field and **read it back before believing it**.
     ///
-    /// A plain input is verified by equality: if the field does not hold what was
-    /// asked for, the step is reported as a failure -- an `ok` here would be the same
-    /// lie the desktop `invoke` used to tell. A contenteditable cannot be judged by
-    /// equality (it holds markup and the editor rewrites it), so it goes through
-    /// `insertText` at the caret and is judged by the three standards in
-    /// [`judge_inserted_text`].
+    /// Automatically ensures target input/editor is scrolled into view and visible.
+    /// Plain inputs dispatch input and change events for framework reactivity.
+    /// Contenteditable / rich iframe editors focus the end and insert text safely (append mode).
+    /// Non-contenteditable elements without a value property are rejected outright rather than
+    /// silently overwriting textContent.
     pub async fn type_text(&mut self, selector: &str, text: &str) -> Result<String> {
         let before = self.read_state(selector).await?;
         if !before.found {
             return Ok("NOT_FOUND".into());
         }
+
+        // Action-internalized scroll & visibility verification
+        let vis = self.ensure_visible(selector, true).await?;
+        if !vis.ok {
+            if vis.code == "NOT_FOUND" {
+                return Ok("NOT_FOUND".into());
+            }
+            if vis.code == "OCCLUDED_BY_FIXED_ELEMENT" {
+                let occluder = vis
+                    .occluded_by
+                    .map(|o| format!("by <{}> id={:?} class={:?}", o.tag, o.id, o.class_name))
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "FAILED: could not scroll element into view (OCCLUDED_BY_FIXED_ELEMENT {occluder}): {}",
+                    vis.remedy
+                ));
+            }
+            return Err(anyhow!(
+                "FAILED: could not scroll element into view ({}): {}",
+                vis.code,
+                vis.remedy
+            ));
+        }
+
         let rich = before.kind == "contenteditable";
         let expected_chars = text.chars().count();
 
         if rich {
-            if !self.focus_end_of(selector).await? {
+            if !self.focus_end_of_frame(selector, "append").await? {
                 return Err(anyhow!(
                     "FAILED: could not put the caret in the contenteditable {selector}; nothing was inserted"
                 ));
@@ -1018,21 +1323,31 @@ impl BrowserSession {
                 r#"(() => {{
                     const raw = {sel};
                     const el = {FIND};
-                    if (!el) return false;
+                    if (!el) return {{ found: false }};
+                    const tag = (el.tagName || '').toLowerCase();
+                    const isInput = tag === 'input' || tag === 'textarea' || ('value' in el && 'form' in el);
+                    if (!isInput) {{
+                        return {{ found: true, writable: false }};
+                    }}
                     el.focus();
                     const value = {text};
-                    if ('value' in el) {{ el.value = value; }} else {{ el.textContent = value; }}
+                    el.value = value;
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return true;
+                    return {{ found: true, writable: true }};
                 }})()"#,
                 sel = serde_json::to_string(selector)?,
                 FIND = FIND_ELEMENT_JS,
                 text = serde_json::to_string(text)?,
             );
             let written = self.eval(&script).await?;
-            if !written.as_bool().unwrap_or(false) {
+            if written["found"].as_bool() != Some(true) {
                 return Ok("NOT_FOUND".into());
+            }
+            if written["writable"].as_bool() != Some(true) {
+                return Err(anyhow!(
+                    "FAILED: target element {selector} is neither an input/textarea nor contenteditable -- refusing to silently overwrite textContent; no text was entered"
+                ));
             }
         }
 
@@ -1079,8 +1394,8 @@ impl BrowserSession {
                 "FAILED: {selector} reads {:?}, not {text:?} -- the text did not land, and this is not reported as a success",
                 after.value.as_deref().map(|v| truncate(v, 60))
             )),
-            cua_core::Effect::Unverifiable => Ok(format!(
-                "typed {expected_chars} chars into {selector} [unverifiable: the element reads no value back -- not proof that it landed]"
+            cua_core::Effect::Unverifiable => Err(anyhow!(
+                "FAILED: target element {selector} does not expose a verifiable value property; refusing to report success"
             )),
         }
     }
@@ -1118,6 +1433,93 @@ impl BrowserSession {
             .decode(data)
             .context("decode screenshot")
     }
+
+    /// Connect directly to an active browser instance using its browser WebSocket URL,
+    /// selecting the page matching `target_query` via Target.getTargets and Target.attachToTarget.
+    pub async fn connect_to_endpoint(ws_url: &str, target_query: Option<&str>) -> Result<Self> {
+        let (ws, _) = connect_async(ws_url)
+            .await
+            .with_context(|| format!("failed to connect to {ws_url}"))?;
+        let mut session = Self {
+            child: Command::new("cmd").args(["/c", "exit"]).spawn()?,
+            profile_dir: PathBuf::new(),
+            ws,
+            next_id: 1,
+            port: 0,
+            target_id: String::new(),
+        };
+
+        let targets = session.send("Target.getTargets", json!({})).await?;
+        let target_infos = targets["targetInfos"]
+            .as_array()
+            .ok_or_else(|| anyhow!("no targetInfos in Target.getTargets"))?;
+
+        let target = if let Some(query) = target_query {
+            target_infos.iter().find(|t| {
+                let url = t["url"].as_str().unwrap_or_default();
+                let title = t["title"].as_str().unwrap_or_default();
+                url.contains(query) || title.contains(query)
+            })
+        } else {
+            target_infos.iter().find(|t| t["type"] == "page")
+        }
+        .ok_or_else(|| anyhow!("no matching page target found for query: {target_query:?}"))?;
+
+        let target_id = target["targetId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("target has no targetId"))?
+            .to_string();
+        session.target_id = target_id.clone();
+        let _ = session
+            .send(
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+            )
+            .await?;
+        Ok(session)
+    }
+
+    /// Read DevToolsActivePort file (line 1 = port, line 2 = path), form the WebSocket URL,
+    /// and connect directly via Target.getTargets.
+    pub async fn connect_from_devtools_active_port(
+        port_file_path: &Path,
+        target_query: Option<&str>,
+    ) -> Result<Self> {
+        let content = std::fs::read_to_string(port_file_path)
+            .with_context(|| format!("read port file: {}", port_file_path.display()))?;
+        let mut lines = content.lines();
+        let port_str = lines
+            .next()
+            .ok_or_else(|| anyhow!("DevToolsActivePort missing line 1 (port)"))?
+            .trim();
+        let path_str = lines
+            .next()
+            .ok_or_else(|| anyhow!("DevToolsActivePort missing line 2 (path)"))?
+            .trim();
+        let ws_url = format!("ws://127.0.0.1:{port_str}{path_str}");
+        Self::connect_to_endpoint(&ws_url, target_query).await
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OccluderInfo {
+    pub tag: String,
+    pub id: Option<String>,
+    pub class_name: Option<String>,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScrollVisibilityResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub remedy: String,
+    pub occluded_by: Option<OccluderInfo>,
+    pub visible_ratio: Option<f64>,
+    pub cx: Option<f64>,
+    pub cy: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1811,5 +2213,356 @@ mod tests {
         let mute = session.click("#plainbtn").await.unwrap();
         assert_ne!(mute, "OK", "the answer this work exists to retire");
         assert!(mute.contains("[effect="), "{mute}");
+    }
+
+    #[test]
+    fn test_scroll_visibility_structures_and_codes() {
+        let res = ScrollVisibilityResult {
+            ok: false,
+            code: "OCCLUDED_BY_FIXED_ELEMENT".into(),
+            remedy: "scroll_offset_adjustment_failed_dismiss_header_or_expand".into(),
+            occluded_by: Some(OccluderInfo {
+                tag: "HEADER".into(),
+                id: Some("sticky-nav".into()),
+                class_name: Some("site-header fixed-top".into()),
+                height: 80.0,
+            }),
+            visible_ratio: Some(0.1),
+            cx: Some(300.0),
+            cy: Some(40.0),
+        };
+        let serialized = serde_json::to_string(&res).unwrap();
+        assert!(serialized.contains("OCCLUDED_BY_FIXED_ELEMENT"));
+        let deserialized: ScrollVisibilityResult = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(res, deserialized);
+    }
+
+    /// Stage B 滚动内化 7 大验收用例端到端测试套件 (Spec 第 8 节).
+    ///
+    /// Run with: `cargo test -p cua-engine-browser -- --ignored stage_b_scroll_internalization_acceptance_suite`.
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn stage_b_scroll_internalization_acceptance_suite() {
+        let _slot = temp_slot().await;
+        let binary = find_browser().expect("set CUA_HUB_BROWSER to a Chrome/Edge executable");
+        let html = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Stage B Acceptance Suite Fixture</title>
+<style>
+  body { margin: 0; padding: 0; font-family: sans-serif; }
+  /* 用例 5: Sticky 吸顶条 (80px 高) */
+  header.fixed-top {
+    position: fixed; top: 0; left: 0; width: 100%; height: 80px;
+    background: rgba(220, 50, 50, 0.95); color: white;
+    z-index: 1000; display: flex; align-items: center; padding-left: 20px;
+  }
+  .spacer-top { height: 90px; }
+
+  /* 用例 3: CSS Scroll-Snap 容器 */
+  .snap-container {
+    height: 300px; overflow-y: scroll; scroll-snap-type: y mandatory;
+    border: 2px solid #333; margin: 20px;
+  }
+  .snap-section {
+    height: 300px; scroll-snap-align: start; padding: 20px; box-sizing: border-box;
+  }
+
+  /* 用例 4: 嵌套独立滚动容器 */
+  .nested-outer {
+    border: 1px solid #666; padding: 10px; margin: 20px; width: 400px;
+  }
+  .nested-inner {
+    height: 120px; overflow-y: scroll; border: 1px dashed #999; padding: 10px;
+  }
+
+  /* 用例 6: 自定义非原生单选组件 */
+  ul.question-options { list-style: none; padding: 0; }
+  li.option-title {
+    display: flex; align-items: center; padding: 8px; margin: 4px 0;
+    border: 1px solid #ccc; cursor: pointer;
+  }
+  li.option-title .numberCover {
+    width: 24px; height: 24px; line-height: 24px; text-align: center;
+    background: #eee; border-radius: 50%; margin-right: 10px;
+  }
+  li.option-title.answer-title {
+    background: #e6f7ff; border-color: #1890ff; color: #1890ff; font-weight: bold;
+  }
+  li.option-title.answer-title .numberCover {
+    background: #1890ff; color: white;
+  }
+
+  /* 用例 2: 超长页面深层控件 (高度 15,000px) */
+  .deep-spacer { height: 14500px; background: linear-gradient(white, #f0f0f0); }
+</style>
+</head>
+<body>
+  <header class="fixed-top" id="sticky-header">
+    <h3>考场吸顶悬浮导航栏 (80px)</h3>
+  </header>
+  <div class="spacer-top"></div>
+
+  <!-- 用例 1 & 5: 受到吸顶栏可能遮挡的表单输入框 -->
+  <div id="sticky-test-box" style="margin: 20px; padding: 10px; border: 1px solid #aaa;">
+    <h4>吸顶遮挡避障测试区</h4>
+    <label for="input-problem-7">填空题目 7：</label>
+    <input id="input-problem-7" type="text" placeholder="请输入答案">
+  </div>
+
+  <!-- 用例 6: 自定义控件与点击代理 (numberCover + answer-title) -->
+  <div id="q8-custom-box" style="margin: 20px; padding: 10px; border: 1px solid #aaa;">
+    <h4>单选第 8 题：最富有美国特色的电影类型</h4>
+    <ul class="question-options">
+      <li class="option-title" id="opt-A" onclick="selectOpt(this)">
+        <div class="numberCover" onclick="event.stopPropagation(); selectOpt(this.parentElement);">A</div>
+        <div>开发片</div>
+      </li>
+      <li class="option-title" id="opt-D" onclick="selectOpt(this)">
+        <div class="numberCover" onclick="event.stopPropagation(); selectOpt(this.parentElement);">D</div>
+        <div>西部片</div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- 用例 3: CSS Scroll-Snap 页面 -->
+  <div class="snap-container" id="snap-box">
+    <div class="snap-section" style="background: #fafafa;">
+      <h5>Section 1: 导读</h5>
+    </div>
+    <div class="snap-section" style="background: #f0f5ff;" id="snap-sec-2">
+      <h5>Section 2: 目标题目</h5>
+      <input type="checkbox" id="snap-checkbox"> <label for="snap-checkbox">Snap目标勾选</label>
+    </div>
+  </div>
+
+  <!-- 用例 4: 嵌套独立滚动容器 -->
+  <div class="nested-outer">
+    <h4>嵌套容器测试</h4>
+    <div class="nested-inner" id="nested-scroll-div">
+      <div style="height: 250px; background: #fdfdfd;">
+        <p>上层长文本说明...</p>
+      </div>
+      <input type="checkbox" id="agree-checkbox">
+      <label for="agree-checkbox">同意许可协议</label>
+    </div>
+  </div>
+
+  <!-- 用例 7: 富文本 iframe 协议化聚焦与追加 -->
+  <div style="margin: 20px;">
+    <h4>富文本论述题</h4>
+    <iframe id="ueditor_0" style="width: 100%; height: 160px; border: 1px solid #ccc;"></iframe>
+  </div>
+
+  <!-- 用例 2: 超长页面提交按钮 -->
+  <div class="deep-spacer"></div>
+  <div style="padding: 30px; text-align: center;">
+    <button id="deep-submit" onclick="this.setAttribute('data-submitted', 'true');" style="padding: 10px 20px;">最终交卷</button>
+  </div>
+
+  <script>
+    function selectOpt(li) {
+      document.querySelectorAll('#q8-custom-box li.option-title').forEach(el => el.classList.remove('answer-title'));
+      li.classList.add('answer-title');
+    }
+
+    // 初始化富文本 iframe 内容
+    const ifr = document.getElementById('ueditor_0');
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<!doctype html><html><body contenteditable="true"><p>已有草稿：</p></body></html>');
+    ifr.contentDocument.close();
+  </script>
+</body>
+</html>"#;
+
+        let file = std::env::temp_dir().join("stage-b-acceptance-fixture.html");
+        std::fs::write(&file, html).unwrap();
+        let url = format!("file:///{}", file.display().to_string().replace('\\', "/"));
+
+        let mut session = launch_with(
+            &binary,
+            LaunchOptions {
+                ..Default::default()
+            },
+            80,
+        )
+        .await
+        .expect("launch real browser for acceptance suite");
+
+        session.navigate(&url).await.unwrap();
+
+        // -------------------------------------------------------------
+        // 用例 5: Sticky 悬浮顶栏遮挡与智能避障 (Sticky Header Occlusion & Remediation)
+        // -------------------------------------------------------------
+        // 目标输入框在顶栏下方，调用 type_text 会自动通过 Layer 3 吸顶避障补偿并写入
+        let res_type = session
+            .type_text("#input-problem-7", "避障成功文本")
+            .await
+            .unwrap();
+        assert!(
+            res_type.contains("[verified"),
+            "用例 5 失败: 输入未验证成功: {res_type}"
+        );
+        let state_inp = session.read_state("#input-problem-7").await.unwrap();
+        assert_eq!(state_inp.value.as_deref(), Some("避障成功文本"));
+
+        // -------------------------------------------------------------
+        // 用例 6: 自定义控件与点击代理类名裁决 (Custom Class & Proxy E2E)
+        // -------------------------------------------------------------
+        // 点击西部片选项 (内部包含 .numberCover 代理，点击后父级获得 answer-title)
+        let res_custom = session.click("#opt-D").await.unwrap();
+        assert!(
+            res_custom.contains("[effect=changed]"),
+            "用例 6 失败: 自定义单选未返回 changed: {res_custom}"
+        );
+        let state_opt_d = session.read_state("#opt-D").await.unwrap();
+        assert_eq!(
+            state_opt_d.checked,
+            Some(true),
+            "用例 6 失败: answer-title 未映射为 checked=true"
+        );
+
+        // -------------------------------------------------------------
+        // 用例 3: CSS Scroll-Snap 页面沉降 (Scroll-Snap Containers)
+        // -------------------------------------------------------------
+        let res_snap = session.click("#snap-checkbox").await.unwrap();
+        assert!(
+            res_snap.contains("[effect=changed]"),
+            "用例 3 失败: Snap 目标点击未生效: {res_snap}"
+        );
+        let state_snap = session.read_state("#snap-checkbox").await.unwrap();
+        assert_eq!(state_snap.checked, Some(true));
+
+        // -------------------------------------------------------------
+        // 用例 4: 多层嵌套独立滚动容器 (Nested Scroll Containers)
+        // -------------------------------------------------------------
+        let res_nested = session.click("#agree-checkbox").await.unwrap();
+        assert!(
+            res_nested.contains("[effect=changed]"),
+            "用例 4 失败: 嵌套容器复选框点击未生效: {res_nested}"
+        );
+        let state_nested = session.read_state("#agree-checkbox").await.unwrap();
+        assert_eq!(state_nested.checked, Some(true));
+
+        // -------------------------------------------------------------
+        // 用例 7: 富文本 iframe 协议化聚焦与测不覆盖追加 (RichText focus_end_of_frame)
+        // -------------------------------------------------------------
+        let res_rich = session
+            .type_text("#ueditor_0", "影视艺术空间构成追加段落 KEYWORD-空间构成")
+            .await
+            .unwrap();
+        assert!(
+            res_rich.contains("[verified"),
+            "用例 7 失败: 富文本写入未验证: {res_rich}"
+        );
+        let state_rich = session.read_state("#ueditor_0").await.unwrap();
+        let held_rich = state_rich.text.unwrap_or_default();
+        assert!(
+            held_rich.contains("已有草稿："),
+            "用例 7 失败: 原有草稿被冲掉: {held_rich}"
+        );
+        assert!(
+            held_rich.contains("KEYWORD-空间构成"),
+            "用例 7 失败: 关键采分词未在场: {held_rich}"
+        );
+
+        // -------------------------------------------------------------
+        // 用例 2: 超长页面深层控件滚动 (Deep Page Scroll: 15,000px)
+        // -------------------------------------------------------------
+        let res_deep = session.click("#deep-submit").await.unwrap();
+        assert!(
+            res_deep.contains("[effect="),
+            "用例 2 失败: 深层按钮点击未响应: {res_deep}"
+        );
+
+        // -------------------------------------------------------------
+        // 用例 1: 作业重跑零手动滚动断言 (Zero Manual Scroll E2E Benchmark)
+        // -------------------------------------------------------------
+        // 整个流程中未调用任何 session.scroll(dx, dy)，所有 6 个深层、遮挡、嵌套、Snap、iframe
+        // 控件均通过动作内部自动 scrollIntoView 与四层验可见完成！
+    }
+
+    /// 验收用例：基于真实复现夹具 `ue.html` 的跨 iframe 富文本聚焦与分段追加写入
+    /// 包含：
+    /// 1. 跨 iframe 聚焦与光标折叠 (`focus_end_of_frame`)
+    /// 2. 分段追加写入不覆盖 (`type` 动作保持前序已有内容)
+    /// 3. 非输入/非富文本元素禁止静默降级为 textContent，直接抛错 FAILED
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn test_ue_fixture_iframe_focus_and_append() {
+        let _slot = temp_slot().await;
+        let binary = find_browser().expect("set CUA_HUB_BROWSER to a Chrome/Edge executable");
+
+        let ext_fixture =
+            std::path::Path::new(r"F:\temp\hw-pilot-friend-2026-10-26\fixture\ue.html");
+        let fixture_file = if ext_fixture.exists() {
+            ext_fixture.to_path_buf()
+        } else {
+            let tmp = std::env::temp_dir().join("ue-repro-fixture.html");
+            let fallback_html = r#"<!doctype html>
+<html><body>
+<div id="plain-div">plain container</div>
+<iframe id="ed" style="width:600px;height:200px"
+  srcdoc="<body contenteditable='true' class='view' style='min-height:150px;border:1px solid #999;padding:8px'><p>hello</p></body>"></iframe>
+</body></html>"#;
+            std::fs::write(&tmp, fallback_html).unwrap();
+            tmp
+        };
+
+        let url = format!(
+            "file:///{}",
+            fixture_file.display().to_string().replace('\\', "/")
+        );
+
+        let mut session = launch_with(
+            &binary,
+            LaunchOptions {
+                ..Default::default()
+            },
+            80,
+        )
+        .await
+        .expect("launch browser for ue fixture test");
+
+        session.navigate(&url).await.unwrap();
+
+        // 1. 验证对非输入元素的 type 绝不静默降级覆写 textContent，必须返回 FAILED 错误
+        let non_editable_err = session
+            .type_text("body", "非法尝试修改body")
+            .await
+            .expect_err("typing into non-editable body must fail");
+        assert!(
+            non_editable_err
+                .to_string()
+                .contains("neither an input/textarea nor contenteditable"),
+            "non-editable error must clearly refuse silent overwrite: {non_editable_err}"
+        );
+
+        // 2. 验证第一次 type 追加写入 (针对 iframe 节点 #ed)
+        let res1 = session.type_text("#ed", " - 第一次追加文本").await.unwrap();
+        assert!(res1.contains("[verified"), "第一段写入应当通过验证: {res1}");
+        let state1 = session.read_state("#ed").await.unwrap();
+        let text1 = state1.text.unwrap_or_default();
+        assert!(text1.contains("hello"), "原有内容 hello 必须保留: {text1}");
+        assert!(
+            text1.contains("第一次追加文本"),
+            "新内容必须追加成功: {text1}"
+        );
+
+        // 3. 验证第二次分段 type 追加写入 (测不覆盖)
+        let res2 = session.type_text("#ed", " - 第二次追加文本").await.unwrap();
+        assert!(res2.contains("[verified"), "第二段写入应当通过验证: {res2}");
+        let state2 = session.read_state("#ed").await.unwrap();
+        let text2 = state2.text.unwrap_or_default();
+        assert!(text2.contains("hello"), "初始 hello 仍必须保留: {text2}");
+        assert!(
+            text2.contains("第一次追加文本"),
+            "第一段内容仍必须保留: {text2}"
+        );
+        assert!(
+            text2.contains("第二次追加文本"),
+            "第二段内容必须追加成功: {text2}"
+        );
     }
 }

@@ -40,7 +40,8 @@ Raw input
 
 - `click {observation_id, screenshot_id?, x, y}` — screenshot pixels from that observation; name the `screenshot_id` when the pixels came from a popup image, because a popup's origin differs from the window's. Clicking inside a popup image does not re-focus the owner (that would dismiss the menu).
 - `click {x, y, right?, middle?, double?}` — absolute physical pixels, last resort.
-- `move {x, y}`, `drag {x, y, x2, y2}`, `scroll {x, y, dx?, dy?}`.
+- `move {x, y}`, `drag {x, y, x2, y2}`.
+- `scroll {x, y, dx?, dy?}` — **[RESTRICTED / exploration-only]** 仅限无界动态流或未寻址纯画布探索。点击与输入动作内部已完全内化 `scrollIntoView` 与可见性避障验证；在做题、填表、点击按钮时，严禁调用 scroll 作为前置动作，直接向目标发送 click 或 type_text 即可。
 - `type_text {text, interval_ms?}` — Unicode text into the focused window.
 - `key {combo}` — `Return`, `ctrl+l`, `alt+Tab`, `PageDown`, arrows, F1–F12…
 - `mouse_down/up {button?}`, `key_down/up {combo}` — hold/release pairs.
@@ -89,8 +90,9 @@ Tasks and browser
    choose again. A `stale_observation` error is not a reason to retry the same
    index; it means re-read.
 6. **Batch only predictable actions**: typing several lines into a focused editor
-   is fine; anything that opens a dialog, submits, navigates, scrolls to new
-   content or changes focus ends the batch and needs a fresh observation.
+   is fine; anything that opens a dialog, submits, navigates or changes focus ends
+   the batch and needs a fresh observation.
+   **Zero manual scroll rule**: 选择题选项、填空输入框、富文本编辑器、提交按钮等寻址时，引擎会自动滚动居中并消除吸顶遮挡；读题请使用全量 `document_text`，严禁通过滚轮逐屏翻页读题。
 7. **Menus and dialogs are in the tree**: a popup is its own window, but it also
    appears inside the owner's tree with real indexes, so `Expand` a menu bar item
    and then click a menu item by index. Its image arrives as a `related`

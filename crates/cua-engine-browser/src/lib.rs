@@ -14,4 +14,6 @@ mod cdp;
 pub use agent::{
     parse_browser_action, run_task, BrowserAction, BrowserOutcome, BrowserReport, BrowserRunOptions,
 };
-pub use cdp::{launch, BrowserSession, LaunchOptions, TabInfo};
+pub use cdp::{
+    launch, BrowserSession, LaunchOptions, OccluderInfo, ScrollVisibilityResult, TabInfo,
+};

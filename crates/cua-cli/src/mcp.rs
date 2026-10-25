@@ -4175,7 +4175,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "scroll",
-            "description": "Scroll the wheel at physical coordinates. Positive dy scrolls down, positive dx scrolls right.",
+            "description": "DEPRECATED FOR FORMS: Automatically handled inside click/type_text. Use only for exploratory viewing of unaddressable canvas/infinite streams. Positive dy scrolls down, positive dx scrolls right.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -654,7 +654,7 @@ Actions:\n\
 {\"action\":\"press\",\"key\":\"Enter|Tab|Escape\"}\n\
 {\"action\":\"eval\",\"script\":\"JS expression returning JSON-able data\"}\n\
 {\"action\":\"wait\",\"ms\":1000}\n\
-{\"action\":\"scroll\",\"dy\":600}                 positive dy scrolls down\n\
+{\"action\":\"scroll\",\"dy\":600}                 [RESTRICTED: exploration-only on unbounded canvas/feeds; never use as prefix to click/type]\n\
 {\"action\":\"wait_for\",\"selector\":\"...\",\"timeout_ms\":5000}\n\
 {\"action\":\"tab_list\"}\n\
 {\"action\":\"tab_new\",\"url\":\"https://...\"}\n\
@@ -663,6 +663,7 @@ Actions:\n\
 {\"action\":\"done\",\"summary\":\"one line result\"}\n\
 {\"action\":\"fail\",\"reason\":\"...\"}\n\
 Rules: prefer `text=` selectors when you cannot see exact CSS. Selectors also match inside same-origin iframes. \
+Never issue 'scroll' to locate questions or inputs; click and type automatically scroll targets into view and resolve occlusions. \
 Use the accessibility tree for roles/names; use eval for reading data. \
 Do not submit forms, purchase, or log in unless the task explicitly asks. \
 Never repeat a failing action more than twice. When the goal is reached, reply done."
