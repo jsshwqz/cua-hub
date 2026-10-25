@@ -725,7 +725,9 @@ name = "cua-engine-access"
 version = "0.1.5"
 dependencies = [
  "cua-core",
+ "regex",
  "serde",
+ "serde_json",
  "windows 0.62.2",
  "zbus",
 ]

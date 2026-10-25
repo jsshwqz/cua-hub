@@ -5,6 +5,7 @@
 //! printed for debugging. Invoking controls by name comes next.
 
 pub mod atspi;
+pub mod target;
 
 use cua_core::Result;
 use serde::{Deserialize, Serialize};
@@ -477,24 +478,39 @@ pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     }
 }
 
-/// Find the first control whose name matches `name` (exact match wins over
-/// substring), returning its rectangle so the caller can click its center.
-pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
-    #[cfg(windows)]
-    {
-        imp::find(name, max_nodes, max_depth)
+/// Why a target did not resolve, said so the caller knows what to do next.
+///
+/// A walk that stopped short cannot support "there is no such control": that is
+/// a claim about a tree nobody finished looking at. Both backends route their
+/// misses through here so the answer cannot drift apart by platform.
+pub(crate) fn miss_error(
+    miss: crate::target::Miss,
+    walked: usize,
+    truncated: bool,
+) -> cua_core::Error {
+    if truncated && matches!(miss, crate::target::Miss::NotFound { .. }) {
+        return cua_core::Error::Lookup(format!(
+            "did not reach the control: {} -- the walk stopped after {} node(s) with the tree still truncated (max_nodes was set); raise max_nodes before concluding the control is absent",
+            miss.to_reason(),
+            walked
+        ));
     }
-    #[cfg(not(windows))]
-    {
-        atspi::find(name, max_nodes, max_depth)
-    }
+    cua_core::Error::Lookup(format!(
+        "{}{}",
+        miss.to_reason(),
+        if miss.worth_one_retry() {
+            ""
+        } else {
+            "; this is not a stale-tree problem, so re-running will not resolve it"
+        }
+    ))
 }
 
-/// How far a name-based action searches when the caller does not choose.
+/// How far a target-addressed action searches when the caller does not choose.
 ///
 /// The AT-SPI tree of a real desktop is easily deeper than this; the point of
-/// exposing it is that running out is now reported as "did not reach", not as
-/// "no such pattern".
+/// exposing it is that running out is reported as "did not reach", not as
+/// "no such control". UIA has its own bounded walk and ignores these numbers.
 pub const DEFAULT_ACTION_NODES: usize = 600;
 pub const DEFAULT_ACTION_DEPTH: usize = 10;
 
@@ -507,66 +523,43 @@ pub const DEFAULT_ACTION_DEPTH: usize = 10;
 /// deadline, not an unbounded wait.
 pub const EFFECT_SETTLE_MS: u64 = 200;
 
-/// Invoke a control through its accessibility Invoke pattern.
+/// Invoke the one control a [`Target`] names, through its accessibility action.
 ///
-/// Returns `None` when the control has no invoke pattern (caller should fall back
+/// Returns `None` when the control has no action to fire (caller should fall back
 /// to a click). A search that ran out of tree before it ever met the control
-/// answers `Err` and says so: that is not a missing pattern, and treating it as
-/// one sends the caller to coordinates for a control nobody looked at.
+/// answers `Err` and says so: that is not a missing action, and treating it as
+/// one sends the caller to coordinates for a control nobody looked at. An
+/// ambiguous target is an error too -- never the first match.
 ///
-/// A `Some` report carries an [`Effect`] read back from the control. The pattern
+/// A `Some` report carries an [`Effect`] read back from the control. The action
 /// answering is not the same fact as the control having done something, and the
 /// two used to be reported as one.
-pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
-    #[cfg(windows)]
-    {
-        imp::invoke(name)
-    }
-    #[cfg(not(windows))]
-    {
-        atspi::invoke(name)
-    }
-}
-
-/// [`invoke`] with the traversal limits chosen by the caller.
-///
-/// Only AT-SPI honours them: UIA walks the element tree live and has no node
-/// budget to run out of, so the numbers are ignored there rather than faked.
-pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<ActionReport>> {
+pub fn invoke_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
         let _ = (max_nodes, max_depth);
-        imp::invoke(name)
+        imp::invoke_target(target)
     }
     #[cfg(not(windows))]
     {
-        atspi::invoke_with(name, max_nodes, max_depth)
+        atspi::invoke_target(target, max_nodes, max_depth)
     }
 }
 
-/// Set a control's text through its Value/EditableText pattern. Returns `None`
-/// when the control does not expose that pattern (caller can fall back to focus +
-/// typing); a search that stopped before reaching it answers `Err`, per
-/// [`invoke`].
+/// Set the text of the one control a [`Target`] names, through its
+/// Value/EditableText pattern. Returns `None` when the control does not expose
+/// that pattern (caller can fall back to focus + typing); a search that stopped
+/// before reaching it answers `Err`, per [`invoke_target`].
 ///
 /// The report's [`Effect`] is judged against the text asked for, so
 /// `unverifiable` on a platform that cannot read the field back is a statement
 /// about the readback, not about the assignment.
-pub fn set_value(name: &str, text: &str) -> Result<Option<ActionReport>> {
-    #[cfg(windows)]
-    {
-        imp::set_value(name, text)
-    }
-    #[cfg(not(windows))]
-    {
-        atspi::set_value(name, text)
-    }
-}
-
-/// [`set_value`] with the traversal limits chosen by the caller; see
-/// [`invoke_with`] for why UIA ignores them.
-pub fn set_value_with(
-    name: &str,
+pub fn set_value_target(
+    target: &crate::target::Target,
     text: &str,
     max_nodes: usize,
     max_depth: usize,
@@ -574,28 +567,50 @@ pub fn set_value_with(
     #[cfg(windows)]
     {
         let _ = (max_nodes, max_depth);
-        imp::set_value(name, text)
+        imp::set_value_target(target, text)
     }
     #[cfg(not(windows))]
     {
-        atspi::set_value_with(name, text, max_nodes, max_depth)
+        atspi::set_value_target(target, text, max_nodes, max_depth)
     }
 }
 
-/// Read common state fields from a control.
+/// Read common state fields from the one control a [`Target`] names.
 ///
-/// `Ok(None)` means no control of that name was found. Both platforms read
-/// enabled / offscreen / toggle / expanded; on AT-SPI `value` and `range_value`
-/// are still `None`, because the text lives behind the Text interface and a
-/// slider's number behind the Value one, neither of which is queried here.
-pub fn state(name: &str) -> Result<Option<ControlState>> {
+/// Both platforms read enabled / offscreen / toggle / expanded; on AT-SPI `value`
+/// and `range_value` are still `None`, because the text lives behind the Text
+/// interface and a slider's number behind the Value one, neither of which is
+/// queried here.
+pub fn state_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<ControlState>> {
     #[cfg(windows)]
     {
-        imp::state(name)
+        let _ = (max_nodes, max_depth);
+        imp::state_target(target)
     }
     #[cfg(not(windows))]
     {
-        atspi::state(name)
+        atspi::state_target(target, max_nodes, max_depth)
+    }
+}
+
+/// Resolve the one control a [`Target`] names, without acting on it.
+pub fn find_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<UiNode> {
+    #[cfg(windows)]
+    {
+        let _ = (max_nodes, max_depth);
+        imp::find_target(target)
+    }
+    #[cfg(not(windows))]
+    {
+        atspi::find_target(target, max_nodes, max_depth)
     }
 }
 
@@ -1130,79 +1145,123 @@ mod imp {
         }
     }
 
-    pub fn find(name: &str, _max_nodes: usize, _max_depth: usize) -> Result<Option<UiNode>> {
-        Ok(find_element(name)?
-            .map(|el| element_to_node(&el))
-            .filter(|n| n.rect.2 > 0 && n.rect.3 > 0))
+    /// One control the walk reached, kept with the live element it was read from.
+    ///
+    /// The element *is* the identity: acting on it takes no second lookup by
+    /// name, which is how an address ends up on a different control that happens
+    /// to share the name. `ancestors` is nearest-first, for `container` filtering.
+    struct Hit {
+        node: UiNode,
+        element: IUIAutomationElement,
+        ancestors: Vec<String>,
     }
 
-    pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
+    /// Resolve a target against a live UIA walk, then act on the exact element
+    /// the walk met.
+    ///
+    /// No `FindFirst`-by-name shortcut survives here: that is the engine choosing
+    /// which same-named control the caller meant. Ambiguity is an error.
+    fn with_hit<T>(
+        target: &crate::target::Target,
+        act: impl FnOnce(&Hit) -> Result<T>,
+    ) -> Result<T> {
+        let mut hits: Vec<Hit> = Vec::new();
+        let (walked, truncated) = walk_raw(
+            FIND_MAX_NODES,
+            FIND_MAX_DEPTH,
+            |node, element, ancestors| {
+                hits.push(Hit {
+                    node: node.clone(),
+                    element: element.clone(),
+                    ancestors: ancestors.to_vec(),
+                });
+                false
+            },
+        )?;
+        let facts: Vec<crate::target::Facts<'_>> = hits
+            .iter()
+            .map(|hit| crate::target::Facts {
+                name: &hit.node.name,
+                role: &hit.node.control_type,
+                automation_id: &hit.node.automation_id,
+                ancestors: &hit.ancestors,
+            })
+            .collect();
+        let chosen = crate::target::select(&facts, target)
+            .map_err(|miss| super::miss_error(miss, walked, truncated))?;
+        act(&hits[chosen])
+    }
+
+    pub fn find_target(target: &crate::target::Target) -> Result<UiNode> {
+        with_hit(target, |hit| Ok(hit.node.clone()))
+    }
+
+    pub fn invoke_target(target: &crate::target::Target) -> Result<Option<ActionReport>> {
         use windows::Win32::UI::Accessibility::{IUIAutomationInvokePattern, UIA_InvokePatternId};
 
-        let Some(element) = find_element(name)? else {
-            return Ok(None);
-        };
-        let node = element_to_node(&element);
-        let pattern: windows::core::Result<IUIAutomationInvokePattern> =
-            unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) };
-        match pattern {
-            Ok(p) => {
-                // Read the control before the action so that "the pattern answered"
-                // and "the control did something" can be told apart afterwards
-                // without asking for a screenshot.
-                let before = state_of(&element);
-                unsafe { p.Invoke() }
-                    .map_err(|e| Error::Capture(format!("UIA Invoke failed: {e}")))?;
-                let mut after = state_of(&element);
-                let mut effect = judge_effect(Some(&before), Some(&after));
-                if effect == Effect::Unchanged {
-                    // A provider that updates on the next paint can look untouched
-                    // to an immediate read, so give it one short wait. Cheaper here
-                    // than on AT-SPI, where every read is a D-Bus round trip.
-                    std::thread::sleep(std::time::Duration::from_millis(EFFECT_SETTLE_MS));
-                    after = state_of(&element);
-                    effect = judge_effect(Some(&before), Some(&after));
+        with_hit(target, |hit| {
+            let element = &hit.element;
+            let pattern: windows::core::Result<IUIAutomationInvokePattern> =
+                unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) };
+            match pattern {
+                Ok(p) => {
+                    // Read the control before the action so that "the pattern
+                    // answered" and "the control did something" can be told apart
+                    // afterwards without asking for a screenshot.
+                    let before = state_of(element);
+                    unsafe { p.Invoke() }
+                        .map_err(|e| Error::Capture(format!("UIA Invoke failed: {e}")))?;
+                    let mut after = state_of(element);
+                    let mut effect = judge_effect(Some(&before), Some(&after));
+                    if effect == Effect::Unchanged {
+                        // A provider that updates on the next paint can look
+                        // untouched to an immediate read, so give it one short wait.
+                        std::thread::sleep(std::time::Duration::from_millis(EFFECT_SETTLE_MS));
+                        after = state_of(element);
+                        effect = judge_effect(Some(&before), Some(&after));
+                    }
+                    Ok(Some(ActionReport {
+                        node: hit.node.clone(),
+                        effect,
+                        state: Some(after),
+                    }))
                 }
-                Ok(Some(ActionReport {
-                    node,
-                    effect,
-                    state: Some(after),
-                }))
+                // The control was reached and has no Invoke pattern. That is the
+                // one honest `None`: the caller falls back to a click.
+                Err(_) => Ok(None),
             }
-            Err(_) => Ok(None),
-        }
+        })
     }
 
-    pub fn set_value(name: &str, text: &str) -> Result<Option<ActionReport>> {
+    pub fn set_value_target(
+        target: &crate::target::Target,
+        text: &str,
+    ) -> Result<Option<ActionReport>> {
         use windows::core::BSTR;
         use windows::Win32::UI::Accessibility::{IUIAutomationValuePattern, UIA_ValuePatternId};
 
-        let Some(element) = find_element(name)? else {
-            return Ok(None);
-        };
-        let node = element_to_node(&element);
-        let pattern: windows::core::Result<IUIAutomationValuePattern> =
-            unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) };
-        match pattern {
-            Ok(p) => {
-                unsafe { p.SetValue(&BSTR::from(text)) }
-                    .map_err(|e| Error::Capture(format!("UIA SetValue failed: {e}")))?;
-                let after = state_of(&element);
-                Ok(Some(ActionReport {
-                    effect: judge_text_effect(Some(&after), text),
-                    state: Some(after),
-                    node,
-                }))
+        with_hit(target, |hit| {
+            let element = &hit.element;
+            let pattern: windows::core::Result<IUIAutomationValuePattern> =
+                unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) };
+            match pattern {
+                Ok(p) => {
+                    unsafe { p.SetValue(&BSTR::from(text)) }
+                        .map_err(|e| Error::Capture(format!("UIA SetValue failed: {e}")))?;
+                    let after = state_of(element);
+                    Ok(Some(ActionReport {
+                        effect: judge_text_effect(Some(&after), text),
+                        state: Some(after),
+                        node: hit.node.clone(),
+                    }))
+                }
+                Err(_) => Ok(None),
             }
-            Err(_) => Ok(None),
-        }
+        })
     }
 
-    pub fn state(name: &str) -> Result<Option<ControlState>> {
-        let Some(element) = find_element(name)? else {
-            return Ok(None);
-        };
-        Ok(Some(state_of(&element)))
+    pub fn state_target(target: &crate::target::Target) -> Result<Option<ControlState>> {
+        with_hit(target, |hit| Ok(Some(state_of(&hit.element))))
     }
 
     /// Every state read for an element the caller already holds.
@@ -1294,65 +1353,6 @@ mod imp {
             expanded,
             range_value,
         }
-    }
-
-    fn find_element(name: &str) -> Result<Option<IUIAutomationElement>> {
-        use windows::core::BSTR;
-        use windows::Win32::System::Variant::VARIANT;
-        use windows::Win32::UI::Accessibility::{
-            IUIAutomation, TreeScope_Subtree, UIA_AutomationIdPropertyId,
-            UIA_ControlTypePropertyId, UIA_NamePropertyId,
-        };
-
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
-        let root = unsafe { automation.GetRootElement() }
-            .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
-
-        // `id:<AutomationId>` targets controls whose Name is dynamic or empty
-        // (e.g. Win32 edit id 15, Calculator's num1Button).
-        if let Some(id) = name.strip_prefix("id:") {
-            let condition = unsafe {
-                automation.CreatePropertyCondition(
-                    UIA_AutomationIdPropertyId,
-                    &VARIANT::from(BSTR::from(id)),
-                )
-            }
-            .map_err(|e| Error::Capture(format!("UIA condition: {e}")))?;
-            if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &condition) } {
-                return Ok(Some(el));
-            }
-            return Ok(None);
-        }
-
-        let name_cond = unsafe {
-            automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(BSTR::from(name)))
-        }
-        .map_err(|e| Error::Capture(format!("UIA condition: {e}")))?;
-
-        // Prefer actionable controls: the Start menu and its button share a
-        // name, but only the button (control type 50000) is clickable chrome.
-        for type_id in [50000i32, 50011, 50007] {
-            let type_cond = unsafe {
-                automation
-                    .CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(type_id))
-            };
-            let Ok(type_cond) = type_cond else { continue };
-            let Ok(combined) = (unsafe { automation.CreateAndCondition(&name_cond, &type_cond) })
-            else {
-                continue;
-            };
-            if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &combined) } {
-                return Ok(Some(el));
-            }
-        }
-
-        if let Ok(el) = unsafe { root.FindFirst(TreeScope_Subtree, &name_cond) } {
-            return Ok(Some(el));
-        }
-        Ok(None)
     }
 
     fn live_checked(
@@ -1468,14 +1468,22 @@ mod imp {
 
     /// Read a cached boolean property. UIA hands these back as a VARIANT, so go
     /// through the OLE conversion helper instead of poking at the union.
-    fn cached_flag(el: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> bool {
+    ///
+    /// `None` means the property did not arrive in the cache, which is different
+    /// from a cached `false`; callers that must not mistake one for the other ask
+    /// this, the rest use [`cached_flag`].
+    fn cached_bool(el: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> Option<bool> {
         use windows::Win32::System::Variant::{VariantClear, VariantToBooleanWithDefault};
         let Ok(mut variant) = (unsafe { el.GetCachedPropertyValue(property) }) else {
-            return false;
+            return None;
         };
         let value = unsafe { VariantToBooleanWithDefault(&variant, false) }.as_bool();
         let _ = unsafe { VariantClear(&mut variant) };
-        value
+        Some(value)
+    }
+
+    fn cached_flag(el: &IUIAutomationElement, property: UIA_PROPERTY_ID) -> bool {
+        cached_bool(el, property).unwrap_or(false)
     }
 
     /// Read a cached integer property the same way.
@@ -1737,46 +1745,33 @@ mod imp {
         Window(u32),
     }
 
-    /// Depth-first walk in document order. `visit` returns true to stop early
-    /// and receives the live element so callers can act on the exact node they
-    /// matched instead of re-finding it by name.
-    fn walk(
-        root_kind: Root,
-        max_nodes: usize,
-        max_depth: usize,
-        mut visit: impl FnMut(&UiNode, &IUIAutomationElement) -> bool,
-    ) -> Result<(bool, bool)> {
-        // RPC_E_CHANGED_MODE is fine: COM is already initialised differently.
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-
+    /// Every property both tree walks read, batched into one cache request.
+    ///
+    /// Fetching properties through the cache is what makes a walk practical
+    /// (36s -> under 1s in practice); live `CurrentX()` getters cost a
+    /// cross-process call per property per node.
+    ///
+    /// TreeScope_Element is deliberate: with TreeScope_Children only the root's
+    /// immediate children arrive with cached properties, and `GetCachedChildren`
+    /// on those children returns an empty array, which silently flattens every
+    /// tree to one level (menus looked empty, Explorer looked like four panes).
+    fn cache_request(
+        automation: &windows::Win32::UI::Accessibility::IUIAutomation,
+    ) -> Result<windows::Win32::UI::Accessibility::IUIAutomationCacheRequest> {
         use windows::Win32::UI::Accessibility::{
-            IUIAutomation, IUIAutomationCacheRequest, TreeScope_Children, TreeScope_Element,
-            UIA_AriaPropertiesPropertyId, UIA_AutomationIdPropertyId,
-            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
+            IUIAutomationCacheRequest, TreeScope_Element, UIA_AriaPropertiesPropertyId,
+            UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
             UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_HasKeyboardFocusPropertyId,
-            UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
-            UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
-            UIA_IsOffscreenPropertyId, UIA_IsScrollPatternAvailablePropertyId,
-            UIA_IsSelectionItemPatternAvailablePropertyId, UIA_IsTogglePatternAvailablePropertyId,
-            UIA_IsValuePatternAvailablePropertyId, UIA_IsWindowPatternAvailablePropertyId,
-            UIA_NamePropertyId, UIA_ScrollHorizontallyScrollablePropertyId,
-            UIA_ScrollVerticallyScrollablePropertyId, UIA_SelectionItemIsSelectedPropertyId,
-            UIA_ToggleToggleStatePropertyId,
+            UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId,
+            UIA_IsExpandCollapsePatternAvailablePropertyId, UIA_IsInvokePatternAvailablePropertyId,
+            UIA_IsKeyboardFocusablePropertyId, UIA_IsOffscreenPropertyId,
+            UIA_IsScrollPatternAvailablePropertyId, UIA_IsSelectionItemPatternAvailablePropertyId,
+            UIA_IsTogglePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+            UIA_IsWindowPatternAvailablePropertyId, UIA_NamePropertyId,
+            UIA_ScrollHorizontallyScrollablePropertyId, UIA_ScrollVerticallyScrollablePropertyId,
+            UIA_SelectionItemIsSelectedPropertyId, UIA_ToggleToggleStatePropertyId,
         };
 
-        // One cache request batches every property fetch into the COM call that
-        // returns the children, which is dramatically faster than walking with
-        // CurrentX() getters (36s -> under 1s in practice).
-        //
-        // TreeScope_Element is deliberate: with TreeScope_Children only the root's
-        // immediate children arrive with cached properties, and `GetCachedChildren`
-        // on those children returns an empty array, which silently flattens every
-        // tree to one level (menus looked empty, Explorer looked like four panes).
-        // Walking with FindAllBuildCache per node caches each level as it is
-        // fetched, so depth is real and memory stays bounded by max_nodes.
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
         let cache: IUIAutomationCacheRequest = unsafe { automation.CreateCacheRequest() }
             .map_err(|e| Error::Capture(format!("UIA cache request: {e}")))?;
         unsafe {
@@ -1787,6 +1782,7 @@ mod imp {
                 .and_then(|_| cache.AddProperty(UIA_BoundingRectanglePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsOffscreenPropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsEnabledPropertyId))
+                .and_then(|_| cache.AddProperty(UIA_IsControlElementPropertyId))
                 .and_then(|_| cache.AddProperty(UIA_HasKeyboardFocusPropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsKeyboardFocusablePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_IsInvokePatternAvailablePropertyId))
@@ -1805,6 +1801,27 @@ mod imp {
                 .and_then(|_| cache.SetTreeScope(TreeScope_Element))
                 .map_err(|e| Error::Capture(format!("UIA cache setup: {e}")))?;
         }
+        Ok(cache)
+    }
+
+    /// Depth-first walk in document order. `visit` returns true to stop early
+    /// and receives the live element so callers can act on the exact node they
+    /// matched instead of re-finding it by name.
+    fn walk(
+        root_kind: Root,
+        max_nodes: usize,
+        max_depth: usize,
+        mut visit: impl FnMut(&UiNode, &IUIAutomationElement) -> bool,
+    ) -> Result<(bool, bool)> {
+        // RPC_E_CHANGED_MODE is fine: COM is already initialised differently.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+
+        use windows::Win32::UI::Accessibility::{IUIAutomation, TreeScope_Children};
+
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
+        let cache = cache_request(&automation)?;
         let anywhere = unsafe { automation.CreateTrueCondition() }
             .map_err(|e| Error::Capture(format!("UIA condition: {e}")))?;
 
@@ -1902,6 +1919,118 @@ mod imp {
         }
 
         Ok((truncated, false))
+    }
+
+    /// Depth-first walk for identity resolution, over the raw view.
+    ///
+    /// Every element this yields is a node the walker itself handed back, so the
+    /// caller acts on that exact element instead of asking UIA to find the name
+    /// again -- a second lookup applies an ambiguous question to a tree that may
+    /// have moved on, which is how an address lands on another control.
+    ///
+    /// Candidates are limited to control elements, the set `window_state` shows,
+    /// so a target cannot reach something the observation never offered. Raw-view
+    /// nodes that are not controls are still descended through, because their
+    /// children may be controls. `ancestors` is nearest-first for `container`
+    /// filtering. Returns (candidates visited, walk was cut short).
+    fn walk_raw(
+        max_nodes: usize,
+        max_depth: usize,
+        mut visit: impl FnMut(&UiNode, &IUIAutomationElement, &[String]) -> bool,
+    ) -> Result<(usize, bool)> {
+        use windows::Win32::UI::Accessibility::{IUIAutomation, UIA_IsControlElementPropertyId};
+
+        // RPC_E_CHANGED_MODE is fine: COM is already initialised differently.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let automation: IUIAutomation =
+            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| Error::Capture(format!("UIA init: {e}")))?;
+        let cache = cache_request(&automation)?;
+        let walker = unsafe { automation.RawViewWalker() }
+            .map_err(|e| Error::Capture(format!("UIA raw view walker: {e}")))?;
+        let root = unsafe { automation.GetRootElementBuildCache(&cache) }
+            .map_err(|e| Error::Capture(format!("UIA root: {e}")))?;
+
+        let mut visited = 0usize;
+        let mut truncated = false;
+        let mut stack: Vec<(IUIAutomationElement, usize, Vec<String>)> =
+            vec![(root, 0, Vec::new())];
+
+        while let Some((element, depth, ancestors)) = stack.pop() {
+            if visited >= max_nodes {
+                truncated = true;
+                break;
+            }
+            if depth > max_depth {
+                truncated = true;
+                continue;
+            }
+
+            // The root of a BuildCache walk comes back with empty cached
+            // properties, so it is read live, as in `walk`.
+            let facts = if depth == 0 {
+                live_facts(&element)
+            } else {
+                let offscreen = unsafe { element.CachedIsOffscreen() }
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false);
+                if offscreen {
+                    continue;
+                }
+                cached_facts(&element)
+            };
+
+            // A provider that does not cache the flag leaves it unknown; treat
+            // that as "could be a control" rather than silently hiding the tree.
+            let is_control =
+                depth == 0 || cached_bool(&element, UIA_IsControlElementPropertyId).unwrap_or(true);
+
+            let mut child_ancestors = Vec::with_capacity(ancestors.len() + 1);
+            if is_control && !facts.name.is_empty() {
+                child_ancestors.push(facts.name.clone());
+            }
+            child_ancestors.extend(ancestors.iter().cloned());
+
+            // Same filter as `walk`: anonymous shell holes carry no usable address.
+            let hollow =
+                facts.name.is_empty() && facts.automation_id.is_empty() && facts.rect.2 == 0;
+            if is_control && !hollow {
+                visited += 1;
+                let node = UiNode {
+                    index: 0,
+                    depth,
+                    control_type: facts.control_type,
+                    name: facts.name,
+                    automation_id: facts.automation_id,
+                    rect: facts.rect,
+                    signature: String::new(),
+                    value: facts.value,
+                    actions: facts.actions,
+                    focused: facts.focused,
+                    selected: facts.selected,
+                    checked: facts.checked,
+                };
+                if visit(&node, &element, &ancestors) {
+                    return Ok((visited, truncated));
+                }
+            }
+
+            let mut children = Vec::new();
+            let mut next = unsafe { walker.GetFirstChildElementBuildCache(&element, &cache) }.ok();
+            while let Some(child) = next {
+                if children.len() >= max_nodes {
+                    truncated = true;
+                    break;
+                }
+                next = unsafe { walker.GetNextSiblingElementBuildCache(&child, &cache) }.ok();
+                children.push(child);
+            }
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1, child_ancestors.clone()));
+            }
+        }
+
+        Ok((visited, truncated))
     }
 }
 

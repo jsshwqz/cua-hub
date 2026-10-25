@@ -365,9 +365,9 @@ fn ensure_on_screen(x: i64, y: i64) -> std::result::Result<(), Value> {
     Ok(())
 }
 
-/// Traversal budget for a name-based action, so a caller can widen it and -- more
-/// usefully -- narrow it in a test. A walk that runs out answers "did not reach",
-/// which must never be read as "this control has no pattern".
+/// Traversal budget for a target-addressed action, so a caller can widen it and
+/// -- more usefully -- narrow it in a test. A walk that runs out answers
+/// "did not reach", which must never be read as "this control has no pattern".
 fn action_limits(args: &Value) -> (usize, usize) {
     (
         args["max_nodes"]
@@ -513,6 +513,34 @@ fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| tool_err(format!("missing string argument `{key}`")))
+}
+
+/// The control a name-addressed tool means: a `target` object, or the `name`
+/// shorthand every caller already used.
+///
+/// Both at once is refused. That pair is the double address whose silent
+/// resolution this stage exists to remove -- one of the two would have to win,
+/// and the caller would never learn which.
+fn target_arg(args: &Value) -> std::result::Result<cua_engine_access::target::Target, Value> {
+    let target = args.get("target").filter(|t| !t.is_null());
+    let name = args.get("name").filter(|n| !n.is_null());
+    match (target, name) {
+        (Some(target), None) => serde_json::from_value(target.clone()).map_err(|e| {
+            tool_err(format!(
+                "invalid `target`: {e}. It takes name (substring, `re:` pattern, or `id:<AutomationId>`), and optionally role, nth (0-based), container"
+            ))
+        }),
+        (None, Some(name)) => name
+            .as_str()
+            .map(cua_engine_access::target::Target::by_name)
+            .ok_or_else(|| tool_err("`name` must be a string")),
+        (Some(_), Some(_)) => Err(tool_err(
+            "give either `target` or `name`, not both: two addresses for one control is the ambiguity this tool refuses",
+        )),
+        (None, None) => Err(tool_err(
+            "missing `target`: {\"name\": \"...\", optional role/nth/container}; the `name` shorthand still works for a bare name",
+        )),
+    }
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
@@ -3103,25 +3131,24 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
             }
         }
         "find_control" => {
-            let name = match required_str(args, "name") {
-                Ok(n) => n,
+            let target = match target_arg(args) {
+                Ok(target) => target,
                 Err(e) => return e,
             };
-            match cua_engine_access::find(&name, 400, 8) {
-                Ok(Some(node)) => tool_ok(json!({
+            match cua_engine_access::find_target(&target, 400, 8) {
+                Ok(node) => tool_ok(json!({
                     "name": node.name,
                     "control_type": node.control_type,
                     "automation_id": node.automation_id,
                     "rect": { "x": node.rect.0, "y": node.rect.1, "w": node.rect.2, "h": node.rect.3 },
                     "center": { "x": node.rect.0 + node.rect.2 / 2, "y": node.rect.1 + node.rect.3 / 2 }
                 })),
-                Ok(None) => tool_err(format!("no control matching {name:?}")),
                 Err(e) => tool_err(e),
             }
         }
         "set_control_text" => {
-            let name = match required_str(args, "name") {
-                Ok(n) => n,
+            let target = match target_arg(args) {
+                Ok(target) => target,
                 Err(e) => return e,
             };
             let text = match required_str(args, "text") {
@@ -3129,7 +3156,7 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 Err(e) => return e,
             };
             let (max_nodes, max_depth) = action_limits(args);
-            match cua_engine_access::set_value_with(&name, &text, max_nodes, max_depth) {
+            match cua_engine_access::set_value_target(&target, &text, max_nodes, max_depth) {
                 Ok(Some(report)) => action_outcome_with_verification_crop(
                     format!(
                         "set text of {} \"{}\" ({} chars){}",
@@ -3141,21 +3168,23 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                     &report,
                 ),
                 Ok(None) => tool_err(format!(
-                    "control {name:?} has no Value/EditableText pattern; focus it and use type_text"
+                    "control {} has no Value/EditableText pattern; focus it and use type_text",
+                    cua_engine_access::target::describe_target(&target)
                 )),
                 Err(e) => tool_err(e),
             }
         }
         "control_state" => {
-            let name = match required_str(args, "name") {
-                Ok(n) => n,
+            let target = match target_arg(args) {
+                Ok(target) => target,
                 Err(e) => return e,
             };
-            match cua_engine_access::state(&name) {
-                Ok(Some(state)) => tool_ok(json!(state)),
-                Ok(None) => tool_err(format!(
-                    "no control named {name:?} was found to read state from"
-                )),
+            match cua_engine_access::state_target(
+                &target,
+                cua_engine_access::DEFAULT_ACTION_NODES,
+                cua_engine_access::DEFAULT_ACTION_DEPTH,
+            ) {
+                Ok(state) => tool_ok(json!(state)),
                 Err(e) => tool_err(e),
             }
         }
@@ -3178,7 +3207,11 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                     "control at index {index} has no accessible name or automation id"
                 ));
             };
-            match cua_engine_access::invoke(&selector) {
+            match cua_engine_access::invoke_target(
+                &cua_engine_access::target::Target::by_name(&selector),
+                cua_engine_access::DEFAULT_ACTION_NODES,
+                cua_engine_access::DEFAULT_ACTION_DEPTH,
+            ) {
                 Ok(Some(report)) => action_outcome_with_verification_crop(
                     format!(
                         "invoked {} \"{}\" via accessibility pattern{}",
@@ -3237,7 +3270,12 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                     "control at index {index} has no accessible name or automation id"
                 ));
             };
-            match cua_engine_access::set_value(&selector, &text) {
+            match cua_engine_access::set_value_target(
+                &cua_engine_access::target::Target::by_name(&selector),
+                &text,
+                cua_engine_access::DEFAULT_ACTION_NODES,
+                cua_engine_access::DEFAULT_ACTION_DEPTH,
+            ) {
                 Ok(Some(report)) => action_outcome_with_verification_crop(
                     format!(
                         "set {} \"{}\" via Value/EditableText{}",
@@ -3346,14 +3384,14 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
             }
         }
         "invoke_control" => {
-            let name = match required_str(args, "name") {
-                Ok(n) => n,
+            let target = match target_arg(args) {
+                Ok(target) => target,
                 Err(e) => return e,
             };
-            // Prefer the accessibility Invoke pattern: no pointer movement and
-            // immune to overlapping windows.
+            // Prefer the accessibility action: no pointer movement and immune to
+            // overlapping windows.
             let (max_nodes, max_depth) = action_limits(args);
-            match cua_engine_access::invoke_with(&name, max_nodes, max_depth) {
+            match cua_engine_access::invoke_target(&target, max_nodes, max_depth) {
                 Ok(Some(report)) => {
                     return action_outcome_with_verification_crop(
                         format!(
@@ -3368,11 +3406,12 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 Ok(None) => {}
                 Err(e) => return tool_err(e),
             }
-            match cua_engine_access::find(&name, 400, 8) {
-                Ok(Some(node)) => {
+            match cua_engine_access::find_target(&target, 400, 8) {
+                Ok(node) => {
                     let Some(center) = control_center(node.rect) else {
                         return tool_err(format!(
-                            "control {name:?} reports no usable rectangle, so there is nothing to click"
+                            "control {} reports no usable rectangle, so there is nothing to click",
+                            cua_engine_access::target::describe_target(&target)
                         ));
                     };
                     let action = Action::Click {
@@ -3391,7 +3430,6 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                         Err(e) => tool_err(e),
                     }
                 }
-                Ok(None) => tool_err(format!("no control matching {name:?}")),
                 Err(e) => tool_err(e),
             }
         }
@@ -3931,47 +3969,100 @@ fn tool_defs() -> Value {
         },
         {
             "name": "find_control",
-            "description": "Find a control by exact accessible name and return its rectangle and center. Prefers buttons/menu items over same-named containers.",
+            "description": "Find the one control a target names and return its rectangle and center. A target is name (case-insensitive substring, `re:` pattern, or `id:<AutomationId>`) plus optional role, container and nth (0-based). Two matches without nth is an error that lists the candidates, never a pick; the old name-only form still works through the `name` shorthand.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "name": { "type": "string" } },
-                "required": ["name"]
+                "properties": {
+                    "target": {
+                        "type": "object",
+                        "description": "The one control this call means.",
+                        "properties": {
+                            "name": { "type": "string", "description": "Case-insensitive substring, `re:` pattern, or `id:<AutomationId>`" },
+                            "role": { "type": "string", "description": "Control type it must be, e.g. Button (case-insensitive exact)" },
+                            "nth": { "type": "integer", "minimum": 0, "description": "Which of several matches, 0-based; absent means the match must be unique" },
+                            "container": { "type": "string", "description": "Only controls inside something whose name matches this" }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    },
+                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" }
+                },
+                "anyOf": [{ "required": ["target"] }, { "required": ["name"] }]
             }
         },
         {
             "name": "set_control_text",
-            "description": "Set a control's text through its Value/EditableText accessibility pattern (no synthetic keystrokes). Use type_text when the control has no such pattern. A walk that runs out of nodes says so instead of reporting a missing pattern; widen with max_nodes.",
+            "description": "Set a control's text through its Value/EditableText accessibility pattern (no synthetic keystrokes). Use type_text when the control has no such pattern. A target that is ambiguous is an error; a walk that runs out of nodes says it did not reach the control; widen with max_nodes. The `name` shorthand still works.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string" },
+                    "target": {
+                        "type": "object",
+                        "description": "The one control this call means.",
+                        "properties": {
+                            "name": { "type": "string", "description": "Case-insensitive substring, `re:` pattern, or `id:<AutomationId>`" },
+                            "role": { "type": "string" },
+                            "nth": { "type": "integer", "minimum": 0 },
+                            "container": { "type": "string" }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    },
+                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" },
                     "text": { "type": "string" },
                     "max_nodes": { "type": "integer", "minimum": 1 },
                     "max_depth": { "type": "integer", "minimum": 1 }
                 },
-                "required": ["name", "text"]
+                "required": ["text"],
+                "anyOf": [{ "required": ["target"] }, { "required": ["name"] }]
             }
         },
         {
             "name": "control_state",
-            "description": "Read a control's enabled/offscreen flags plus toggle, value, expanded and range values when available.",
+            "description": "Read a control's enabled/offscreen flags plus toggle, value, expanded and range values when available. A target that is ambiguous is an error that lists the candidates; the `name` shorthand still works.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "name": { "type": "string" } },
-                "required": ["name"]
+                "properties": {
+                    "target": {
+                        "type": "object",
+                        "description": "The one control this call means.",
+                        "properties": {
+                            "name": { "type": "string", "description": "Case-insensitive substring, `re:` pattern, or `id:<AutomationId>`" },
+                            "role": { "type": "string" },
+                            "nth": { "type": "integer", "minimum": 0 },
+                            "container": { "type": "string" }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    },
+                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" }
+                },
+                "anyOf": [{ "required": ["target"] }, { "required": ["name"] }]
             }
         },
         {
             "name": "invoke_control",
-            "description": "Invoke a control by accessible name (Invoke pattern first, click-center fallback). A walk that stopped early reports \"did not reach\" rather than \"no pattern\"; raise max_nodes.",
+            "description": "Invoke the one control a target names (accessibility action first, click-center fallback). A target that is ambiguous is an error, never a pick; a walk that stopped early reports \"did not reach\" rather than \"no action\"; raise max_nodes. The `name` shorthand still works.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string" },
+                    "target": {
+                        "type": "object",
+                        "description": "The one control this call means.",
+                        "properties": {
+                            "name": { "type": "string", "description": "Case-insensitive substring, `re:` pattern, or `id:<AutomationId>`" },
+                            "role": { "type": "string" },
+                            "nth": { "type": "integer", "minimum": 0 },
+                            "container": { "type": "string" }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    },
+                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" },
                     "max_nodes": { "type": "integer", "minimum": 1 },
                     "max_depth": { "type": "integer", "minimum": 1 }
                 },
-                "required": ["name"]
+                "anyOf": [{ "required": ["target"] }, { "required": ["name"] }]
             }
         },
         {
@@ -5190,5 +5281,58 @@ mod tests {
             "re-resolved node must carry updated rectangle from fresh snapshot"
         );
         assert_eq!(recovered.node.index, 5);
+    }
+
+    fn error_text(value: &Value) -> &str {
+        value["content"][0]["text"]
+            .as_str()
+            .expect("tool errors carry text")
+    }
+
+    #[test]
+    fn a_target_and_a_name_together_are_refused() {
+        // Double addressing is the failure this stage exists to remove: one of
+        // the two would silently win and the caller would never learn which.
+        let err = target_arg(&json!({
+            "target": {"name": "ok"},
+            "name": "ok"
+        }))
+        .expect_err("both addresses must be refused");
+        assert!(
+            error_text(&err).contains("not both"),
+            "{}",
+            error_text(&err)
+        );
+    }
+
+    #[test]
+    fn the_name_shorthand_is_still_a_complete_target() {
+        let target = target_arg(&json!({"name": "probe-toggle"})).expect("shorthand resolves");
+        assert_eq!(
+            target,
+            cua_engine_access::target::Target::by_name("probe-toggle")
+        );
+    }
+
+    #[test]
+    fn a_missing_address_says_what_to_send() {
+        let err = target_arg(&json!({})).expect_err("neither address is not a target");
+        assert!(
+            error_text(&err).contains("missing `target`"),
+            "{}",
+            error_text(&err)
+        );
+    }
+
+    #[test]
+    fn a_target_refuses_the_fields_that_double_address_it() {
+        // `index` inside a target is the stale-index shortcut in new clothing.
+        let err = target_arg(&json!({"target": {"name": "ok", "index": 4}}))
+            .expect_err("unknown fields must not be ignored");
+        assert!(
+            error_text(&err).contains("index"),
+            "say which field was refused: {}",
+            error_text(&err)
+        );
     }
 }

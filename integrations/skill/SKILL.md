@@ -24,7 +24,7 @@ Perception
 - `window_input {window, text, x?, y?, submit?, interval_ms?}` — atomically focus, click a window-relative point, type, and optionally press Return; the target must resolve to exactly one window. `x`/`y` are measured from the window's own top-left and must land inside its rectangle — an offset that would escape is refused with `offset_outside_window`, and giving only one axis is refused too, because half a point is not a click. This tool cannot reach outside the window it names; if you need a screen coordinate, use `click` with absolute pixels and say so.
 - `screen_info` — screen size, origin, DPI, cursor position (use to validate coordinates).
 - `accessibility_tree {max_nodes?, depth?}` — desktop-wide UIA (Windows) / AT-SPI (Linux) tree. Prefer `window_state` for in-window indexes.
-- `find_control {name}` — locate by accessible name or `id:<AutomationId>`, returns rectangle and centre.
+- `find_control {target}` — locate the one control a target names and return its rectangle and centre. A target is `name` (case-insensitive substring, `re:` pattern, or `id:<AutomationId>`) plus optional `role`, `container`, `nth` (0-based). Two matches without `nth` is an error that lists the candidates, never a pick. `{name: "..."}` remains shorthand.
 
 Precise UI control (prefer over pixels)
 
@@ -32,7 +32,7 @@ Precise UI control (prefer over pixels)
 - `perform_secondary_action {observation_id, element_index, action}` — an accessibility action besides a click: `Expand`, `Collapse`, `Raise`, `Scroll Up/Down/Left/Right`, `Toggle`, `Select`, `Focus`, `Invoke`. Only use names the element lists in its `actions=` in the tree; a guessed name returns `unsupported_action` with the real list, and the element's state is read back afterwards so you can verify.
 - `invoke_element {index, observation_id?}` — Invoke pattern first, click-centre fallback.
 - `set_element_value {index, text, observation_id?}` — Value/EditableText pattern, no keystrokes.
-- `invoke_control {name}` / `set_control_text {name, text}` / `control_state {name}` — same by accessible name. `control_state` works on both platforms and uses the same vocabulary on each (`toggle`: `on`/`off`/`indeterminate`; `expanded`: `expanded`/`collapsed`/`partially_expanded`/`leaf`). On Linux `value` and `range_value` stay absent, so read a field's text from the tree instead; `toggle` only appears for a control that says it is checkable, so a missing `toggle` means "not a toggle", not "off".
+- `invoke_control {target}` / `set_control_text {target, text}` / `control_state {target}` — same by target (`name` shorthand still works). An ambiguous target is an error that lists the candidates: narrow with `role` or `container`, or name one with `nth`; the engine never takes the first match. `control_state` works on both platforms and uses the same vocabulary on each (`toggle`: `on`/`off`/`indeterminate`; `expanded`: `expanded`/`collapsed`/`partially_expanded`/`leaf`). On Linux `value` and `range_value` stay absent, so read a field's text from the tree instead; `toggle` only appears for a control that says it is checkable, so a missing `toggle` means "not a toggle", not "off".
   Both name-based actions take an optional `max_nodes`/`max_depth`, and the failure says which problem you have: `did not reach` means the search ran out of tree — raise `max_nodes` and retry; `did not get an answer` means that application never replied (on Linux one call waits at most 1200ms, then the same application is treated as silent for 30s instead of being probed again). Neither is "the control has no such pattern", and neither is a reason to go hunting by coordinates — the control may be fine and simply unseen. Only a `None`-style answer, after the walk reached the control, means the pattern is absent.
 - A successful action also carries the verdict it could read back: `effect=changed` (a state the control publishes moved), `effect=unchanged` (a control with a toggle/expand state published one and it did not move), `effect=unverifiable` (nothing readable moved — including a plain button, which has no state bits to move at all). Treat `unverifiable` as "look": confirm with the next observation or the tree, because the toolkit answering is not evidence that anything appeared. `set_control_text` judges the field against the text you asked for, so on a platform that cannot read the value back it answers `unverifiable` rather than guessing.
 
@@ -222,6 +222,6 @@ the keystrokes, and say what data goes where and why.
   id, so apps whose X11 class and accessibility name differ (Python scripts report
   the script filename, Electron reports `electron`) still resolve. When no frame can
   be matched the error lists the applications the bus does expose — fall back to
-  `accessibility_tree` plus `find_control`/`invoke_control` by name.
+  `accessibility_tree` plus `find_control`/`invoke_control` by target.
 - CLI fallback: `cua-hub run "<task>"`, `cua-hub browser "<task>"`,
   `cua-hub orchestrate "<task>"`, `cua-hub console` for a local live view.

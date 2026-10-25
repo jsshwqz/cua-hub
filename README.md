@@ -134,7 +134,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |
 | `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选。`x`/`y` 必须落在该窗口自己的矩形内，越界返回 `offset_outside_window`（这个工具不会点到窗口外），只给一个轴也拒绝。窗口激活只在 Windows 实现，Linux 上这条工具回 `unsupported` + `retry:false`（不拿可重试的错误糊过去） |
 | `accessibility_tree` | 带编号的桌面级 UIA 树（窗口/按钮/输入框 + 矩形）；日常观测请用 `window_state`。Linux 上如果某些应用没应答，树尾会列出 `! parts of this tree were not read:`（最多点名 6 个子树，其余给条数）——少节点不再无声 |
-| `find_control` / `invoke_control` | 按无障碍名称定位；invoke 优先走 Invoke 模式，失败再点中心。`invoke_control` 可选 `max_nodes`/`max_depth`，失败要按原话读：`did not reach` = 搜索被节点预算截断（提高 `max_nodes` 再来），`did not get an answer` = 那个应用没回话（Linux 单次调用最多等 1200ms），两者都**不**表示控件没有该模式；只有走到控件后的 `None` 才是"没有该模式"。三种都不该顺手降级成坐标点击。成功的答案还带**效果裁决** `effect=changed`/`unchanged`/`unverifiable`（回读控件自己的状态得出；普通按钮没有可读状态位，所以是 `unverifiable` 而不是"没变"——要看画面或树自己确认） |
+| `find_control` / `invoke_control` | 按 `target` 身份地址定位（`name` 简写仍可用）；invoke 优先走 Invoke 模式，失败再点中心。一个 target 命中多个控件时**报错并列出候选**，绝不替调用方挑一个。`invoke_control` 可选 `max_nodes`/`max_depth`，失败要按原话读：`did not reach` = 搜索被节点预算截断（提高 `max_nodes` 再来），`did not get an answer` = 那个应用没回话（Linux 单次调用最多等 1200ms），两者都**不**表示控件没有该模式；只有走到控件后的 `None` 才是"没有该模式"。三种都不该顺手降级成坐标点击。成功的答案还带**效果裁决** `effect=changed`/`unchanged`/`unverifiable`（回读控件自己的状态得出；普通按钮没有可读状态位，所以是 `unverifiable` 而不是"没变"——要看画面或树自己确认） |
 | `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |
 | `set_control_text` / `set_element_value` | 用 Value/EditableText 模式按名称/编号直接设值（不模拟键盘）。`set_control_text` 同样接受可选 `max_nodes`/`max_depth`，读失败口径同 `invoke_control`：`did not reach` = 预算不够，`did not get an answer` = 那个应用没回话，两者都不是"控件不支持"。效果裁决按"字段里是不是我要的那段文字"判：Windows 读得回来所以能报 `changed`/`unchanged`；Linux 还没接 Text 接口，诚实报 `unverifiable`，不拿"模式回了 true"冒充"写进去了" |
 | `control_state` | 读取启用/可见、勾选、展开状态、范围值。两平台都实现：Windows 走 UIA 的 Toggle/ExpandCollapse/Value/RangeValue 模式，Linux 走 AT-SPI 的 `GetState` 位图（`toggle` = `on`/`off`/`indeterminate`，`expanded` = `expanded`/`collapsed`/`partially_expanded`/`leaf`，口径一致）。Linux 侧 `value` 与 `range_value` 暂不填——那两个在 Text / Value 接口后面，还没接 |
@@ -147,8 +147,19 @@ export OPENROUTER_API_KEY=sk-or-...
 | `clipboard_get` / `clipboard_set` | 剪贴板文本读写（常驻实例） |
 | `screen_info` | 主屏尺寸、原点、DPI、光标位置 |
 
-控件名支持 `id:<AutomationId>` 形式，用于名称动态或为空的控件，例如
-Win32 编辑框 `id:15`、计算器按键 `id:num1Button`、结果显示 `id:CalculatorResults`。
+控件寻址用 `target`：`{"name": "...", "role": "Button", "nth": 0, "container": "..."}`。
+`name` 是不区分大小写的子串，也可写 `re:` 正则或 `id:<AutomationId>` 形式（用于名称动态或
+为空的控件，例如 Win32 编辑框 `id:15`、计算器按键 `id:num1Button`、结果显示
+`id:CalculatorResults`）；`role` 是控件类型，`container` 只匹配位于同名容器内的控件，
+`nth` 是多个命中里的第几个（0 起）。**一个 target 命中多个控件时一律报错并列出候选，
+绝不由引擎挑第一个**；要选就由调用方用 role/container/nth 说明白。旧的字符串 `name`
+参数是 `{"target":{"name":...}}` 的简写，仍然可用；同时给 `target` 和 `name` 会被拒绝
+（双重地址）。
+
+解析和动手对着同一个节点：Linux 上身份是 `(bus name, object path)`，Windows 上用
+RawViewWalker 走到哪个元素就对哪个元素动手，解析之后不再按名二次查找。代价是 Windows
+动作从"按名 FindFirst"变成每次走一遍树：本机约 2300 个可见节点的桌面上一次 `find_control`
+约 15s（同等节点的 control-view 快照也要 14s，慢在树的大小，不在 walker）。
 
 远程/容器内调用可以走 HTTP（streamable POST）：
 

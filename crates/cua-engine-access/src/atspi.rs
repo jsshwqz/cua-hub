@@ -388,11 +388,12 @@ fn role_from_name(name: &str) -> u32 {
     }
 }
 
-fn walk(
-    max_nodes: usize,
-    max_depth: usize,
-    visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
-) -> Result<WalkReport> {
+/// One node as the walk reaches it: the connection to read more through, the node,
+/// the `(bus name, object path)` it came from, and the names of its enclosing
+/// nodes, nearest first -- what a `container:` filter is answered from.
+type Visit<'a> = &'a mut dyn FnMut(&Connection, &UiNode, &str, &str, &[String]) -> bool;
+
+fn walk(max_nodes: usize, max_depth: usize, visit: Visit<'_>) -> Result<WalkReport> {
     let conn = a11y_connection()?;
     let root_kids = children(&conn, REGISTRY, ROOT_PATH)?;
     walk_from(&conn, root_kids, max_nodes, max_depth, visit)
@@ -406,12 +407,17 @@ fn walk_from(
     starts: Vec<(String, OwnedObjectPath)>,
     max_nodes: usize,
     max_depth: usize,
-    visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
+    visit: Visit<'_>,
 ) -> Result<WalkReport> {
     let mut truncated = false;
     let mut unreadable: Vec<crate::Unreadable> = Vec::new();
     let mut visited = 0usize;
     let deadline = Instant::now() + WALK_BUDGET;
+    // Names of the nodes currently on the path down from the root, as (depth, name).
+    // A `container:` in a target is answered from this: without it, two panels that
+    // carry the same labels are indistinguishable and the walk can only say
+    // "ambiguous" where the caller actually said which one.
+    let mut trail: Vec<(usize, String)> = Vec::new();
     let mut stack: Vec<(String, String, usize)> = starts
         .into_iter()
         .rev()
@@ -475,12 +481,22 @@ fn walk_from(
             selected,
             checked,
         };
-        if visit(conn, &node, &dest, &path) {
+        while trail
+            .last()
+            .is_some_and(|(depth_seen, _)| *depth_seen >= depth)
+        {
+            trail.pop();
+        }
+        let ancestors: Vec<String> = trail.iter().rev().map(|(_, name)| name.clone()).collect();
+        if visit(conn, &node, &dest, &path, &ancestors) {
             return Ok(WalkReport {
                 truncated,
                 visited,
                 unreadable,
             });
+        }
+        if !node.name.is_empty() {
+            trail.push((depth, node.name.clone()));
         }
 
         if kids.len() + visited > max_nodes {
@@ -640,7 +656,7 @@ pub fn snapshot_window(
         vec![(dest, path)],
         max_nodes,
         max_depth,
-        &mut |_, node, _, _| {
+        &mut |_, node, _, _, _| {
             let mut node = node.clone();
             node.index = nodes.len();
             nodes.push(node);
@@ -685,7 +701,7 @@ fn title_matches(at_spi_name: &str, want: &str) -> bool {
 
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     let mut nodes = Vec::new();
-    let report = walk(max_nodes, max_depth, &mut |_, node, _, _| {
+    let report = walk(max_nodes, max_depth, &mut |_, node, _, _, _| {
         let mut node = node.clone();
         node.index = nodes.len();
         nodes.push(node);
@@ -698,118 +714,6 @@ pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     })
 }
 
-/// How actionable a role is, used to break name collisions.
-///
-/// Mirrors the Windows side, which prefers [Button, MenuItem, ListItem] over a
-/// same-named label; without that, a caption sitting next to a button steals the
-/// match and the caller presses nothing.
-fn role_priority(control_type: &str) -> u8 {
-    match control_type {
-        "Button" | "PushButton" => 3u8,
-        "MenuItem" | "ListItem" | "PageTab" => 2,
-        _ => 1,
-    }
-}
-
-/// Whether a candidate displaces the incumbent, where "nothing yet" loses to
-/// anything. Strictly greater keeps the *first* node among equals, so the answer
-/// does not change when two identical siblings swap places between observations.
-fn beats(incumbent: Option<u8>, candidate: u8) -> bool {
-    match incumbent {
-        Some(held) => candidate > held,
-        None => true,
-    }
-}
-
-/// The best match seen so far, split into exact and partial buckets.
-#[derive(Default)]
-struct MatchWinner {
-    exact: Option<(u8, UiNode)>,
-    partial: Option<(u8, UiNode)>,
-}
-
-impl MatchWinner {
-    fn consider(&mut self, needle: &str, node: &UiNode) {
-        if node.name.is_empty() || node.rect.2 <= 0 || node.rect.3 <= 0 {
-            return;
-        }
-        let priority = role_priority(&node.control_type);
-        let hay = node.name.to_lowercase();
-        if hay == needle {
-            if beats(self.exact.as_ref().map(|(held, _)| *held), priority) {
-                self.exact = Some((priority, node.clone()));
-            }
-        } else if hay.contains(needle)
-            && beats(self.partial.as_ref().map(|(held, _)| *held), priority)
-        {
-            self.partial = Some((priority, node.clone()));
-        }
-    }
-
-    fn finish(self) -> Option<UiNode> {
-        self.exact.or(self.partial).map(|(_, node)| node)
-    }
-}
-
-/// Choose which of the *visited* controls a query meant.
-///
-/// Consuming every node is the point: cutting the walk short at the first exact
-/// hit returns whichever same-named control the tree happens to list first, and a
-/// Label -- which has no action to fire -- often comes first, because that is
-/// what a GTK button's own caption looks like from the outside.
-fn pick(needle: &str, visited: impl Iterator<Item = UiNode>) -> Option<UiNode> {
-    let needle = needle.to_lowercase();
-    let mut winner = MatchWinner::default();
-    for node in visited {
-        winner.consider(&needle, &node);
-    }
-    winner.finish()
-}
-
-pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiNode>> {
-    let mut visited = Vec::new();
-    walk(max_nodes, max_depth, &mut |_, node, _, _| {
-        visited.push(node.clone());
-        false
-    })?;
-    Ok(pick(name, visited.into_iter()))
-}
-
-/// The walk ran out of tree before it met the control.
-///
-/// `Ok(None)` means "this control does not expose that pattern", and callers act
-/// on it by falling back to coordinates. A search that stopped early is a
-/// different fact, and dressing it up as that one is how a capped walk turns into
-/// a click on the wrong pixel.
-fn capped(name: &str, action: &str, visited: usize, max_nodes: usize, max_depth: usize) -> Error {
-    Error::Lookup(format!(
-        "did not reach {action} on {name:?}: the walk stopped after {visited} node(s) at depth {max_depth} with the tree still truncated (max_nodes={max_nodes}); raise max_nodes, or fall back to coordinates knowingly -- this is not \"the control lacks the pattern\""
-    ))
-}
-
-/// Why a name-based action that fired nothing should say what it says.
-///
-/// Kept apart from the walk so the ordering has a test. Silence outranks a
-/// truncated walk because meeting the control and getting no reply is the more
-/// specific fact; `None` is left for the one case where `Ok(None)` is honest,
-/// namely a walk that finished and found the control without the pattern.
-fn action_miss(
-    name: &str,
-    action: &str,
-    silence: Option<&str>,
-    walked: &WalkReport,
-    max_nodes: usize,
-    max_depth: usize,
-) -> Option<Error> {
-    if let Some(reason) = silence {
-        return Some(unanswered_call(action, name, reason));
-    }
-    if walked.truncated {
-        return Some(capped(name, action, walked.visited, max_nodes, max_depth));
-    }
-    None
-}
-
 /// Read one control's state without a second walk, swallowing a failed read.
 ///
 /// A failed readback is not an error: the action it follows already answered. It
@@ -819,164 +723,6 @@ fn read_state(conn: &Connection, node: &UiNode, dest: &str, path: &str) -> Optio
     state_words(conn, dest, path)
         .ok()
         .map(|words| decode_state(node, &words))
-}
-
-/// Fire the control's first AT-SPI action (usually "click"/"press").
-///
-/// A control nobody answered is an `Err`, not `Ok(None)`: the caller's documented
-/// response to `None` is a coordinate click, and dropping to coordinates because a
-/// toolkit was silent is exactly the mistake this backend keeps having to unmake.
-pub fn invoke(name: &str) -> Result<Option<ActionReport>> {
-    invoke_with(
-        name,
-        crate::DEFAULT_ACTION_NODES,
-        crate::DEFAULT_ACTION_DEPTH,
-    )
-}
-
-/// [`invoke`] with the traversal limits spelled out.
-pub fn invoke_with(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<ActionReport>> {
-    let mut hit = None;
-    let mut silence: Option<String> = None;
-    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
-        if node.name != name || node.rect.2 <= 0 {
-            return false;
-        }
-        // Read the control before firing it. "The pattern answered" and "the
-        // control did something" are two facts, and the audit found a panel button
-        // that gave the first answer while opening nothing.
-        let before = read_state(conn, node, dest, path);
-        let dest_owned = dest.to_string();
-        let path_owned = path.to_string();
-        match attempted(conn, dest, move |conn| {
-            proxy_call::<bool, _>(
-                &conn,
-                &dest_owned,
-                &path_owned,
-                "org.a11y.atspi.Action",
-                "DoAction",
-                &(0i32,),
-            )
-        }) {
-            // DoAction answers with its own success boolean, so a reply of
-            // `false` is "the toolkit refused", not "the control fired": only the
-            // first counts as an invoke.
-            Attempt::Answered(true) => {
-                let mut after = read_state(conn, node, dest, path);
-                let mut effect = crate::judge_effect(before.as_ref(), after.as_ref());
-                if effect == Effect::Unchanged {
-                    // One bounded re-read: a toolkit that updates on the next paint
-                    // looks untouched to a call made immediately after the action.
-                    std::thread::sleep(Duration::from_millis(crate::EFFECT_SETTLE_MS));
-                    after = read_state(conn, node, dest, path);
-                    effect = crate::judge_effect(before.as_ref(), after.as_ref());
-                }
-                hit = Some(ActionReport {
-                    node: node.clone(),
-                    effect,
-                    state: after,
-                });
-                return true;
-            }
-            Attempt::Answered(false) => {}
-            Attempt::Unanswered(reason) => {
-                silence = Some(reason);
-            }
-            Attempt::NoPattern(_) => {}
-        }
-        false
-    })?;
-    if hit.is_none() {
-        if let Some(miss) = action_miss(
-            name,
-            "invoke",
-            silence.as_deref(),
-            &report,
-            max_nodes,
-            max_depth,
-        ) {
-            return Err(miss);
-        }
-    }
-    Ok(hit)
-}
-
-/// Replace text through the EditableText interface. See [`invoke`] for why a
-/// silent toolkit is an `Err` here rather than a `None`.
-pub fn set_value(name: &str, text: &str) -> Result<Option<ActionReport>> {
-    set_value_with(
-        name,
-        text,
-        crate::DEFAULT_ACTION_NODES,
-        crate::DEFAULT_ACTION_DEPTH,
-    )
-}
-
-/// [`set_value`] with the traversal limits spelled out.
-///
-/// The verdict here is `unverifiable` on this backend, not because the write did
-/// not happen but because reading a field's text needs the Text interface, which
-/// `control_state` does not query yet (see ROADMAP). `Changed` is only claimed when
-/// the control answers with the exact text asked for.
-pub fn set_value_with(
-    name: &str,
-    text: &str,
-    max_nodes: usize,
-    max_depth: usize,
-) -> Result<Option<ActionReport>> {
-    let mut hit = None;
-    let mut silence: Option<String> = None;
-    let report = walk(max_nodes, max_depth, &mut |conn, node, dest, path| {
-        if node.name != name || node.rect.2 <= 0 {
-            return false;
-        }
-        let dest_owned = dest.to_string();
-        let path_owned = path.to_string();
-        let text_owned = text.to_string();
-        match attempted(conn, dest, move |conn| {
-            // SetTextContents answers with a boolean. Decoding it as nothing
-            // made a call that the toolkit *had* applied look like a control
-            // without the interface, which is the opposite of what the caller
-            // needs to know.
-            proxy_call::<bool, _>(
-                &conn,
-                &dest_owned,
-                &path_owned,
-                "org.a11y.atspi.EditableText",
-                "SetTextContents",
-                &(text_owned,),
-            )
-        }) {
-            Attempt::Answered(true) => {
-                let state = read_state(conn, node, dest, path);
-                hit = Some(ActionReport {
-                    node: node.clone(),
-                    effect: crate::judge_text_effect(state.as_ref(), text),
-                    state,
-                });
-                return true;
-            }
-            Attempt::Answered(false) => {}
-            Attempt::Unanswered(reason) => {
-                silence = Some(reason);
-            }
-            Attempt::NoPattern(_) => {}
-        }
-        false
-    })?;
-    if hit.is_none() {
-        if let Some(miss) = action_miss(
-            name,
-            "set_value",
-            silence.as_deref(),
-            &report,
-            max_nodes,
-            max_depth,
-        ) {
-            return Err(miss);
-        }
-    }
-    Ok(hit)
 }
 
 /// `AtspiStateType` ordinals, counted from the enum in at-spi2-core's
@@ -1101,28 +847,178 @@ fn state_words(conn: &Connection, dest: &str, path: &str) -> Result<Vec<u32>> {
     }
 }
 
-/// Read one control's state by accessible name.
+/// One node the walk reached, kept with what is needed to act on it again.
 ///
-/// An off-screen control is still returned: `offscreen: true` is the answer the
-/// caller needs, and refusing to look it up would push them into clicking a
-/// coordinate for a control we can describe.
-pub fn state(name: &str) -> Result<Option<crate::ControlState>> {
-    let mut found = None;
-    let mut failure: Option<Error> = None;
-    walk(600, 10, &mut |conn, node, dest, path| {
-        if node.name != name {
-            return false;
-        }
-        match state_words(conn, dest, path) {
-            Ok(words) => found = Some(decode_state(node, &words)),
-            Err(e) => failure = Some(e),
-        }
-        true
+/// The identity is the `(bus name, object path)` pair the node was read through,
+/// which is exact. After a resolution there is deliberately no second lookup by
+/// name: that lookup would re-apply the ambiguous question to a tree that may have
+/// changed in between, which is how an address ends up on a different control.
+pub struct Hit {
+    pub node: UiNode,
+    pub dest: String,
+    pub path: String,
+}
+
+/// Say why the caller could not be answered, in the words it has to act on.
+fn miss_error(miss: crate::target::Miss, walked: &WalkReport) -> Error {
+    // One wording for both backends: a caller must not have to learn two
+    // vocabularies for the same refusal.
+    crate::miss_error(miss, walked.visited, walked.truncated)
+}
+
+/// Resolve a `Target` against a live tree and act on the one node it names.
+fn with_hit<T>(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+    act: impl FnOnce(&Connection, &Hit) -> Result<T>,
+) -> Result<T> {
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut lines: Vec<Vec<String>> = Vec::new();
+    let report = walk(
+        max_nodes,
+        max_depth,
+        &mut |_, node, dest, path, ancestors| {
+            hits.push(Hit {
+                node: node.clone(),
+                dest: dest.to_string(),
+                path: path.to_string(),
+            });
+            lines.push(ancestors.to_vec());
+            false
+        },
+    )?;
+    let facts: Vec<crate::target::Facts<'_>> = hits
+        .iter()
+        .zip(lines.iter())
+        .map(|(hit, ancestors)| crate::target::Facts {
+            name: &hit.node.name,
+            role: &hit.node.control_type,
+            automation_id: &hit.node.automation_id,
+            ancestors,
+        })
+        .collect();
+    let chosen = crate::target::select(&facts, target).map_err(|miss| miss_error(miss, &report))?;
+    let hit = &hits[chosen];
+    let conn = a11y_connection()?;
+    act(&conn, hit)
+}
+
+/// Find the one control a target names, without acting.
+pub fn find_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<UiNode> {
+    let mut picked: Option<UiNode> = None;
+    with_hit(target, max_nodes, max_depth, |_, hit| {
+        picked = Some(hit.node.clone());
+        Ok(())
     })?;
-    match failure {
-        Some(e) => Err(e),
-        None => Ok(found),
-    }
+
+    // `with_hit` always resolves to exactly one node or returns an error, so the
+    // only way this is None is a walk that produced no hits -- which select would
+    // have reported. Unwrapping is a lie in that case; say what happened.
+    picked.ok_or_else(|| Error::Lookup(format!("no control matched {:?}", target.name)))
+}
+
+/// Read the state of the one control a target names.
+pub fn state_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<crate::ControlState>> {
+    with_hit(target, max_nodes, max_depth, |conn, hit| {
+        Ok(state_words(conn, &hit.dest, &hit.path)
+            .ok()
+            .map(|words| decode_state(&hit.node, &words)))
+    })
+}
+
+/// Fire the action of the one control a target names.
+///
+/// `None` keeps its old, single meaning: the walk reached this control and it does
+/// not expose the pattern. Anything else -- nobody answered, the search ran out, the
+/// name was ambiguous -- is an `Err`, because the caller's move for those is a
+/// coordinate click and that is the wrong move for all three.
+pub fn invoke_target(
+    target: &crate::target::Target,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<ActionReport>> {
+    with_hit(target, max_nodes, max_depth, |conn, hit| {
+        let before = read_state(conn, &hit.node, &hit.dest, &hit.path);
+        let dest = hit.dest.clone();
+        let path = hit.path.clone();
+        match attempted(conn, &hit.dest, move |conn| {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest,
+                &path,
+                "org.a11y.atspi.Action",
+                "DoAction",
+                &(0i32,),
+            )
+        }) {
+            Attempt::Answered(true) => {
+                let mut after = read_state(conn, &hit.node, &hit.dest, &hit.path);
+                let mut effect = crate::judge_effect(before.as_ref(), after.as_ref());
+                if effect == Effect::Unchanged {
+                    std::thread::sleep(Duration::from_millis(crate::EFFECT_SETTLE_MS));
+                    after = read_state(conn, &hit.node, &hit.dest, &hit.path);
+                    effect = crate::judge_effect(before.as_ref(), after.as_ref());
+                }
+                Ok(Some(ActionReport {
+                    node: hit.node.clone(),
+                    effect,
+                    state: after,
+                }))
+            }
+            // The toolkit answered "no". That is a refusal, not a missing pattern,
+            // and it is reported as nothing happened rather than as success.
+            Attempt::Answered(false) => Ok(None),
+            Attempt::Unanswered(reason) => Err(unanswered_call("invoke", &hit.node.name, &reason)),
+            Attempt::NoPattern(_) => Ok(None),
+        }
+    })
+}
+
+/// Set the text of the one control a target names.
+pub fn set_value_target(
+    target: &crate::target::Target,
+    text: &str,
+    max_nodes: usize,
+    max_depth: usize,
+) -> Result<Option<ActionReport>> {
+    with_hit(target, max_nodes, max_depth, |conn, hit| {
+        let dest = hit.dest.clone();
+        let path = hit.path.clone();
+        let owned = text.to_string();
+        match attempted(conn, &hit.dest, move |conn| {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest,
+                &path,
+                "org.a11y.atspi.EditableText",
+                "SetTextContents",
+                &(owned,),
+            )
+        }) {
+            Attempt::Answered(true) => {
+                let state = read_state(conn, &hit.node, &hit.dest, &hit.path);
+                Ok(Some(ActionReport {
+                    node: hit.node.clone(),
+                    effect: crate::judge_text_effect(state.as_ref(), text),
+                    state,
+                }))
+            }
+            Attempt::Answered(false) => Ok(None),
+            Attempt::Unanswered(reason) => {
+                Err(unanswered_call("set_value", &hit.node.name, &reason))
+            }
+            Attempt::NoPattern(_) => Ok(None),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1232,46 +1128,44 @@ mod tests {
     }
 
     #[test]
-    fn the_button_wins_over_the_label_listed_before_it() {
-        // The probe window is exactly this shape: a bare label, then a button
-        // with the same accessible name.
-        let visited = vec![
-            node("Label", "probe-ambiguous"),
-            node("Button", "probe-ambiguous"),
+    fn two_controls_with_one_name_are_refused_not_picked() {
+        // The probe window is a label then a button with the same accessible name.
+        // #11 batch 1 answered this by preferring the button; that is the engine
+        // choosing on the caller's behalf, which is how a slightly wrong guess
+        // lands on a control nobody named. Ambiguity is the answer now, and the
+        // way out is for the caller to say which one it meant.
+        let held = [
+            crate::target::Facts {
+                name: "probe-ambiguous",
+                role: "Label",
+                automation_id: "",
+                ancestors: &[],
+            },
+            crate::target::Facts {
+                name: "probe-ambiguous",
+                role: "Button",
+                automation_id: "",
+                ancestors: &[],
+            },
         ];
-        let hit = pick("probe-ambiguous", visited.into_iter()).expect("a match");
-        assert_eq!(hit.control_type, "Button", "the actionable role must win");
-    }
-
-    #[test]
-    fn an_exact_name_beats_a_more_actionable_partial_one() {
-        let visited = vec![
-            node("Button", "probe-submit-now"),
-            node("MenuItem", "submit"),
-        ];
-        let hit = pick("submit", visited.into_iter()).expect("a match");
-        assert_eq!(hit.name, "submit", "exact outranks role");
-    }
-
-    #[test]
-    fn among_equals_the_first_seen_still_wins() {
-        let mut left = node("Button", "OK");
-        left.automation_id = "left".into();
-        let mut right = node("Button", "OK");
-        right.automation_id = "right".into();
-        let hit = pick("ok", vec![left, right].into_iter()).expect("a match");
+        let bare = crate::target::Target::by_name("probe-ambiguous");
+        match crate::target::select(&held, &bare) {
+            Err(crate::target::Miss::Ambiguous { candidates }) => {
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected an ambiguity, got {other:?}"),
+        }
+        let aimed = crate::target::Target {
+            name: "probe-ambiguous".into(),
+            role: Some("Button".into()),
+            nth: None,
+            container: None,
+        };
         assert_eq!(
-            hit.automation_id, "left",
-            "ties must not churn between observations"
+            crate::target::select(&held, &aimed),
+            Ok(1),
+            "naming the role ends the ambiguity"
         );
-    }
-
-    #[test]
-    fn unnamed_and_off_screen_controls_are_not_candidates() {
-        let mut zero_width = node("Button", "OK");
-        zero_width.rect = (0, 0, 0, 40);
-        let blank = node("Button", "");
-        assert!(pick("ok", vec![zero_width, blank].into_iter()).is_none());
     }
 
     /// A state set the way the D-Bus reply carries it: one u32 per 32 ordinals.
@@ -1382,31 +1276,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_capped_search_blames_the_cap_not_the_control() {
-        // The whole point of item 7: this message is what keeps a caller from
-        // reading "no pattern" and dropping to a coordinate click.
-        let message = capped("probe-entry", "set_value", 1, 1, 10).to_string();
-        assert!(
-            message.starts_with("accessibility lookup failed: "),
-            "the label must not send the reader to a screenshot problem: {message}"
-        );
-        assert!(
-            message.contains("did not reach set_value on \"probe-entry\""),
-            "{message}"
-        );
-        assert!(message.contains("after 1 node(s)"), "{message}");
-        assert!(message.contains("max_nodes=1"), "{message}");
-        assert!(
-            message.contains("not \"the control lacks the pattern\""),
-            "must name the misreading it is preventing: {message}"
-        );
-        assert!(
-            !message.to_lowercase().contains("no such pattern"),
-            "the old wording must not survive in the new one"
-        );
-    }
-
     fn readable(toggle: Option<&str>, expanded: Option<&str>) -> crate::ControlState {
         crate::ControlState {
             name: "probe-toggle".to_string(),
@@ -1417,14 +1286,6 @@ mod tests {
             value: None,
             expanded: expanded.map(str::to_string),
             range_value: None,
-        }
-    }
-
-    fn walked(truncated: bool, visited: usize) -> WalkReport {
-        WalkReport {
-            truncated,
-            visited,
-            unreadable: Vec::new(),
         }
     }
 
@@ -1540,37 +1401,33 @@ mod tests {
     }
 
     #[test]
-    fn silence_outranks_a_truncated_walk_in_the_answer() {
-        let miss = action_miss(
-            "probe-toggle",
-            "invoke",
-            Some("no reply within 1200ms"),
-            &walked(true, 600),
-            600,
-            10,
-        )
-        .unwrap()
-        .to_string();
-        assert!(miss.contains("did not get an answer"), "{miss}");
+    fn a_walk_that_ran_out_cannot_claim_there_is_no_such_control() {
+        let miss = crate::target::Miss::NotFound {
+            searched: "\"probe-entry\"".into(),
+            nearby: Vec::new(),
+        };
+        let message = crate::miss_error(miss, 1, true).to_string();
+        assert!(message.contains("did not reach"), "{message}");
+        assert!(message.contains("after 1 node(s)"), "{message}");
+        assert!(message.contains("raise max_nodes"), "{message}");
         assert!(
-            !miss.contains("did not reach"),
-            "meeting the control is the more specific fact: {miss}"
+            !message.contains("re-running will not resolve it"),
+            "raising the cap is exactly a fresh look: {message}"
         );
     }
 
     #[test]
-    fn a_walk_that_ran_out_without_silence_blames_the_cap() {
-        let miss = action_miss("probe-toggle", "invoke", None, &walked(true, 1), 1, 10)
-            .unwrap()
-            .to_string();
-        assert!(miss.contains("did not reach"), "{miss}");
-    }
-
-    #[test]
-    fn a_walk_that_finished_and_found_nothing_is_not_an_error() {
-        // The one case where Ok(None) is the honest answer: the control was seen and
-        // does not expose the pattern.
-        assert!(action_miss("probe-toggle", "invoke", None, &walked(false, 42), 600, 10).is_none());
+    fn an_ambiguity_says_retrying_will_not_help() {
+        let miss = crate::target::Miss::Ambiguous {
+            candidates: vec!["Label \"OK\"".into(), "Button \"OK\"".into()],
+        };
+        let message = crate::miss_error(miss, 42, false).to_string();
+        assert!(message.contains("2 controls match"), "{message}");
+        assert!(
+            message.contains("re-running will not resolve it"),
+            "{message}"
+        );
+        assert!(!message.contains("did not reach"), "{message}");
     }
 
     #[test]

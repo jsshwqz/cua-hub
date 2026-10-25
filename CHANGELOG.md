@@ -6,6 +6,43 @@
 
 ## Unreleased — 已合入分支，尚未发版
 
+### 身份寻址：歧义报错，解析到的节点就是动手的节点（PR #37）
+
+`find_control` / `invoke_control` / `set_control_text` / `control_state` 以前按名字找，
+引擎在同名里挑"更像能点的"（AT-SPI 的 `role_priority`）或按固定控件类型顺序
+`FindFirst`（UIA 的 50000/50011/50007）。那等于替调用方猜：猜错时点击落在对方从未点名的
+控件上，而且调用方无从得知。
+
+现在四个工具接受 `target`：`name`（不区分大小写子串、`re:` 正则、或
+`id:<AutomationId>`）加可选 `role` / `container` / `nth`（0 起）。命中多于一个**一律报错
+并列出候选**，由调用方用 role/container/nth 说清楚；字符串 `name` 仍是
+`{"target":{"name":...}}` 的简写，两者同时给会被拒绝。`id:` 走同一套匹配（精确、非前缀），
+空名的 Win32 控件地址不变。
+
+解析与动手是**同一个节点**：AT-SPI 用走到的 `(bus name, object path)`，UIA 用
+RawViewWalker 走到的元素，解析之后不再按名二次查找（二次查找会把一个已经有歧义的问题
+再问一遍可能已经变动的树）。UIA 的候选限制在 control element，与 `window_state` 展示的
+集合一致；`ancestors` 最近优先，供 `container` 过滤。
+
+- **行为回退的纠正**：`find_control {name: probe-ambiguous}` 从"返回按钮"改为报歧义；
+  `{target:{name:"probe-ambiguous",role:"Button"}}` 才拿到按钮。`linux-atspi-runtime.py`
+  用这两条钉住，`aligned` 与 `mismatch` 两个场景都跑。红 run
+  [40208064523](https://github.com/jsshwqz/cua-hub/actions/runs/40208064523)，绿 run
+  [40210705098](https://github.com/jsshwqz/cua-hub/actions/runs/40210705098)（67 PASS / 0 FAIL）。
+- **连带变化**：`name` 是子串，所以 `probe-menu` 同时命中 `probe-menu-item`。运行时脚本
+  那条 invoke 改为 `{target:{name:"probe-menu",role:"ToggleButton"}}`，不再依赖"精确名
+  优先"这条已删除的隐含规则。真实桌面同理：`开始` 会同时命中两个 `开始学习` 链接，现在
+  报歧义而不是替你选"开始"按钮。
+- 截断的 walk 继续报 `did not reach`（不是"没有这个控件/没有这个模式"）；歧义与 `nth`
+  越界明说重跑不会改变。两个后端共用同一套措辞。
+- **代价（不藏在"更准"后面）**：Windows 动作从按名 `FindFirst` 改为每次动作走一遍树。
+  本机 Windows 10、约 2300 个 control-view 节点的桌面、debug 构建、单轮测量：`find` 约 15s；
+  同轮同规模的 control-view 快照约 14s——成本在树的大小，不在 walker 本身。共享机上有
+  并发任务，这组数字用于说明量级，不作为基准；release 未单独取数。
+- 本机 Windows workspace 测试 192 passed / 2 ignored；`cargo fmt --check` 与
+  `clippy --all-targets -D warnings` 干净；CI `test (ubuntu-24.04)` / `test (windows-latest)`
+  在 47ce157、f520201 与最终提交上均绿（Linux 侧计数以 CI 自己的输出为准）。
+
 ### 修复：Anthropic 会话被解析失败的 tool_use 毒化（issue #9）
 
 一个不支持的动作原本会**让整个任务必死**。`computer_20250124` 的
