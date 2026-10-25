@@ -5282,4 +5282,57 @@ mod tests {
         );
         assert_eq!(recovered.node.index, 5);
     }
+
+    fn error_text(value: &Value) -> &str {
+        value["content"][0]["text"]
+            .as_str()
+            .expect("tool errors carry text")
+    }
+
+    #[test]
+    fn a_target_and_a_name_together_are_refused() {
+        // Double addressing is the failure this stage exists to remove: one of
+        // the two would silently win and the caller would never learn which.
+        let err = target_arg(&json!({
+            "target": {"name": "ok"},
+            "name": "ok"
+        }))
+        .expect_err("both addresses must be refused");
+        assert!(
+            error_text(&err).contains("not both"),
+            "{}",
+            error_text(&err)
+        );
+    }
+
+    #[test]
+    fn the_name_shorthand_is_still_a_complete_target() {
+        let target = target_arg(&json!({"name": "probe-toggle"})).expect("shorthand resolves");
+        assert_eq!(
+            target,
+            cua_engine_access::target::Target::by_name("probe-toggle")
+        );
+    }
+
+    #[test]
+    fn a_missing_address_says_what_to_send() {
+        let err = target_arg(&json!({})).expect_err("neither address is not a target");
+        assert!(
+            error_text(&err).contains("missing `target`"),
+            "{}",
+            error_text(&err)
+        );
+    }
+
+    #[test]
+    fn a_target_refuses_the_fields_that_double_address_it() {
+        // `index` inside a target is the stale-index shortcut in new clothing.
+        let err = target_arg(&json!({"target": {"name": "ok", "index": 4}}))
+            .expect_err("unknown fields must not be ignored");
+        assert!(
+            error_text(&err).contains("index"),
+            "say which field was refused: {}",
+            error_text(&err)
+        );
+    }
 }
