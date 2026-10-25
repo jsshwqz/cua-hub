@@ -63,6 +63,21 @@ class Probe(Gtk.Window):
         self.ambiguous = Gtk.Button(label="probe-ambiguous")
         box.pack_start(self.ambiguous, False, False, 0)
 
+        # A control whose entire job is to pop up a menu. DoAction answers either
+        # way, which is the shape the audit hit on the Xfce panel: the reply cannot
+        # tell the caller whether anything appeared. The popup's own item gets an
+        # accessible name so the assertion can check the verdict against the tree
+        # instead of against the reply.
+        self.menu = Gtk.MenuButton()
+        self.menu.get_accessible().set_name("probe-menu")
+        popup = Gtk.Menu()
+        item = Gtk.MenuItem(label="probe-menu-item")
+        item.get_accessible().set_name("probe-menu-item")
+        popup.append(item)
+        popup.show_all()
+        self.menu.set_popup(popup)
+        box.pack_start(self.menu, False, False, 0)
+
         self.add(box)
         self.connect("destroy", Gtk.main_quit)
 

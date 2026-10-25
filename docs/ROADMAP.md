@@ -126,7 +126,7 @@
   序号表照 at-spi2-core 的 `atspi-constants.h` 数出来：第一份文档给的 VISIBLE/HORIZONTAL
   各差一位，而这种错位不会报错，只会把一个状态读成另一个。probe 因此让 GTK 自己写
   `toggled` 信号当独立 oracle——总线的数字不等于控件的真相。
-  **还差**：`invoke` 后的效果校验（第 8 项）——第 7 项（写死的 600/10 与 `None` 的含义）见下面一条。
+  **还差**：~~`invoke` 后的效果校验（第 8 项）~~ 已做，见下面第 8 项一条——第 7 项（写死的 600/10 与 `None` 的含义）见再下面一条。
 - [x] 动作路径同样上期限，并且不再把沉默说成"不支持"（#28 自留边界的收尾）：
   `DoAction` / `SetTextContents` / `GetState` 走同一个 `timed` 期限；结果分三类
   （答了 / 没这个接口 / 没人答），只有第三类变成 `Error::Lookup` 并写明
@@ -138,6 +138,26 @@
   `if let Some(reason) = silence { .. }` 整段删掉，本机 24 条测试仍全绿（`invoke_with` 要真总线
   才能跑，本机没有可控的装死目标）。第 8 项要么把这段决定抽成纯函数补钉，要么在真机上造一个
   可控装死目标；我倾向前者，不依赖 CI 时序。
+  **已按前者关掉**（第 8 项那条）：判定抽成 `action_miss(...)` 纯函数 + 三条本机单测
+  （沉默优先于截断、走完且没找到才是合法的 `Ok(None)`）。仍然没有钉子的是"遍历真的调用了它"
+  这一层——那一格只有真机能看，靠 CI 里那三条守卫守着，脚本注释已写明它们为什么不算证据。
+- [x] `invoke` 之后给出效果裁决（issue #11 第 8 项，契约定为**报告，不改成功语义**）：
+  `invoke` / `set_value` 返回 `ActionReport { node, effect, state }`，`effect` =
+  `changed` / `unchanged` / `unverifiable`，由共用纯函数 `judge_effect` 从控件自己发布的状态前后对比得出。
+  三条口径是这套裁决的全部要点：① 读不回**不是**"没变"（否则会把调用方劝退一次正当的重试）；
+  ② 普通按钮没有 toggle/expanded，只能说 `unverifiable`，不能说 `unchanged`——后者一旦常见到
+  就是假阴性洪水，而一个经常错的判据会被忽略，原 bug 正是这样被信任下来的；
+  ③ 回读失败不推翻已答的动作，所以读不到时是 `unverifiable` 而不是 `Err`。
+  `set_control_text` 用 `judge_text_effect` 判"字段里是不是要的那段文字"；Linux 没接 Text 接口，
+  因此那边诚实报 `unverifiable`，不拿 `SetTextContents` 回 true 冒充写进去了。
+  验证分三层：本机 10 条纯函数单测；**Windows 真机**用 WinForms 自写日志当独立 oracle
+  （自禁用按钮→`changed`、只写日志的按钮→`unverifiable` 且动作确实发生、效果落在别的控件→`unverifiable`）；
+  **Linux 真机**给夹具加 `Gtk.MenuButton`，断言是 `effect=changed` 当且仅当菜单项进了树——
+  跟独立的树证据比，而不是跟自己的回复比。
+  **`unchanged` 至今没有真机样本**：GTK 的 MenuButton 被 `DoAction` 真的开了菜单（走 `changed`），
+  Windows 的普通按钮不发布状态位（走 `unverifiable`）。那一格目前只有本机单测钉住语义，
+  补它需要一个"发布状态、能走 Invoke、答了却不动"的真实控件（审计那台 Xfce 面板就是这种），
+  不是能凭空造的夹具——把夹具改成"故意不开"是在造我想让它红的样本，不算证据。
 - [x] AT-SPI 读不到时不再无声（issue #11 第 6 项，契约定为**带诊断的部分成功**）：
   `UiSnapshot` 多一本 `unreadable` 账（bus + 对象路径 + 哪几个读没应答），
   `accessibility_tree` 树尾点名（最多 6 条再给计数）、`window_state` 里条件性出现

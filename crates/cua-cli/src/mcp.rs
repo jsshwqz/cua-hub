@@ -366,6 +366,40 @@ fn action_limits(args: &Value) -> (usize, usize) {
     )
 }
 
+/// Phrase what an action visibly did, from the state read back off the control.
+///
+/// `unchanged` is not "failed": the audit's panel button answered the pattern and
+/// opened nothing, and a caller has to be able to see that difference without
+/// taking a screenshot. `unverifiable` says the readback was unavailable, which is
+/// a statement about this platform, not about the action.
+fn effect_note(report: &cua_engine_access::ActionReport, text_write: bool) -> String {
+    let mut readback = Vec::new();
+    if let Some(state) = &report.state {
+        if let Some(toggle) = &state.toggle {
+            readback.push(format!("toggle={toggle}"));
+        }
+        if let Some(expanded) = &state.expanded {
+            readback.push(format!("expanded={expanded}"));
+        }
+        if let Some(value) = &state.value {
+            let shown: String = value.chars().take(40).collect();
+            readback.push(format!("value={shown:?}"));
+        }
+    }
+    if readback.is_empty() {
+        readback.push(if text_write {
+            "this platform cannot read the field's text back".to_string()
+        } else {
+            "no readable state on this control".to_string()
+        });
+    }
+    format!(
+        "; effect={} ({})",
+        report.effect.as_str(),
+        readback.join(" ")
+    )
+}
+
 fn required_str(args: &Value, key: &str) -> std::result::Result<String, Value> {
     args[key]
         .as_str()
@@ -1620,11 +1654,12 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             let (max_nodes, max_depth) = action_limits(args);
             match cua_engine_access::set_value_with(&name, &text, max_nodes, max_depth) {
-                Ok(Some(node)) => tool_ok(format!(
-                    "set text of {} \"{}\" ({} chars)",
-                    node.control_type,
-                    node.name,
-                    text.chars().count()
+                Ok(Some(report)) => tool_ok(format!(
+                    "set text of {} \"{}\" ({} chars){}",
+                    report.node.control_type,
+                    report.node.name,
+                    text.chars().count(),
+                    effect_note(&report, true)
                 )),
                 Ok(None) => tool_err(format!(
                     "control {name:?} has no Value/EditableText pattern; focus it and use type_text"
@@ -1663,9 +1698,11 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 ));
             };
             match cua_engine_access::invoke(&selector) {
-                Ok(Some(invoked)) => tool_ok(format!(
-                    "invoked {} \"{}\" via accessibility pattern",
-                    invoked.control_type, invoked.name
+                Ok(Some(report)) => tool_ok(format!(
+                    "invoked {} \"{}\" via accessibility pattern{}",
+                    report.node.control_type,
+                    report.node.name,
+                    effect_note(&report, false)
                 )),
                 Ok(None) => {
                     let (x, y, w, h) = resolved.node.rect;
@@ -1716,9 +1753,11 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 ));
             };
             match cua_engine_access::set_value(&selector, &text) {
-                Ok(Some(set)) => tool_ok(format!(
-                    "set {} \"{}\" via Value/EditableText",
-                    set.control_type, set.name
+                Ok(Some(report)) => tool_ok(format!(
+                    "set {} \"{}\" via Value/EditableText{}",
+                    report.node.control_type,
+                    report.node.name,
+                    effect_note(&report, true)
                 )),
                 Ok(None) => tool_err(format!(
                     "control at index {index} has no Value/EditableText pattern; use type_text"
@@ -1825,10 +1864,12 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             // immune to overlapping windows.
             let (max_nodes, max_depth) = action_limits(args);
             match cua_engine_access::invoke_with(&name, max_nodes, max_depth) {
-                Ok(Some(node)) => {
+                Ok(Some(report)) => {
                     return tool_ok(format!(
-                        "invoked {} \"{}\" via accessibility pattern",
-                        node.control_type, node.name
+                        "invoked {} \"{}\" via accessibility pattern{}",
+                        report.node.control_type,
+                        report.node.name,
+                        effect_note(&report, false)
                     ))
                 }
                 Ok(None) => {}

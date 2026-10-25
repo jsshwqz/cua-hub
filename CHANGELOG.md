@@ -307,6 +307,67 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
   负控：把 `classify` 的 `NoReply` 分支折回 `NoPattern`（= 修复前的形状），
   `a_silent_toolkit_is_not_reported_as_a_missing_pattern` 立刻红。
 
+### 新增：invoke 之后回读控件状态，给出效果裁决（issue #11 第 8 项）
+
+审计的实证是 Xfce 面板的 Applications 按钮：`DoAction` 答了、菜单没开、树里没有菜单项，
+而工具无条件报 `invoked ... via accessibility pattern`。**"模式答了"和"控件做了事"是两件事**，
+只把前者当成功交付，依赖成功信号的 agent 就会在这类控件上静默失败。
+
+- `invoke` / `set_value` 现在返回 `ActionReport { node, effect, state }`，
+  `effect` 三档：**`changed`**（控件自己某个可读状态动了）、**`unchanged`**（发布了 toggle /
+  expanded 的控件前后一模一样）、**`unverifiable`**（读不回来，或这控件本来就没有可动的状态位）。
+  裁决来自 `judge_effect(before, after)` 这个纯函数，两平台共用一套口径。
+- **`unchanged` 只在有状态可读时才说**：普通按钮没有 toggle / expanded，若把它判成
+  "没变"，那等于每次成功按按钮都报一次假阴性，而一个经常错的判据会被调用方忽略——
+  原来那个 bug 就是这么被信任下来的。这种情况报 `unverifiable`，让调用方去看画面或树。
+- **回读失败不是错误**：动作已经答了才去读状态，读不到就记 `unverifiable`；
+  把整次调用判失败会让人以为动作没做。
+- `set_control_text` 的判据是"字段里最终是不是我要的那段文字"（`judge_text_effect`），
+  不是"值变了"。Linux 侧 `value` 还没接 Text 接口，所以那边诚实报
+  `unverifiable (this platform cannot read the field's text back)`，不借用
+  `SetTextContents` 回了 true 这件事冒充"改好了"。
+- 顺带关掉 #29 记录的那条缺口：**"沉默 → `Err`" 的接线本身没有钉子**。判定抽成
+  `action_miss(name, action, silence, walked, ...)` 纯函数（沉默优先于截断、走完且没找到
+  才是合法的 `Ok(None)`），三条本机单测钉住；原来这两段判断在 `invoke_with` /
+  `set_value_with` 里各写一遍。
+- 期限与冷却（1200ms / 30s）不变；每次回读同样在期限内。`unchanged` 时最多再等 200ms 读一次
+  （`EFFECT_SETTLE_MS`），因为下一帧才更新的工具包会被立刻读成"没变"。
+
+### 测试与验证（issue #11 第 8 项）
+
+- 本机新增 10 条纯函数单测：动了→`changed`、没动→`unchanged`、读不回→`unverifiable`、
+  普通按钮不得冒充 `unchanged`（flood guard）、改名/改类型不算效果、NaN 滑杆不算效果、
+  文字赋值只认"是否等于要的那段"，以及 `action_miss` 的三种次序。workspace **139 passed / 1 ignored**。
+- **Windows 真机自证**（本机，不靠 CI）：一个 WinForms 探针窗口写自己的日志当独立 oracle，
+  三个按钮分别是"只写日志"、"改别的控件"、"把自己禁用"。实测：
+  `cua-flip-self` → `effect=changed`（日志 `flipped:disabled` 独立印证）；
+  `cua-noop` → `effect=unverifiable` 而日志 `noop:clicked` 证明动作确实发生了——
+  这正是审计那种"答了但看不到效果"的形状，现在不再冒充已验证；
+  `cua-toggle-target` → `unverifiable`（效果落在别的控件上，按钮自己读不出来）。
+  `unchanged` 在 Windows 上没有真机样本：普通按钮不发布 toggle / expanded，
+  本机够不到的控件才有；Linux 那一格实际走到了 `changed`（见下一条），所以 **`unchanged` 两平台
+  都没有真机样本**，只有本机单测钉住语义。
+- Linux 真机（CI 图形作业）：夹具新增 `Gtk.MenuButton`（accessible name `probe-menu`），
+  断言不是"跟自己的回复比"，而是**跟树比对**：`effect=changed` 当且仅当菜单项真的进了树。
+  红的那次（run `40147535682`）8 条失败全是新断言，原文点名旧回复里没有裁决：
+  `invoked ToggleButton "probe-menu" via accessibility pattern`（`menu_item_in_tree=True`，
+  也就是"菜单开了但我们报不出这件事"）。绿的那次（run `40147819661`）真机原文：
+
+  ```
+  PASS  invoke reports the effect it read back            [CheckBox "probe-toggle" ...; effect=changed (toggle=on)]
+  PASS  the verdict agrees with whether the menu is on screen [ToggleButton "probe-menu" ...; effect=changed (toggle=on), menu_item_in_tree=True]
+  PASS  invoke_control fires DoAction on the button        [Button "probe-submit" ...; effect=unverifiable (no readable state on this control)]
+  PASS  a text write says it could not be read back here   [Text "probe-entry" ...; effect=unverifiable (this platform cannot read the field's text back)]
+  ```
+
+  **跟预期不一样的地方，如实记下来**：GTK 的 `MenuButton` 被 `DoAction` 真的打开了菜单，
+  所以那一格走 `changed`——审计在 Xfce 面板上撞到的"答了但什么都没出现"，在这两个 CI 的夹具上
+  都不复现。因此 **`unchanged` 至今没有真机样本**（Windows 没有、Linux 也没有），只有本机
+  `an_answered_action_that_moves_nothing_says_unchanged` 钉住它的语义；在那一格拿到真实控件样本之前，
+  它应当被读成"语义已定义、真机未观测"。我没有把夹具改成"故意不开菜单"去凑一个红——那是在造
+  一个我想让它红的样本，而不是在测真实工具包。真实面板控件（普通按钮）走的是 `unverifiable`，
+  那一格两平台都有真机样本（`probe-submit`、`cua-noop`）。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。
