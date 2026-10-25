@@ -624,6 +624,14 @@ const ENSURE_VISIBLE_AND_HIT_TEST_JS: &str = r#"((root, rawSel, allowRemediate) 
     const targetEl = proxy || el;
 
     // Action-internalized scroll
+    if (el.ownerDocument !== document) {
+        try {
+            const host = el.ownerDocument.defaultView.frameElement;
+            if (host) {
+                host.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+            }
+        } catch (e) {}
+    }
     try {
         targetEl.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
     } catch (e) {
@@ -659,9 +667,12 @@ const ENSURE_VISIBLE_AND_HIT_TEST_JS: &str = r#"((root, rawSel, allowRemediate) 
 
     const isHitTarget = (h) => {
         if (!h) return false;
-        return h === targetEl || targetEl.contains(h) || h === el || el.contains(h) ||
-            (targetEl.tagName === 'LABEL' && h === targetEl.control) ||
-            (el.tagName === 'LABEL' && h === el.control);
+        if (h === targetEl || targetEl.contains(h) || h === el || el.contains(h)) return true;
+        if ((targetEl.tagName === 'LABEL' && h === targetEl.control) || (el.tagName === 'LABEL' && h === el.control)) return true;
+        try {
+            if (h.tagName === 'IFRAME' && (h.contentDocument === el.ownerDocument || h.contentDocument === targetEl.ownerDocument)) return true;
+        } catch (e) {}
+        return false;
     };
 
     if (hit && !isHitTarget(hit)) {
@@ -1008,11 +1019,13 @@ impl BrowserSession {
                 if (!el) return {{ found: false }};
                 const tag = (el.tagName || '').toLowerCase();
                 const isCheck = tag === 'input' && (el.type === 'checkbox' || el.type === 'radio');
-                const isRich = el.isContentEditable || tag === 'iframe' || (tag === 'body' && el.ownerDocument !== document);
+                const isIframeEditor = tag === 'iframe' && el.contentDocument && el.contentDocument.body &&
+                    (el.contentDocument.body.isContentEditable || el.contentDocument.designMode === 'on' || el.contentDocument.body.getAttribute('contenteditable') === 'true');
+                const isRich = el.isContentEditable || el.getAttribute('contenteditable') === 'true' || isIframeEditor || (tag === 'body' && el.ownerDocument !== document) || tag === 'iframe';
                 const kind = isRich ? 'contenteditable'
                     : isCheck ? 'checkbox'
                     : tag === 'textarea' ? 'textarea'
-                    : ('value' in el) ? 'input'
+                    : (('value' in el) && (tag === 'input' || tag === 'textarea' || 'form' in el)) ? 'input'
                     : 'other';
                 const num = (v) => (v === null || v === undefined) ? null : v;
                 const aria = el.getAttribute ? el.getAttribute('aria-expanded') : null;
@@ -1171,7 +1184,8 @@ impl BrowserSession {
     /// Place the caret at the **end** of a contenteditable or iframe body, with no selection range.
     ///
     /// Supports both `"replace"` (resetting content) and `"append"` (preserving existing content,
-    /// collapsing to the document end) modes.
+    /// collapsing to the document end) modes. Cross-iframe aware: automatically scrolls and focuses
+    /// the host iframe before targeting the inner editable body using the inner document's own APIs.
     pub async fn focus_end_of_frame(&mut self, selector: &str, mode: &str) -> Result<bool> {
         let script = format!(
             r#"(() => {{
@@ -1203,24 +1217,39 @@ impl BrowserSession {
                         return false;
                     }}
                     target.scrollIntoView({{ block: 'center' }});
+                    target.focus();
                 }} else {{
-                    target.scrollIntoView({{ block: 'center' }});
                     doc = target.ownerDocument || document;
                     win = doc.defaultView || window;
+                    editBody = target;
+                    try {{
+                        const host = win.frameElement;
+                        if (host) {{
+                            host.scrollIntoView({{ block: 'center' }});
+                            host.focus();
+                        }}
+                    }} catch (e) {{}}
+                    target.scrollIntoView({{ block: 'center' }});
                 }}
+
+                if (!doc || !editBody) return false;
+                win.focus();
+                editBody.focus();
 
                 if (mode === "replace") {{
                     editBody.innerHTML = '<p><br></p>';
                 }}
 
-                editBody.focus();
                 const range = doc.createRange();
                 range.selectNodeContents(editBody);
                 range.collapse(false);
                 const sel = win.getSelection();
                 sel.removeAllRanges();
                 sel.addRange(range);
-                return true;
+
+                const inDocActive = doc.activeElement === editBody || editBody.contains(doc.activeElement);
+                const hasRange = sel.rangeCount > 0;
+                return inDocActive || hasRange;
             }})()"#,
             sel = serde_json::to_string(selector)?,
             mode = serde_json::to_string(mode)?,
@@ -1247,7 +1276,9 @@ impl BrowserSession {
     ///
     /// Automatically ensures target input/editor is scrolled into view and visible.
     /// Plain inputs dispatch input and change events for framework reactivity.
-    /// Contenteditable / rich iframe editors focus the end and insert text safely.
+    /// Contenteditable / rich iframe editors focus the end and insert text safely (append mode).
+    /// Non-contenteditable elements without a value property are rejected outright rather than
+    /// silently overwriting textContent.
     pub async fn type_text(&mut self, selector: &str, text: &str) -> Result<String> {
         let before = self.read_state(selector).await?;
         if !before.found {
@@ -1292,21 +1323,31 @@ impl BrowserSession {
                 r#"(() => {{
                     const raw = {sel};
                     const el = {FIND};
-                    if (!el) return false;
+                    if (!el) return {{ found: false }};
+                    const tag = (el.tagName || '').toLowerCase();
+                    const isInput = tag === 'input' || tag === 'textarea' || ('value' in el && 'form' in el);
+                    if (!isInput) {{
+                        return {{ found: true, writable: false }};
+                    }}
                     el.focus();
                     const value = {text};
-                    if ('value' in el) {{ el.value = value; }} else {{ el.textContent = value; }}
+                    el.value = value;
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return true;
+                    return {{ found: true, writable: true }};
                 }})()"#,
                 sel = serde_json::to_string(selector)?,
                 FIND = FIND_ELEMENT_JS,
                 text = serde_json::to_string(text)?,
             );
             let written = self.eval(&script).await?;
-            if !written.as_bool().unwrap_or(false) {
+            if written["found"].as_bool() != Some(true) {
                 return Ok("NOT_FOUND".into());
+            }
+            if written["writable"].as_bool() != Some(true) {
+                return Err(anyhow!(
+                    "FAILED: target element {selector} is neither an input/textarea nor contenteditable -- refusing to silently overwrite textContent; no text was entered"
+                ));
             }
         }
 
@@ -1353,8 +1394,8 @@ impl BrowserSession {
                 "FAILED: {selector} reads {:?}, not {text:?} -- the text did not land, and this is not reported as a success",
                 after.value.as_deref().map(|v| truncate(v, 60))
             )),
-            cua_core::Effect::Unverifiable => Ok(format!(
-                "typed {expected_chars} chars into {selector} [unverifiable: the element reads no value back -- not proof that it landed]"
+            cua_core::Effect::Unverifiable => Err(anyhow!(
+                "FAILED: target element {selector} does not expose a verifiable value property; refusing to report success"
             )),
         }
     }
@@ -2440,5 +2481,88 @@ mod tests {
         // -------------------------------------------------------------
         // 整个流程中未调用任何 session.scroll(dx, dy)，所有 6 个深层、遮挡、嵌套、Snap、iframe
         // 控件均通过动作内部自动 scrollIntoView 与四层验可见完成！
+    }
+
+    /// 验收用例：基于真实复现夹具 `ue.html` 的跨 iframe 富文本聚焦与分段追加写入
+    /// 包含：
+    /// 1. 跨 iframe 聚焦与光标折叠 (`focus_end_of_frame`)
+    /// 2. 分段追加写入不覆盖 (`type` 动作保持前序已有内容)
+    /// 3. 非输入/非富文本元素禁止静默降级为 textContent，直接抛错 FAILED
+    #[tokio::test]
+    #[ignore = "launches a real browser"]
+    async fn test_ue_fixture_iframe_focus_and_append() {
+        let _slot = temp_slot().await;
+        let binary = find_browser().expect("set CUA_HUB_BROWSER to a Chrome/Edge executable");
+
+        let ext_fixture =
+            std::path::Path::new(r"F:\temp\hw-pilot-friend-2026-10-26\fixture\ue.html");
+        let fixture_file = if ext_fixture.exists() {
+            ext_fixture.to_path_buf()
+        } else {
+            let tmp = std::env::temp_dir().join("ue-repro-fixture.html");
+            let fallback_html = r#"<!doctype html>
+<html><body>
+<div id="plain-div">plain container</div>
+<iframe id="ed" style="width:600px;height:200px"
+  srcdoc="<body contenteditable='true' class='view' style='min-height:150px;border:1px solid #999;padding:8px'><p>hello</p></body>"></iframe>
+</body></html>"#;
+            std::fs::write(&tmp, fallback_html).unwrap();
+            tmp
+        };
+
+        let url = format!(
+            "file:///{}",
+            fixture_file.display().to_string().replace('\\', "/")
+        );
+
+        let mut session = launch_with(
+            &binary,
+            LaunchOptions {
+                ..Default::default()
+            },
+            80,
+        )
+        .await
+        .expect("launch browser for ue fixture test");
+
+        session.navigate(&url).await.unwrap();
+
+        // 1. 验证对非输入元素的 type 绝不静默降级覆写 textContent，必须返回 FAILED 错误
+        let non_editable_err = session
+            .type_text("body", "非法尝试修改body")
+            .await
+            .expect_err("typing into non-editable body must fail");
+        assert!(
+            non_editable_err
+                .to_string()
+                .contains("neither an input/textarea nor contenteditable"),
+            "non-editable error must clearly refuse silent overwrite: {non_editable_err}"
+        );
+
+        // 2. 验证第一次 type 追加写入 (针对 iframe 节点 #ed)
+        let res1 = session.type_text("#ed", " - 第一次追加文本").await.unwrap();
+        assert!(res1.contains("[verified"), "第一段写入应当通过验证: {res1}");
+        let state1 = session.read_state("#ed").await.unwrap();
+        let text1 = state1.text.unwrap_or_default();
+        assert!(text1.contains("hello"), "原有内容 hello 必须保留: {text1}");
+        assert!(
+            text1.contains("第一次追加文本"),
+            "新内容必须追加成功: {text1}"
+        );
+
+        // 3. 验证第二次分段 type 追加写入 (测不覆盖)
+        let res2 = session.type_text("#ed", " - 第二次追加文本").await.unwrap();
+        assert!(res2.contains("[verified"), "第二段写入应当通过验证: {res2}");
+        let state2 = session.read_state("#ed").await.unwrap();
+        let text2 = state2.text.unwrap_or_default();
+        assert!(text2.contains("hello"), "初始 hello 仍必须保留: {text2}");
+        assert!(
+            text2.contains("第一次追加文本"),
+            "第一段内容仍必须保留: {text2}"
+        );
+        assert!(
+            text2.contains("第二次追加文本"),
+            "第二段内容必须追加成功: {text2}"
+        );
     }
 }
