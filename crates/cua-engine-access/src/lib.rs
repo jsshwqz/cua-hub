@@ -710,6 +710,23 @@ pub fn focus_window(_id: u32) -> Result<()> {
     ))
 }
 
+/// Check whether the top-level window `id` currently owns the OS foreground.
+#[cfg(windows)]
+pub fn is_foreground_window(id: u32) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    if id == 0 {
+        return false;
+    }
+    unsafe { GetForegroundWindow() == HWND(id as *mut _) }
+}
+
+#[cfg(not(windows))]
+pub fn is_foreground_window(_id: u32) -> bool {
+    true
+}
+
 /// Map a control-type id to a short readable name. UIA uses ids in the 50000
 /// range; AT-SPI roles are small integers (see `AtspiRole`).
 fn control_type_name(id: u32) -> &'static str {
