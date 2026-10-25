@@ -461,6 +461,29 @@ def scenario(identity: str) -> None:
             f"value={after_json.get('value')!r}",
         )
 
+        # Item 7: a search that runs out of tree must blame the cap, not the
+        # control. Before the fix these extra arguments are simply ignored, so the
+        # calls either succeed or report a missing pattern and both checks go red.
+        capped_write = call(
+            "set_control_text",
+            {"name": "probe-entry", "text": "CAPPED", "max_nodes": 1, "max_depth": 1},
+        )
+        check(
+            f"[{identity}] a capped search reports that it did not reach the control",
+            capped_write["is_error"] and "did not reach" in capped_write["text"],
+            f"{capped_write['text'][:170]}",
+        )
+        capped_invoke = call(
+            "invoke_control",
+            {"name": "probe-toggle", "max_nodes": 1, "max_depth": 1},
+        )
+        check(
+            f"[{identity}] the same rule covers invoke, not only value setting",
+            capped_invoke["is_error"] and "did not reach" in capped_invoke["text"],
+            f"{capped_invoke['text'][:170]}",
+        )
+        # The honest retry: same target, roomy budget, must work -- which is what
+        # makes the two checks above about the cap rather than about the control.
         written = call("set_control_text", {"name": "probe-entry", "text": "AT-SPI-WRITES-HERE"})
         check(
             f"[{identity}] set_control_text reaches the entry",
