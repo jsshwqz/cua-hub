@@ -492,6 +492,38 @@ def scenario(identity: str) -> None:
             capped_invoke["is_error"] and "did not reach" in capped_invoke["text"],
             f"{capped_invoke['text'][:170]}",
         )
+        # Issue #12 item 3: a window-relative point has to stay inside the window it
+        # names. Before the fix the offset was added to the window origin and injected
+        # with no check at all, so this call clicked outside -- while still answering
+        # that it had gone to this window. Placed just before the roomy retry below,
+        # because that replaces the whole entry value and so keeps the RESULT
+        # assertion independent of whatever these three calls happened to touch.
+        outside_x = int(window["width"]) + 400
+        escaped = call(
+            "window_input",
+            {"window": window["id"], "x": outside_x, "y": 60, "text": "ESCAPED"},
+        )
+        check(
+            f"[{identity}] an offset that would leave the window is refused",
+            escaped["is_error"] and "offset_outside_window" in escaped["text"],
+            f"{escaped['text'][:170]}",
+        )
+        half = call("window_input", {"window": window["id"], "x": 20, "text": "HALF"})
+        check(
+            f"[{identity}] half a point is refused instead of silently ignored",
+            half["is_error"] and "half_a_point" in half["text"],
+            f"{half['text'][:170]}",
+        )
+        aimed = call(
+            "window_input",
+            {"window": window["id"], "x": 30, "y": 30, "text": "WITHIN-W"},
+        )
+        check(
+            f"[{identity}] a point inside the window is still accepted",
+            not aimed["is_error"],
+            f"{aimed['text'][:140]}",
+        )
+
         # The honest retry: same target, roomy budget, must work -- which is what
         # makes the two checks above about the cap rather than about the control.
         written = call("set_control_text", {"name": "probe-entry", "text": "AT-SPI-WRITES-HERE"})
