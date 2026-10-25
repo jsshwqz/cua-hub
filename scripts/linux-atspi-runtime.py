@@ -461,6 +461,16 @@ def scenario(identity: str) -> None:
             f"value={after_json.get('value')!r}",
         )
 
+        # Item 8: the answer has to say what the control looks like after the action,
+        # not only that the pattern replied. This control publishes a state, so the
+        # verdict is checkable -- and it is checked against the app's own toggle log
+        # above rather than against the reply itself.
+        check(
+            f"[{identity}] invoke reports the effect it read back",
+            "effect=changed" in toggled["text"],
+            f"{toggled['text'][:170]}",
+        )
+
         # Item 7: a search that runs out of tree must blame the cap, not the
         # control. Before the fix these extra arguments are simply ignored, so the
         # calls either succeed or report a missing pattern and both checks go red.
@@ -490,6 +500,34 @@ def scenario(identity: str) -> None:
             not written["is_error"],
             written["text"][:120],
         )
+        # This backend cannot read a field's text back yet, so the honest answer is
+        # that the write is unverified -- not a "changed" borrowed from the fact that
+        # SetTextContents replied true.
+        check(
+            f"[{identity}] a text write says it could not be read back here",
+            "effect=unverifiable" in written["text"] and "cannot read the field" in written["text"],
+            written["text"][:170],
+        )
+
+        # Item 8's hard case, the one the audit found on a panel: a control whose
+        # reply says "done" whether or not anything appeared. The verdict is checked
+        # against the tree, an independent witness, rather than against the reply.
+        popped = call("invoke_control", {"name": "probe-menu"})
+        tree_after = call("accessibility_tree", {"max_nodes": 400, "depth": 8})
+        opened = "probe-menu-item" in tree_after["text"]
+        check(
+            f"[{identity}] the menu button answer carries a verdict at all",
+            "effect=" in popped["text"],
+            f"{popped['text'][:170]}",
+        )
+        check(
+            f"[{identity}] the verdict agrees with whether the menu is on screen",
+            ("effect=changed" in popped["text"]) == opened,
+            f"text={popped['text'][:120]!r} menu_item_in_tree={opened}",
+        )
+        # An open menu grabs the pointer, and every check after this one would then be
+        # measuring the grab rather than the control.
+        call("key", {"combo": "Escape"})
 
         invoked = call("invoke_control", {"name": "probe-submit"})
         check(
