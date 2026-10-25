@@ -744,6 +744,654 @@ fn append_related_titles_only(mut tree: String, related: &[cua_io::WindowInfo]) 
     tree
 }
 
+/// Default consecutive failures allowed on the same question before stopping.
+const DEFAULT_MAX_QUESTION_RETRIES: usize = 3;
+
+/// Default pixel padding around a target rectangle when cropping an
+/// `unverifiable` verification screenshot.
+const TARGET_CROP_MARGIN_PX: i32 = 48;
+
+static QUESTION_FAILURE_COUNTS: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn reset_question_retries() {
+    if let Ok(mut guard) = QUESTION_FAILURE_COUNTS.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.clear();
+        }
+    }
+}
+
+fn extract_question_id(args: &Value) -> Option<String> {
+    for key in ["question", "question_id", "question_number"] {
+        if let Some(s) = args[key].as_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Some(n) = args[key].as_u64() {
+            return Some(n.to_string());
+        }
+    }
+    None
+}
+
+fn max_retries_from_args(args: &Value) -> usize {
+    args["max_retries"]
+        .as_u64()
+        .map(|n| n.clamp(1, 20) as usize)
+        .unwrap_or(DEFAULT_MAX_QUESTION_RETRIES)
+}
+
+fn retry_limit_error(question: &str, attempts: usize, max_retries: usize) -> Value {
+    tool_err(json!({
+        "ok": false,
+        "error": {
+            "code": "retry_limit_exceeded",
+            "question": question,
+            "attempts": attempts,
+            "max_retries": max_retries,
+            "message": format!(
+                "question {question} failed {attempts} consecutive times (limit {max_retries}); stopping at question {question} instead of blindly continuing or skipping"
+            ),
+            "retry": false,
+        }
+    }))
+}
+
+fn check_question_retry_budget(
+    question: &str,
+    max_retries: usize,
+) -> std::result::Result<(), Value> {
+    let attempts = QUESTION_FAILURE_COUNTS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|map| map.get(question).copied()))
+        .unwrap_or(0);
+    if attempts >= max_retries {
+        return Err(retry_limit_error(question, attempts, max_retries));
+    }
+    Ok(())
+}
+
+fn record_question_attempt(
+    question: &str,
+    succeeded: bool,
+    max_retries: usize,
+) -> std::result::Result<usize, Value> {
+    let mut guard = QUESTION_FAILURE_COUNTS
+        .lock()
+        .map_err(|_| tool_err("question retry lock poisoned"))?;
+    let map = guard.get_or_insert_with(Default::default);
+    if succeeded {
+        map.remove(question);
+        return Ok(0);
+    }
+    let count = map.entry(question.to_string()).or_insert(0);
+    *count += 1;
+    let current = *count;
+    if current >= max_retries {
+        return Err(retry_limit_error(question, current, max_retries));
+    }
+    Ok(current)
+}
+
+fn action_result_succeeded(result: &Value) -> bool {
+    if result["isError"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    if let Some(parts) = result["content"].as_array() {
+        for part in parts {
+            if let Some(text) = part["text"].as_str() {
+                if text.contains("effect=unchanged") {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Only `Effect::Unverifiable` warrants a verification screenshot; `Changed`
+/// and `Unchanged` are already decided from accessibility state readback.
+fn should_capture_verification_crop(effect: cua_engine_access::Effect) -> bool {
+    matches!(effect, cua_engine_access::Effect::Unverifiable)
+}
+
+/// Compute a small bounding box around `target_rect` (in physical screen pixels)
+/// within a captured surface at `screen_origin` of size `screen_size`. Never
+/// returns a full-screen region when the target is a control.
+fn compute_target_crop_bounds(
+    screen_origin: (i32, i32),
+    screen_size: (u32, u32),
+    target_rect: (i32, i32, i32, i32),
+    margin: i32,
+) -> Option<(u32, u32, u32, u32)> {
+    let (tx, ty, tw, th) = target_rect;
+    if tw <= 0 || th <= 0 || screen_size.0 == 0 || screen_size.1 == 0 {
+        return None;
+    }
+    let rel_x = tx - screen_origin.0;
+    let rel_y = ty - screen_origin.1;
+    let pad = margin.max(0);
+    let left = (rel_x - pad).clamp(0, screen_size.0 as i32);
+    let top = (rel_y - pad).clamp(0, screen_size.1 as i32);
+    let right = (rel_x + tw + pad).clamp(0, screen_size.0 as i32);
+    let bottom = (rel_y + th + pad).clamp(0, screen_size.1 as i32);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((
+        left as u32,
+        top as u32,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    ))
+}
+
+/// Extract a sub-rectangle `(cx, cy, cw, ch)` from an RGBA8 image buffer.
+fn crop_rgba_region(
+    rgba: &[u8],
+    img_w: u32,
+    img_h: u32,
+    crop: (u32, u32, u32, u32),
+) -> Option<Vec<u8>> {
+    let (cx, cy, cw, ch) = crop;
+    if cw == 0
+        || ch == 0
+        || cx.checked_add(cw)? > img_w
+        || cy.checked_add(ch)? > img_h
+        || rgba.len() < (img_w as usize) * (img_h as usize) * 4
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity((cw as usize) * (ch as usize) * 4);
+    let stride = (img_w as usize) * 4;
+    let row_bytes = (cw as usize) * 4;
+    for row in 0..ch {
+        let start = ((cy + row) as usize) * stride + (cx as usize) * 4;
+        out.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+    Some(out)
+}
+
+fn crc32_png(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+fn adler32_zlib(bytes: &[u8]) -> u32 {
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in bytes {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let crc_start = out.len();
+    out.extend_from_slice(tag);
+    out.extend_from_slice(data);
+    let crc = crc32_png(&out[crc_start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Encode a small RGBA8 buffer as a valid PNG image using stored deflate blocks.
+fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut raw_scanlines = Vec::with_capacity((height as usize) * (1 + (width as usize) * 4));
+    let row_bytes = (width as usize) * 4;
+    for y in 0..(height as usize) {
+        raw_scanlines.push(0u8); // filter type 0 (None)
+        let start = y * row_bytes;
+        raw_scanlines.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+
+    let mut zlib = Vec::with_capacity(raw_scanlines.len() + 64);
+    zlib.extend_from_slice(&[0x78, 0x01]); // zlib header (CM=8, CINFO=7, no preset dict)
+    let chunks: Vec<&[u8]> = if raw_scanlines.is_empty() {
+        vec![&[][..]]
+    } else {
+        raw_scanlines.chunks(65_535).collect()
+    };
+    for (idx, block) in chunks.iter().enumerate() {
+        let is_last = idx + 1 == chunks.len();
+        zlib.push(if is_last { 0x01 } else { 0x00 });
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32_zlib(&raw_scanlines).to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_png_chunk(&mut png, b"IDAT", &zlib);
+    write_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Build the MCP tool response for an accessibility action report:
+/// - For `Changed` and `Unchanged`: returns text only (never captures a screenshot).
+/// - For `Unverifiable`: captures ONLY a small cropped neighborhood around the
+///   target control's rectangle (never a full-screen screenshot).
+fn action_outcome_with_verification_crop(
+    message: String,
+    report: &cua_engine_access::ActionReport,
+) -> Value {
+    if !should_capture_verification_crop(report.effect) {
+        return tool_ok(message);
+    }
+    if let Ok(screen) = cua_io::capture_primary() {
+        if let Some(crop) = compute_target_crop_bounds(
+            screen.origin,
+            (screen.width, screen.height),
+            report.node.rect,
+            TARGET_CROP_MARGIN_PX,
+        ) {
+            if let Some(cropped_rgba) =
+                crop_rgba_region(screen.image.as_raw(), screen.width, screen.height, crop)
+            {
+                let png = encode_rgba_png(crop.2, crop.3, &cropped_rgba);
+                let crop_meta = json!({
+                    "text": message,
+                    "effect": "unverifiable",
+                    "verification_crop": {
+                        "x": screen.origin.0 + crop.0 as i32,
+                        "y": screen.origin.1 + crop.1 as i32,
+                        "width": crop.2,
+                        "height": crop.3,
+                        "full_screen": false,
+                    }
+                });
+                return tool_ok(json!([
+                    {
+                        "type": "image",
+                        "data": encode_base64(&png),
+                        "mimeType": "image/png",
+                    },
+                    {
+                        "type": "text",
+                        "text": crop_meta.to_string(),
+                    }
+                ]));
+            }
+        }
+    }
+    tool_ok(message)
+}
+
+#[derive(Debug, Clone)]
+struct SubmissionAudit {
+    total_questions: usize,
+    answered_count: usize,
+    missing_questions: Vec<String>,
+    differences: Vec<Value>,
+    checked_controls: Vec<String>,
+    filled_controls: Vec<String>,
+    passed: bool,
+}
+
+fn normalize_answer_tokens(value: &Value) -> Vec<String> {
+    match value {
+        Value::Null => Vec::new(),
+        Value::Bool(b) => vec![b.to_string()],
+        Value::Number(n) => vec![n.to_string()],
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        Value::Array(arr) => {
+            let mut out: Vec<String> = arr
+                .iter()
+                .flat_map(normalize_answer_tokens)
+                .filter(|s| !s.is_empty())
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn infer_question_key(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("第")
+        .and_then(|s| s.split("题").next())
+    {
+        let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return Some(digits);
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["question ", "question_", "question-", "q", "题"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return Some(digits);
+            }
+        }
+    }
+    let leading_digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !leading_digits.is_empty() {
+        let after = &trimmed[leading_digits.len()..];
+        if after.starts_with('.')
+            || after.starts_with('、')
+            || after.starts_with(')')
+            || after.starts_with('）')
+            || after.starts_with(':')
+        {
+            return Some(leading_digits);
+        }
+    }
+    None
+}
+
+fn extract_node_answer(node: &cua_engine_access::UiNode) -> Option<String> {
+    if node.checked == Some(true) || node.selected {
+        if !node.name.trim().is_empty() {
+            return Some(node.name.trim().to_string());
+        }
+        if !node.value.trim().is_empty() {
+            return Some(node.value.trim().to_string());
+        }
+        return Some("true".to_string());
+    }
+    if matches!(
+        node.control_type.as_str(),
+        "Edit" | "Document" | "ComboBox" | "Entry"
+    ) && !node.value.trim().is_empty()
+    {
+        return Some(node.value.trim().to_string());
+    }
+    None
+}
+
+fn answers_match(expected: &[String], actual: &[String]) -> bool {
+    if expected.is_empty() || actual.is_empty() || expected.len() != actual.len() {
+        return false;
+    }
+    let mut exp_norm: Vec<String> = expected.iter().map(|s| s.trim().to_lowercase()).collect();
+    let mut act_norm: Vec<String> = actual.iter().map(|s| s.trim().to_lowercase()).collect();
+    exp_norm.sort();
+    act_norm.sort();
+    exp_norm
+        .iter()
+        .zip(act_norm.iter())
+        .all(|(e, a)| e == a || a.starts_with(&format!("{e}.")) || a.starts_with(&format!("{e} ")))
+}
+
+/// Audit the current page's accessibility nodes against `planned_answers`:
+/// 1) Full-page check: compares every selected/checked option and filled input
+///    against the planned answers and lists all discrepancies in `differences`.
+/// 2) Coverage check: counts `answered_count` vs `total_questions` and lists any
+///    unanswered question numbers in `missing_questions`.
+fn audit_submission_nodes(
+    nodes: &[cua_engine_access::UiNode],
+    planned_answers: &Value,
+    total_questions_override: Option<usize>,
+) -> SubmissionAudit {
+    let mut checked_controls = Vec::new();
+    let mut filled_controls = Vec::new();
+    let mut by_question: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut current_question: Option<String> = None;
+
+    for node in nodes {
+        if let Some(q) =
+            infer_question_key(&node.automation_id).or_else(|| infer_question_key(&node.name))
+        {
+            current_question = Some(q);
+        }
+        if node.checked == Some(true) || node.selected {
+            checked_controls.push(format!(
+                "[{}] {} {:?}",
+                node.index, node.control_type, node.name
+            ));
+        } else if !node.value.trim().is_empty() {
+            filled_controls.push(format!(
+                "[{}] {} {:?} value={:?}",
+                node.index, node.control_type, node.name, node.value
+            ));
+        }
+        if let Some(ans) = extract_node_answer(node) {
+            if let Some(q) = current_question.clone() {
+                let entry = by_question.entry(q).or_default();
+                if !entry.contains(&ans) {
+                    entry.push(ans);
+                }
+            }
+        }
+    }
+
+    struct PlannedItem {
+        question: String,
+        expected: Vec<String>,
+        explicit_actual: Option<Vec<String>>,
+        element_index: Option<usize>,
+    }
+
+    let mut planned: Vec<PlannedItem> = Vec::new();
+    if let Some(arr) = planned_answers.as_array() {
+        for (idx, item) in arr.iter().enumerate() {
+            let q = item["question"]
+                .as_str()
+                .or_else(|| item["id"].as_str())
+                .or_else(|| item["number"].as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    item["question"]
+                        .as_u64()
+                        .or_else(|| item["id"].as_u64())
+                        .or_else(|| item["number"].as_u64())
+                        .map(|n| n.to_string())
+                })
+                .unwrap_or_else(|| (idx + 1).to_string());
+            let expected_val = item
+                .get("expected")
+                .or_else(|| item.get("answer"))
+                .or_else(|| item.get("value"))
+                .unwrap_or(&Value::Null);
+            let expected = normalize_answer_tokens(expected_val);
+            let explicit_actual = item.get("actual").map(normalize_answer_tokens);
+            let element_index = item["element_index"]
+                .as_u64()
+                .or_else(|| item["index"].as_u64())
+                .map(|n| n as usize);
+            planned.push(PlannedItem {
+                question: q,
+                expected,
+                explicit_actual,
+                element_index,
+            });
+        }
+    } else if let Some(map) = planned_answers.as_object() {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort_by_key(|k| (k.parse::<usize>().unwrap_or(usize::MAX), (*k).clone()));
+        for key in keys {
+            planned.push(PlannedItem {
+                question: key.clone(),
+                expected: normalize_answer_tokens(&map[key]),
+                explicit_actual: None,
+                element_index: None,
+            });
+        }
+    }
+
+    let total_questions = total_questions_override
+        .unwrap_or(planned.len())
+        .max(planned.len());
+    let mut missing_questions = Vec::new();
+    let mut differences = Vec::new();
+    let mut answered_count = 0usize;
+    let mut seen_questions = std::collections::HashSet::new();
+
+    for item in &planned {
+        seen_questions.insert(item.question.clone());
+        let actual: Vec<String> = if let Some(explicit) = &item.explicit_actual {
+            explicit.clone()
+        } else if let Some(index) = item.element_index {
+            nodes
+                .iter()
+                .find(|n| n.index == index)
+                .and_then(extract_node_answer)
+                .into_iter()
+                .collect()
+        } else if let Some(found) = by_question.get(&item.question) {
+            found.clone()
+        } else if by_question.is_empty() {
+            // Fallback when the page has no question headers: check if any active control matches
+            nodes
+                .iter()
+                .filter_map(extract_node_answer)
+                .filter(|ans| answers_match(&item.expected, std::slice::from_ref(ans)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if item.expected.is_empty() || actual.is_empty() {
+            missing_questions.push(item.question.clone());
+            differences.push(json!({
+                "question": item.question,
+                "expected": item.expected,
+                "actual": actual,
+                "reason": "unanswered",
+            }));
+        } else {
+            answered_count += 1;
+            if !answers_match(&item.expected, &actual) {
+                differences.push(json!({
+                    "question": item.question,
+                    "expected": item.expected,
+                    "actual": actual,
+                    "reason": "mismatch",
+                }));
+            }
+        }
+    }
+
+    for q_num in 1..=total_questions {
+        let key = q_num.to_string();
+        if !seen_questions.contains(&key) {
+            if let Some(actual) = by_question.get(&key).filter(|v| !v.is_empty()) {
+                let _ = actual;
+                answered_count += 1;
+            } else {
+                missing_questions.push(key);
+            }
+        }
+    }
+
+    let passed =
+        missing_questions.is_empty() && differences.is_empty() && answered_count >= total_questions;
+
+    SubmissionAudit {
+        total_questions,
+        answered_count,
+        missing_questions,
+        differences,
+        checked_controls,
+        filled_controls,
+        passed,
+    }
+}
+
+fn submission_audit_to_json(audit: &SubmissionAudit) -> Value {
+    json!({
+        "ok": audit.passed,
+        "can_submit": audit.passed,
+        "coverage": {
+            "answered": audit.answered_count,
+            "total": audit.total_questions,
+            "missing_questions": audit.missing_questions,
+        },
+        "differences": audit.differences,
+        "checked_controls": audit.checked_controls,
+        "filled_controls": audit.filled_controls,
+    })
+}
+
+fn enforce_submission_gate(args: &Value) -> std::result::Result<Option<Value>, Value> {
+    let Some(planned) = args
+        .get("planned_answers")
+        .or_else(|| args.get("expected_answers"))
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(None);
+    };
+    let total_override = args["total_questions"].as_u64().map(|n| n as usize);
+    let nodes: Vec<cua_engine_access::UiNode> = if let Some(raw_nodes) = args.get("nodes") {
+        serde_json::from_value(raw_nodes.clone()).unwrap_or_default()
+    } else if !args["window"].is_null() {
+        let win = resolve_window_arg(&args["window"])?;
+        cua_engine_access::snapshot_window(win.id, &win.app, &win.title, win.pid, 600, 16)
+            .map(|s| s.nodes)
+            .unwrap_or_default()
+    } else if let Some(obs_id) = args["observation_id"].as_str() {
+        let Some(obs) = observations::get(obs_id) else {
+            return Err(stale_err(format!(
+                "observation `{obs_id}` is no longer held; re-run window_state before submitting"
+            )));
+        };
+        obs.nodes
+    } else {
+        cua_engine_access::snapshot(600, 12)
+            .map(|s| s.nodes)
+            .unwrap_or_default()
+    };
+
+    let audit = audit_submission_nodes(&nodes, planned, total_override);
+    let payload = submission_audit_to_json(&audit);
+    if !audit.passed {
+        return Err(tool_err(json!({
+            "ok": false,
+            "error": {
+                "code": "submission_quality_gate_failed",
+                "message": format!(
+                    "submission blocked by quality gate: answered {}/{} questions, missing {:?}, differences: {}",
+                    audit.answered_count,
+                    audit.total_questions,
+                    audit.missing_questions,
+                    audit.differences.len()
+                ),
+                "audit": payload,
+                "retry": false,
+            }
+        })));
+    }
+    Ok(Some(payload))
+}
+
 /// An index or pixel that came from an observation the server no longer holds,
 /// or that does not exist in it. Treated as retryable but never silently
 /// re-resolved: the caller must re-observe and choose again.
@@ -1185,7 +1833,69 @@ fn error_text(result: &Value) -> String {
 }
 
 async fn call_tool_single(name: &str, args: &Value) -> Value {
+    let question_id = extract_question_id(args);
+    let max_retries = max_retries_from_args(args);
+    if let Some(q) = &question_id {
+        if let Err(limit_err) = check_question_retry_budget(q, max_retries) {
+            return limit_err;
+        }
+    }
+    if name != "verify_submission" {
+        if let Err(gate_err) = enforce_submission_gate(args) {
+            return gate_err;
+        }
+    }
+    let result = call_tool_single_inner(name, args).await;
+    if let Some(q) = &question_id {
+        let succeeded = action_result_succeeded(&result);
+        if let Err(limit_err) = record_question_attempt(q, succeeded, max_retries) {
+            return limit_err;
+        }
+    }
+    result
+}
+
+async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
     match name {
+        "verify_submission" => {
+            let planned = args
+                .get("planned_answers")
+                .or_else(|| args.get("expected_answers"))
+                .unwrap_or(&Value::Null);
+            if planned.is_null() {
+                return tool_err("verify_submission requires `planned_answers`");
+            }
+            let total_override = args["total_questions"].as_u64().map(|n| n as usize);
+            let nodes: Vec<cua_engine_access::UiNode> = if let Some(raw_nodes) = args.get("nodes") {
+                serde_json::from_value(raw_nodes.clone()).unwrap_or_default()
+            } else if !args["window"].is_null() {
+                let win = match resolve_window_arg(&args["window"]) {
+                    Ok(w) => w,
+                    Err(e) => return e,
+                };
+                cua_engine_access::snapshot_window(win.id, &win.app, &win.title, win.pid, 600, 16)
+                    .map(|s| s.nodes)
+                    .unwrap_or_default()
+            } else if let Some(obs_id) = args["observation_id"].as_str() {
+                let Some(obs) = observations::get(obs_id) else {
+                    return stale_err(format!(
+                        "observation `{obs_id}` is no longer held; re-run window_state"
+                    ));
+                };
+                obs.nodes
+            } else {
+                cua_engine_access::snapshot(600, 12)
+                    .map(|s| s.nodes)
+                    .unwrap_or_default()
+            };
+            let audit = audit_submission_nodes(&nodes, planned, total_override);
+            let payload = submission_audit_to_json(&audit);
+            if audit.passed {
+                tool_ok(payload)
+            } else {
+                tool_err(payload)
+            }
+        }
         "start_task" => {
             let opts = match run_options_from_args(args) {
                 Ok(o) => o,
@@ -1875,13 +2585,16 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             };
             let (max_nodes, max_depth) = action_limits(args);
             match cua_engine_access::set_value_with(&name, &text, max_nodes, max_depth) {
-                Ok(Some(report)) => tool_ok(format!(
-                    "set text of {} \"{}\" ({} chars){}",
-                    report.node.control_type,
-                    report.node.name,
-                    text.chars().count(),
-                    effect_note(&report, true)
-                )),
+                Ok(Some(report)) => action_outcome_with_verification_crop(
+                    format!(
+                        "set text of {} \"{}\" ({} chars){}",
+                        report.node.control_type,
+                        report.node.name,
+                        text.chars().count(),
+                        effect_note(&report, true)
+                    ),
+                    &report,
+                ),
                 Ok(None) => tool_err(format!(
                     "control {name:?} has no Value/EditableText pattern; focus it and use type_text"
                 )),
@@ -1919,12 +2632,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 ));
             };
             match cua_engine_access::invoke(&selector) {
-                Ok(Some(report)) => tool_ok(format!(
-                    "invoked {} \"{}\" via accessibility pattern{}",
-                    report.node.control_type,
-                    report.node.name,
-                    effect_note(&report, false)
-                )),
+                Ok(Some(report)) => action_outcome_with_verification_crop(
+                    format!(
+                        "invoked {} \"{}\" via accessibility pattern{}",
+                        report.node.control_type,
+                        report.node.name,
+                        effect_note(&report, false)
+                    ),
+                    &report,
+                ),
                 Ok(None) => {
                     let Some(center) = control_center(resolved.node.rect) else {
                         return tool_err(format!(
@@ -1970,12 +2686,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 ));
             };
             match cua_engine_access::set_value(&selector, &text) {
-                Ok(Some(report)) => tool_ok(format!(
-                    "set {} \"{}\" via Value/EditableText{}",
-                    report.node.control_type,
-                    report.node.name,
-                    effect_note(&report, true)
-                )),
+                Ok(Some(report)) => action_outcome_with_verification_crop(
+                    format!(
+                        "set {} \"{}\" via Value/EditableText{}",
+                        report.node.control_type,
+                        report.node.name,
+                        effect_note(&report, true)
+                    ),
+                    &report,
+                ),
                 Ok(None) => tool_err(format!(
                     "control at index {index} has no Value/EditableText pattern; use type_text"
                 )),
@@ -2082,12 +2801,15 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             let (max_nodes, max_depth) = action_limits(args);
             match cua_engine_access::invoke_with(&name, max_nodes, max_depth) {
                 Ok(Some(report)) => {
-                    return tool_ok(format!(
-                        "invoked {} \"{}\" via accessibility pattern{}",
-                        report.node.control_type,
-                        report.node.name,
-                        effect_note(&report, false)
-                    ))
+                    return action_outcome_with_verification_crop(
+                        format!(
+                            "invoked {} \"{}\" via accessibility pattern{}",
+                            report.node.control_type,
+                            report.node.name,
+                            effect_note(&report, false)
+                        ),
+                        &report,
+                    )
                 }
                 Ok(None) => {}
                 Err(e) => return tool_err(e),
@@ -2837,6 +3559,26 @@ fn tool_defs() -> Value {
                 "properties": { "combo": { "type": "string" } },
                 "required": ["combo"]
             }
+        },
+        {
+            "name": "verify_submission",
+            "description": "Pre-submit quality gate for web quizzes/forms: re-reads all checked/selected/filled controls on the page, compares against `planned_answers`, checks coverage (`answered_count`/`total_questions`), and blocks submission if any questions are missing or mismatched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "description": "Window id or selector to re-read before submitting",
+                        "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ]
+                    },
+                    "observation_id": { "type": "string", "description": "Fallback observation id when no live window is specified" },
+                    "planned_answers": {
+                        "description": "Planned answers keyed by question number/label (object or array), compared against actual checked/selected/value state on screen",
+                        "oneOf": [ { "type": "object" }, { "type": "array" } ]
+                    },
+                    "total_questions": { "type": "integer", "minimum": 1, "description": "Total expected question count on the page for coverage verification" }
+                },
+                "required": ["planned_answers"]
+            }
         }
     ]);
     add_chain_controls(&mut defs);
@@ -2869,6 +3611,21 @@ fn add_chain_controls(defs: &mut Value) {
         "description": "Milliseconds to wait between chain steps, so the previous action has landed. Only used with `then`."
     });
 
+    let question_schema = json!({
+        "description": "Question identifier/number for bounded per-question retry tracking; stops after N consecutive failures on the same question.",
+        "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 } ]
+    });
+    let max_retries_schema = json!({
+        "type": "integer",
+        "minimum": 1,
+        "default": DEFAULT_MAX_QUESTION_RETRIES,
+        "description": "Maximum consecutive failed attempts allowed on the same question before stopping and reporting the question number."
+    });
+    let planned_answers_schema = json!({
+        "description": "When passed on a submit action, runs full-page pre-submit answer and coverage verification before allowing the action.",
+        "oneOf": [ { "type": "object" }, { "type": "array" } ]
+    });
+
     let Some(tools) = defs.as_array_mut() else {
         return;
     };
@@ -2879,7 +3636,7 @@ fn add_chain_controls(defs: &mut Value) {
         let name = tool["name"].as_str().unwrap_or_default();
         if !chainable(name) {
             continue;
-        }
+        };
         let Some(schema) = tool
             .entry("inputSchema")
             .or_insert_with(|| json!({ "type": "object" }))
@@ -2897,6 +3654,15 @@ fn add_chain_controls(defs: &mut Value) {
         properties.insert("then".to_string(), then_schema.clone());
         properties.insert("observe".to_string(), observe_schema.clone());
         properties.insert("settle_ms".to_string(), settle_schema.clone());
+        properties
+            .entry("question".to_string())
+            .or_insert_with(|| question_schema.clone());
+        properties
+            .entry("max_retries".to_string())
+            .or_insert_with(|| max_retries_schema.clone());
+        properties
+            .entry("planned_answers".to_string())
+            .or_insert_with(|| planned_answers_schema.clone());
     }
 }
 
@@ -3488,5 +4254,177 @@ mod tests {
         assert!(tree_with_titles.contains("# related window 91 \"Confirm Submission\"\n"));
         assert!(tree_with_titles.contains("# related window 92 \"Helper Tooltip\"\n"));
         assert!(!tree_with_titles.contains("[1]"));
+    }
+
+    #[test]
+    fn submission_quality_gate_reports_missing_questions_and_answer_differences() {
+        let mut q1 = sample_ui_node(1, "Group", "1. Rust ownership");
+        q1.depth = 1;
+        let mut q1_opt_a = sample_ui_node(2, "RadioButton", "A. Borrow checker");
+        q1_opt_a.depth = 2;
+        q1_opt_a.checked = Some(false);
+        let mut q1_opt_b = sample_ui_node(3, "RadioButton", "B. Garbage collector");
+        q1_opt_b.depth = 2;
+        q1_opt_b.checked = Some(true);
+
+        let mut q2 = sample_ui_node(4, "Group", "2. Memory safety");
+        q2.depth = 1;
+        let mut q2_opt_true = sample_ui_node(5, "RadioButton", "True");
+        q2_opt_true.depth = 2;
+        q2_opt_true.checked = Some(true);
+
+        let mut q3 = sample_ui_node(6, "Group", "3. Fill in the blank");
+        q3.depth = 1;
+        let mut q3_edit = sample_ui_node(7, "Edit", "Question 3 answer");
+        q3_edit.depth = 2;
+        q3_edit.value = String::new();
+
+        let nodes = vec![q1, q1_opt_a, q1_opt_b, q2, q2_opt_true.clone(), q3, q3_edit];
+        let planned = json!({
+            "1": "A",
+            "2": "True",
+            "3": "Result<T, E>",
+            "4": "B"
+        });
+
+        let audit = audit_submission_nodes(&nodes, &planned, Some(4));
+        assert!(
+            !audit.passed,
+            "audit must fail when questions are missing or mismatched"
+        );
+        assert_eq!(audit.total_questions, 4);
+        assert_eq!(audit.answered_count, 2);
+        assert_eq!(
+            audit.missing_questions,
+            vec!["3".to_string(), "4".to_string()]
+        );
+        assert_eq!(audit.differences.len(), 3);
+        assert_eq!(audit.differences[0]["question"], json!("1"));
+
+        // Verify that verify_submission tool returns an error listing missing_questions & differences,
+        // and passes once all questions match the plan.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let failed_gate = rt.block_on(call_tool_single(
+            "verify_submission",
+            &json!({
+                "nodes": nodes,
+                "planned_answers": planned,
+                "total_questions": 4
+            }),
+        ));
+        assert_eq!(failed_gate["isError"], json!(true));
+        let failed_body: Value =
+            serde_json::from_str(failed_gate["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(failed_body["ok"], json!(false));
+        assert_eq!(failed_body["can_submit"], json!(false));
+        assert_eq!(
+            failed_body["coverage"]["missing_questions"],
+            json!(["3", "4"])
+        );
+        assert_eq!(failed_body["differences"].as_array().unwrap().len(), 3);
+
+        // Fix answers and verify gate passes.
+        let mut fixed_q1_a = sample_ui_node(2, "RadioButton", "A. Borrow checker");
+        fixed_q1_a.depth = 2;
+        fixed_q1_a.checked = Some(true);
+        let mut fixed_q3_edit = sample_ui_node(7, "Edit", "Question 3 answer");
+        fixed_q3_edit.depth = 2;
+        fixed_q3_edit.value = "Result<T, E>".into();
+        let fixed_nodes = vec![
+            sample_ui_node(1, "Group", "1. Rust ownership"),
+            fixed_q1_a,
+            sample_ui_node(4, "Group", "2. Memory safety"),
+            q2_opt_true,
+            sample_ui_node(6, "Group", "3. Fill in the blank"),
+            fixed_q3_edit,
+        ];
+        let passed_gate = rt.block_on(call_tool_single(
+            "verify_submission",
+            &json!({
+                "nodes": fixed_nodes,
+                "planned_answers": {
+                    "1": "A. Borrow checker",
+                    "2": "True",
+                    "3": "Result<T, E>"
+                },
+                "total_questions": 3
+            }),
+        ));
+        assert_eq!(passed_gate["isError"], json!(false));
+        let passed_body: Value =
+            serde_json::from_str(passed_gate["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(passed_body["ok"], json!(true));
+        assert_eq!(passed_body["can_submit"], json!(true));
+        assert_eq!(passed_body["coverage"]["answered"], json!(3));
+        assert_eq!(passed_body["coverage"]["total"], json!(3));
+        assert_eq!(passed_body["coverage"]["missing_questions"], json!([]));
+        assert_eq!(passed_body["differences"], json!([]));
+    }
+
+    #[test]
+    fn bounded_question_retry_stops_after_n_failures_and_reports_question_number() {
+        reset_question_retries();
+
+        // Fail twice on question 7 with max_retries = 2.
+        assert!(record_question_attempt("7", false, 2).is_ok());
+        let err = record_question_attempt("7", false, 2)
+            .expect_err("second failure on question 7 must hit retry limit 2");
+        assert_eq!(err["isError"], json!(true));
+        let body: Value =
+            serde_json::from_str(err["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], json!("retry_limit_exceeded"));
+        assert_eq!(body["error"]["question"], json!("7"));
+        assert_eq!(body["error"]["attempts"], json!(2));
+        assert_eq!(body["error"]["max_retries"], json!(2));
+
+        // Any subsequent attempt on question 7 is blocked before execution.
+        let blocked = check_question_retry_budget("7", 2)
+            .expect_err("further attempts on exhausted question must be blocked");
+        let blocked_body: Value =
+            serde_json::from_str(blocked["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(blocked_body["error"]["code"], json!("retry_limit_exceeded"));
+        assert_eq!(blocked_body["error"]["question"], json!("7"));
+
+        // A different question is unaffected, and a success resets its counter.
+        assert!(record_question_attempt("8", false, 2).is_ok());
+        assert!(record_question_attempt("8", true, 2).is_ok());
+        assert!(record_question_attempt("8", false, 2).is_ok());
+        reset_question_retries();
+    }
+
+    #[test]
+    fn verification_crop_only_fires_on_unverifiable_and_crops_target_neighborhood() {
+        let mut node = sample_ui_node(12, "RadioButton", "Option C");
+        node.rect = (200, 300, 80, 30);
+
+        assert!(!should_capture_verification_crop(
+            cua_engine_access::Effect::Changed
+        ));
+        assert!(!should_capture_verification_crop(
+            cua_engine_access::Effect::Unchanged
+        ));
+        assert!(should_capture_verification_crop(
+            cua_engine_access::Effect::Unverifiable
+        ));
+
+        // Screen is 1920x1080; target is (200, 300, 80, 30).
+        // Crop must be a small bounded box around the target, never the full 1920x1080 screen.
+        let (cx, cy, cw, ch) =
+            compute_target_crop_bounds((0, 0), (1920, 1080), node.rect, TARGET_CROP_MARGIN_PX)
+                .expect("valid crop bounds");
+        assert!(cw <= 400 && ch <= 400);
+        assert!(cw < 1920 && ch < 1080);
+        assert!(cx <= 200 && cy <= 300);
+        assert!(cx + cw >= 280 && cy + ch >= 330);
+
+        // Verify RGBA sub-region extraction + PNG encoding produces a valid small PNG.
+        let full_w = 100u32;
+        let full_h = 100u32;
+        let raw = vec![128u8; (full_w * full_h * 4) as usize];
+        let cropped =
+            crop_rgba_region(&raw, full_w, full_h, (10, 20, 24, 16)).expect("valid rgba crop");
+        assert_eq!(cropped.len(), (24 * 16 * 4) as usize);
+        let png = encode_rgba_png(24, 16, &cropped);
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }
