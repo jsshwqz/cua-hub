@@ -8,6 +8,8 @@
 //! but only dispatched to on non-Windows platforms.
 
 use cua_core::{Error, Result};
+use std::time::{Duration, Instant};
+
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
 
@@ -22,6 +24,219 @@ type Kids = Vec<(String, OwnedObjectPath)>;
 type Rect = (i32, i32, i32, i32);
 type NodeData = (String, u32, Rect, Kids);
 
+/// How long to wait for one AT-SPI reply before calling the application deaf.
+///
+/// The D-Bus default is around 25 seconds, and a hung application would take a
+/// whole observation down with it -- which is worse than a shorter tree, because
+/// the shorter tree used to arrive looking complete. Unanswered reads are
+/// reported in `UiSnapshot::unreadable` instead.
+const CALL_TIMEOUT: Duration = Duration::from_millis(1200);
+
+/// Do not poke a bus that just went deaf, for this long.
+///
+/// A read that overruns its deadline cannot be cancelled: the worker thread stays
+/// parked on the socket. The cooldown keeps that to one parked thread per wedged
+/// application per window instead of one per observation, which is the difference
+/// between a survivable leak and an unbounded one.
+const WEDGED_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Buses known to have gone deaf, with when they last did.
+static WEDGED: std::sync::Mutex<Option<std::collections::HashMap<String, Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// A read that the peer did not answer in time.
+enum Stall {
+    /// No reply within the deadline; the read is now parked on a worker thread.
+    NoReply,
+    /// Not even attempted: the same bus went deaf inside the cooldown window.
+    CoolingDown,
+}
+
+/// Why a single bus call ended the way it did.
+#[derive(Debug)]
+enum Attempt<T> {
+    /// The toolkit replied.
+    Answered(T),
+    /// It answered "I do not implement that": a fact about the control.
+    NoPattern(String),
+    /// It said nothing, or was already known deaf. We know nothing here.
+    Unanswered(String),
+}
+
+/// One method call, deadline-bounded and classified.
+///
+/// The three-way split is the point. Before this, silence fell through to the
+/// same branch as "no such interface", so an application that never answered was
+/// reported as a control that cannot be invoked -- and the caller's documented
+/// response to that is a coordinate click.
+fn attempted<T, F>(conn: &Connection, bus: &str, work: F) -> Attempt<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Connection) -> std::result::Result<T, String> + Send + 'static,
+{
+    let owned = conn.clone();
+    classify(timed(bus, move || work(owned)))
+}
+
+/// The classification on its own, so it can be tested without a bus: silence, an
+/// absent interface and a reply are three different facts.
+fn classify<T>(outcome: std::result::Result<std::result::Result<T, String>, Stall>) -> Attempt<T> {
+    match outcome {
+        Err(Stall::NoReply) => {
+            Attempt::Unanswered(format!("no reply within {}ms", CALL_TIMEOUT.as_millis()))
+        }
+        Err(Stall::CoolingDown) => Attempt::Unanswered(format!(
+            "not attempted: this bus was deaf within the last {}s",
+            WEDGED_COOLDOWN.as_secs()
+        )),
+        Ok(Ok(value)) => Attempt::Answered(value),
+        Ok(Err(reason)) => match unanswered(&reason) {
+            Some(_) => Attempt::Unanswered(reason),
+            None => Attempt::NoPattern(reason),
+        },
+    }
+}
+
+/// The one failure a caller must not act on, phrased so they cannot misread it.
+fn unanswered_call(what: &str, name: &str, reason: &str) -> Error {
+    Error::Lookup(format!(
+        "did not get an answer for {what} on {name:?}: {reason}. This is not \"the control has no {what} pattern\" -- nobody replied, so the control may well support it"
+    ))
+}
+
+/// Build a proxy and call one method, keeping the bus's own wording for failures.
+fn proxy_call<T, B>(
+    conn: &Connection,
+    dest: &str,
+    path: &str,
+    iface: &str,
+    method: &str,
+    body: &B,
+) -> std::result::Result<T, String>
+where
+    T: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
+    B: serde::ser::Serialize + zbus::zvariant::DynamicType,
+{
+    match Proxy::new(conn, dest, path, iface) {
+        Ok(proxy) => proxy
+            .call::<_, _, T>(method, body)
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn mark_wedged(bus: &str) {
+    if let Ok(mut guard) = WEDGED.lock() {
+        let map = guard.get_or_insert_with(Default::default);
+        map.insert(bus.to_string(), Instant::now());
+    }
+}
+
+fn is_wedged(bus: &str) -> bool {
+    let Ok(guard) = WEDGED.lock() else {
+        return false;
+    };
+    let Some(map) = guard.as_ref() else {
+        return false;
+    };
+    map.get(bus)
+        .is_some_and(|since| since.elapsed() < WEDGED_COOLDOWN)
+}
+
+/// Run one round of bus reads where it cannot pin the caller.
+///
+/// zbus 5's blocking API has no client-side reply timeout: `Proxy::call` and
+/// `blocking::Connection::call_method` both just `block_on` the async call, and
+/// `Builder::method_timeout` is honoured only by the async `Connection::call`,
+/// which the blocking type does not expose. Measured on CI (run 40118056194): a
+/// connection built with `method_timeout(1200ms)` still had not returned after
+/// 180 seconds against a peer under `SIGSTOP`.
+///
+/// So the deadline lives here. The work runs on a worker thread holding its own
+/// clone of the connection; the caller waits `CALL_TIMEOUT` and, when that
+/// expires, reports the subtree as unreadable rather than hanging the walk.
+fn timed<T, F>(bus: &str, work: F) -> std::result::Result<T, Stall>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if is_wedged(bus) {
+        return Err(Stall::CoolingDown);
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(1);
+    // A panicked worker is treated as no reply: the node is then reported rather
+    // than silently absent, which is the whole point of the ledger.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|_| Stall::NoReply)?;
+    match receiver.recv_timeout(CALL_TIMEOUT) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            mark_wedged(bus);
+            Err(Stall::NoReply)
+        }
+    }
+}
+
+/// How long one tree walk may spend waiting on the bus in total.
+///
+/// The per-call timeout bounds a single read; this bounds the observation. A
+/// desktop with several wedged applications would otherwise multiply
+/// `calls x timeout` into something the caller cannot wait for, and "give up
+/// politely and say what was not attempted" is the contract.
+const WALK_BUDGET: Duration = Duration::from_millis(6000);
+
+/// What one traversal produced: the nodes it read, plus what it could not read.
+struct WalkReport {
+    truncated: bool,
+    unreadable: Vec<crate::Unreadable>,
+}
+
+/// Did the control simply not implement this, or did nobody answer?
+///
+/// Only the second belongs in `unreadable`. Most containers have no Component
+/// interface and no Name property, and calling those failures would bury the
+/// application that is really stuck.
+fn unanswered(reason: &str) -> Option<String> {
+    // Strip spaces and lowercase: zbus renders a D-Bus failure as the interface
+    // name (`org.freedesktop.DBus.Error.UnknownInterface`) next to a human
+    // sentence ("No such interface ... on object"), and either half can be the one
+    // that says the interface is absent rather than unanswered.
+    let flat: String = reason
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let absent = [
+        "unknowninterface",
+        "unknownproperty",
+        "unknownmethod",
+        "unknownobject",
+        "nosuchinterface",
+        "notsupported",
+    ]
+    .iter()
+    .any(|needle| flat.contains(needle));
+    (!absent).then(|| shorten(reason))
+}
+
+/// Keep the bus's own wording but not its whole banner.
+fn shorten(reason: &str) -> String {
+    let one_line = reason.lines().next().unwrap_or_default().trim();
+    let trimmed = one_line.trim_start_matches("io error: ").trim();
+    trimmed.chars().take(160).collect()
+}
+
+/// Record a read that went unanswered, if it did.
+fn note(problems: &mut Vec<String>, what: &str, reason: &str) {
+    if let Some(text) = unanswered(reason) {
+        problems.push(format!("{what}: {text}"));
+    }
+}
+
 fn a11y_connection() -> Result<Connection> {
     let session = Connection::session()
         .map_err(|e| Error::Capture(format!("session bus unavailable: {e}")))?;
@@ -31,7 +246,9 @@ fn a11y_connection() -> Result<Connection> {
         .call("GetAddress", &())
         .map_err(|e| Error::Capture(format!("GetAddress failed: {e}")))?;
     zbus::blocking::connection::Builder::address(address.as_str())
-        .and_then(|b| b.build())
+        // Applies only to the async `Connection::call` path; what actually bounds
+        // a wedged peer here is `timed`, so do not read this as the safety net.
+        .and_then(|b| b.method_timeout(CALL_TIMEOUT).build())
         .map_err(|e| Error::Capture(format!("connect a11y bus at {address}: {e}")))
 }
 
@@ -44,36 +261,90 @@ fn children(conn: &Connection, dest: &str, path: &str) -> Result<Vec<(String, Ow
     Ok(kids)
 }
 
-fn read_node(conn: &Connection, dest: &str, path: &str) -> NodeData {
+/// The node's fields alone.
+///
+/// For the window-matching reads, where a failure already surfaces as a refusal
+/// that names what the bus did show -- reporting it twice would be noise.
+fn read_node_data(conn: &Connection, dest: &str, path: &str) -> NodeData {
+    read_node(conn, dest, path).0
+}
+
+/// Read one node, within the walk's reply deadline.
+///
+/// Returns an empty node plus the reason when the peer is deaf, so the caller can
+/// report the hole instead of losing it.
+fn read_node(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
+    let conn = conn.clone();
+    let dest_owned = dest.to_string();
+    let path_owned = path.to_string();
+    match timed(dest, move || read_node_raw(&conn, &dest_owned, &path_owned)) {
+        Ok(pair) => pair,
+        Err(Stall::NoReply) => (
+            (String::new(), 0, (0, 0, 0, 0), Vec::new()),
+            vec![format!("no reply within {}ms", CALL_TIMEOUT.as_millis())],
+        ),
+        Err(Stall::CoolingDown) => (
+            (String::new(), 0, (0, 0, 0, 0), Vec::new()),
+            vec![format!(
+                "not re-attempted: this bus was deaf within the last {}s",
+                WEDGED_COOLDOWN.as_secs()
+            )],
+        ),
+    }
+}
+
+/// Read one node, keeping a note of any read that went unanswered.
+///
+/// The node is still returned with whatever did arrive: a control whose name is
+/// unknown but whose rectangle answered is useful, and dropping it silently was
+/// the old failure. What changed is that the caller now also learns which reads
+/// nobody answered.
+fn read_node_raw(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
     let mut name = String::new();
     let mut role = 0u32;
     let mut kids = Vec::new();
+    let mut problems = Vec::new();
 
-    if let Ok(proxy) = Proxy::new(conn, dest, path, "org.a11y.atspi.Accessible") {
-        if let Ok(n) = proxy.get_property::<String>("Name") {
-            name = n;
+    match Proxy::new(conn, dest, path, "org.a11y.atspi.Accessible") {
+        Ok(proxy) => {
+            match proxy.get_property::<String>("Name") {
+                Ok(n) => name = n,
+                Err(e) => note(&mut problems, "name", &e.to_string()),
+            }
+            // AT-SPI exposes the role through methods, not a D-Bus property.
+            match proxy.call::<_, _, u32>("GetRole", &()) {
+                Ok(r) => role = r,
+                Err(e) => {
+                    // Some toolkits only answer the name form; only if both are
+                    // silent is this a read nobody answered.
+                    let reason = e.to_string();
+                    match proxy.call::<_, _, String>("GetRoleName", &()) {
+                        Ok(role_name) => role = role_from_name(&role_name),
+                        Err(e2) => note(&mut problems, "role", &format!("{reason}; {e2}")),
+                    }
+                }
+            }
+            match proxy.call::<_, _, Kids>("GetChildren", &()) {
+                Ok(k) => kids = k,
+                Err(e) => note(&mut problems, "children", &e.to_string()),
+            }
         }
-        // AT-SPI exposes the role through methods, not a D-Bus property.
-        if let Ok(r) = proxy.call::<_, _, u32>("GetRole", &()) {
-            role = r;
-        } else if let Ok(name) = proxy.call::<_, _, String>("GetRoleName", &()) {
-            role = role_from_name(&name);
-        }
-        if let Ok(k) = proxy.call::<_, _, Vec<(String, OwnedObjectPath)>>("GetChildren", &()) {
-            kids = k;
-        }
+        Err(e) => note(&mut problems, "accessible", &e.to_string()),
     }
 
-    let rect = Proxy::new(conn, dest, path, "org.a11y.atspi.Component")
-        .ok()
-        .and_then(|p| {
-            p.call::<_, _, (i32, i32, i32, i32)>("GetExtents", &(0u32,))
-                .ok()
-        })
-        .map(|(x, y, w, h)| (x, y, if w > 0 { w } else { 0 }, if h > 0 { h } else { 0 }))
-        .unwrap_or((0, 0, 0, 0));
+    let rect = match Proxy::new(conn, dest, path, "org.a11y.atspi.Component") {
+        Ok(proxy) => match proxy.call::<_, _, (i32, i32, i32, i32)>("GetExtents", &(0u32,)) {
+            Ok((x, y, w, h)) => (x, y, if w > 0 { w } else { 0 }, if h > 0 { h } else { 0 }),
+            Err(e) => {
+                note(&mut problems, "extents", &e.to_string());
+                (0, 0, 0, 0)
+            }
+        },
+        // Not every control is a component, so a proxy failure here is expected.
+        Err(_) => (0, 0, 0, 0),
+    };
 
-    (name, role, rect, kids)
+    ((name, role, rect, kids), problems)
 }
 
 /// Fallback mapping when only a localized role name is available.
@@ -100,7 +371,7 @@ fn walk(
     max_nodes: usize,
     max_depth: usize,
     visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
-) -> Result<(bool, bool)> {
+) -> Result<WalkReport> {
     let conn = a11y_connection()?;
     let root_kids = children(&conn, REGISTRY, ROOT_PATH)?;
     walk_from(&conn, root_kids, max_nodes, max_depth, visit)
@@ -115,9 +386,11 @@ fn walk_from(
     max_nodes: usize,
     max_depth: usize,
     visit: &mut dyn FnMut(&Connection, &UiNode, &str, &str) -> bool,
-) -> Result<(bool, bool)> {
+) -> Result<WalkReport> {
     let mut truncated = false;
+    let mut unreadable: Vec<crate::Unreadable> = Vec::new();
     let mut visited = 0usize;
+    let deadline = Instant::now() + WALK_BUDGET;
     let mut stack: Vec<(String, String, usize)> = starts
         .into_iter()
         .rev()
@@ -129,12 +402,35 @@ fn walk_from(
             truncated = true;
             break;
         }
+        if Instant::now() >= deadline {
+            // Named by the first node it refused to attempt: the walk does not
+            // know what else would have answered, and saying so is the point.
+            truncated = true;
+            unreadable.push(crate::Unreadable {
+                bus: dest.clone(),
+                path: path.clone(),
+                reason: format!(
+                    "not attempted: the {}ms walk budget ran out after {visited} node(s)",
+                    WALK_BUDGET.as_millis()
+                ),
+            });
+            break;
+        }
         if depth > max_depth {
             truncated = true;
             continue;
         }
 
-        let (name, role, rect, kids) = read_node(conn, &dest, &path);
+        let ((name, role, rect, kids), problems) = read_node(conn, &dest, &path);
+        // Recorded whether or not the node survives: a control whose rectangle
+        // nobody answered is still a hole in what the caller can trust.
+        if !problems.is_empty() {
+            unreadable.push(crate::Unreadable {
+                bus: dest.clone(),
+                path: path.clone(),
+                reason: problems.join("; "),
+            });
+        }
         if name.is_empty() && rect.2 == 0 && kids.is_empty() {
             continue;
         }
@@ -156,7 +452,10 @@ fn walk_from(
             selected: false,
         };
         if visit(conn, &node, &dest, &path) {
-            return Ok((truncated, true));
+            return Ok(WalkReport {
+                truncated,
+                unreadable,
+            });
         }
 
         if kids.len() + visited > max_nodes {
@@ -167,7 +466,10 @@ fn walk_from(
         }
     }
 
-    Ok((truncated, false))
+    Ok(WalkReport {
+        truncated,
+        unreadable,
+    })
 }
 
 /// Roles that own a window on screen: frame, dialog and window.
@@ -264,7 +566,7 @@ pub fn snapshot_window(
     let mut observed: Vec<String> = Vec::new();
 
     for (dest, path) in &apps {
-        let (name, _role, _rect, _kids) = read_node(&conn, dest, path);
+        let (name, _role, _rect, _kids) = read_node_data(&conn, dest, path);
         observed.push(if name.is_empty() {
             dest.clone()
         } else {
@@ -283,11 +585,11 @@ pub fn snapshot_window(
         None => return Err(Error::Capture(no_frame_message(app, title, pid, &observed))),
     };
 
-    let (_name, _role, _rect, kids) = read_node(&conn, &dest, &path);
+    let (_name, _role, _rect, kids) = read_node_data(&conn, &dest, &path);
     let frames: Vec<(String, OwnedObjectPath)> = kids
         .into_iter()
         .filter(|(fd, fp)| {
-            let (_n, role, _rect, _) = read_node(&conn, fd, fp);
+            let (_n, role, _rect, _) = read_node_data(&conn, fd, fp);
             TOP_LEVEL_ROLES.contains(&role)
         })
         .collect();
@@ -296,7 +598,7 @@ pub fn snapshot_window(
     }
     let frame_names: Vec<String> = frames
         .iter()
-        .map(|(fd, fp)| read_node(&conn, fd, fp).0)
+        .map(|(fd, fp)| read_node_data(&conn, fd, fp).0)
         .collect();
     let chosen = resolve_frame(&frame_names, title).map_err(|seen| {
         Error::Capture(format!(
@@ -307,7 +609,7 @@ pub fn snapshot_window(
 
     let (dest, path) = frames[chosen].clone();
     let mut nodes = Vec::new();
-    let (truncated, _) = walk_from(
+    let report = walk_from(
         &conn,
         vec![(dest, path)],
         max_nodes,
@@ -319,7 +621,11 @@ pub fn snapshot_window(
             false
         },
     )?;
-    Ok(UiSnapshot { nodes, truncated })
+    Ok(UiSnapshot {
+        nodes,
+        truncated: report.truncated,
+        unreadable: report.unreadable,
+    })
 }
 
 /// The application a window list entry refers to. The window list reports a
@@ -353,13 +659,17 @@ fn title_matches(at_spi_name: &str, want: &str) -> bool {
 
 pub fn snapshot(max_nodes: usize, max_depth: usize) -> Result<UiSnapshot> {
     let mut nodes = Vec::new();
-    let (truncated, _) = walk(max_nodes, max_depth, &mut |_, node, _, _| {
+    let report = walk(max_nodes, max_depth, &mut |_, node, _, _| {
         let mut node = node.clone();
         node.index = nodes.len();
         nodes.push(node);
         false
     })?;
-    Ok(UiSnapshot { nodes, truncated })
+    Ok(UiSnapshot {
+        nodes,
+        truncated: report.truncated,
+        unreadable: report.unreadable,
+    })
 }
 
 /// How actionable a role is, used to break name collisions.
@@ -440,45 +750,95 @@ pub fn find(name: &str, max_nodes: usize, max_depth: usize) -> Result<Option<UiN
 }
 
 /// Fire the control's first AT-SPI action (usually "click"/"press").
+///
+/// A control nobody answered is an `Err`, not `Ok(None)`: the caller's documented
+/// response to `None` is a coordinate click, and dropping to coordinates because a
+/// toolkit was silent is exactly the mistake this backend keeps having to unmake.
 pub fn invoke(name: &str) -> Result<Option<UiNode>> {
     let mut hit = None;
+    let mut silence: Option<String> = None;
     walk(600, 10, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
-        if let Ok(action) = Proxy::new(conn, dest, path, "org.a11y.atspi.Action") {
-            if action.call::<_, _, bool>("DoAction", &(0i32,)).is_ok() {
+        let dest_owned = dest.to_string();
+        let path_owned = path.to_string();
+        match attempted(conn, dest, move |conn| {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest_owned,
+                &path_owned,
+                "org.a11y.atspi.Action",
+                "DoAction",
+                &(0i32,),
+            )
+        }) {
+            // DoAction answers with its own success boolean, so a reply of
+            // `false` is "the toolkit refused", not "the control fired": only the
+            // first counts as an invoke.
+            Attempt::Answered(true) => {
                 hit = Some(node.clone());
                 return true;
             }
+            Attempt::Answered(false) => {}
+            Attempt::Unanswered(reason) => {
+                silence = Some(reason);
+            }
+            Attempt::NoPattern(_) => {}
         }
         false
     })?;
+    if hit.is_none() {
+        if let Some(reason) = silence {
+            return Err(unanswered_call("invoke", name, &reason));
+        }
+    }
     Ok(hit)
 }
 
-/// Replace text through the EditableText interface.
+/// Replace text through the EditableText interface. See [`invoke`] for why a
+/// silent toolkit is an `Err` here rather than a `None`.
 pub fn set_value(name: &str, text: &str) -> Result<Option<UiNode>> {
     let mut hit = None;
+    let mut silence: Option<String> = None;
     walk(600, 10, &mut |conn, node, dest, path| {
         if node.name != name || node.rect.2 <= 0 {
             return false;
         }
-        if let Ok(editable) = Proxy::new(conn, dest, path, "org.a11y.atspi.EditableText") {
+        let dest_owned = dest.to_string();
+        let path_owned = path.to_string();
+        let text_owned = text.to_string();
+        match attempted(conn, dest, move |conn| {
             // SetTextContents answers with a boolean. Decoding it as nothing
             // made a call that the toolkit *had* applied look like a control
             // without the interface, which is the opposite of what the caller
             // needs to know.
-            if editable
-                .call::<_, _, bool>("SetTextContents", &(text,))
-                .unwrap_or(false)
-            {
+            proxy_call::<bool, _>(
+                &conn,
+                &dest_owned,
+                &path_owned,
+                "org.a11y.atspi.EditableText",
+                "SetTextContents",
+                &(text_owned,),
+            )
+        }) {
+            Attempt::Answered(true) => {
                 hit = Some(node.clone());
                 return true;
             }
+            Attempt::Answered(false) => {}
+            Attempt::Unanswered(reason) => {
+                silence = Some(reason);
+            }
+            Attempt::NoPattern(_) => {}
         }
         false
     })?;
+    if hit.is_none() {
+        if let Some(reason) = silence {
+            return Err(unanswered_call("set_value", name, &reason));
+        }
+    }
     Ok(hit)
 }
 
@@ -559,12 +919,28 @@ fn decode_state(node: &UiNode, words: &[u32]) -> crate::ControlState {
 }
 
 /// `org.a11y.atspi.Accessible.GetState`: no arguments, an array of u32.
+///
+/// Bounded like every other call: `control_state` on a wedged application used to
+/// wait on the peer forever, which is the same silence the tree walk now reports.
 fn state_words(conn: &Connection, dest: &str, path: &str) -> Result<Vec<u32>> {
-    let proxy = Proxy::new(conn, dest, path, "org.a11y.atspi.Accessible")
-        .map_err(|e| Error::Capture(format!("state proxy {path}: {e}")))?;
-    proxy
-        .call::<_, _, Vec<u32>>("GetState", &())
-        .map_err(|e| Error::Capture(format!("GetState {path}: {e}")))
+    let dest_owned = dest.to_string();
+    let path_owned = path.to_string();
+    match attempted(conn, dest, move |owned| {
+        proxy_call::<Vec<u32>, _>(
+            &owned,
+            &dest_owned,
+            &path_owned,
+            "org.a11y.atspi.Accessible",
+            "GetState",
+            &(),
+        )
+    }) {
+        Attempt::Answered(words) => Ok(words),
+        Attempt::NoPattern(reason) => Err(Error::Capture(format!("GetState {path}: {reason}"))),
+        Attempt::Unanswered(reason) => Err(Error::Lookup(format!(
+            "did not get state for {path}: {reason}. This is not \"the control has no state\""
+        ))),
+    }
 }
 
 /// Read one control's state by accessible name.
@@ -768,6 +1144,61 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_toolkit_is_not_reported_as_a_missing_pattern() {
+        // The proof of the action-side fix, and deliberately not a CI check: only
+        // here can all three outcomes be forced regardless of which application
+        // the walk happens to reach first.
+        assert!(matches!(classify(Ok(Ok(true))), Attempt::Answered(true)));
+
+        match classify::<bool>(Err(Stall::NoReply)) {
+            Attempt::Unanswered(reason) => assert!(
+                reason.contains("no reply within"),
+                "the deadline must say it was the deadline: {reason}"
+            ),
+            other => panic!("a stalled call must be Unanswered, got {other:?}"),
+        }
+        match classify::<bool>(Err(Stall::CoolingDown)) {
+            Attempt::Unanswered(reason) => assert!(reason.contains("was deaf"), "{reason}"),
+            other => panic!("a cooled-down bus is still silence, got {other:?}"),
+        }
+
+        // "I do not implement that" is a fact about the control.
+        match classify::<bool>(Ok(Err(
+            "org.freedesktop.DBus.Error.UnknownInterface: nope".into()
+        ))) {
+            Attempt::NoPattern(reason) => assert!(reason.contains("UnknownInterface"), "{reason}"),
+            other => panic!("an absent interface must be NoPattern, got {other:?}"),
+        }
+
+        // The bus's own "nobody answered" is not an absent interface. This is the
+        // pair that used to collapse into the same branch.
+        match classify::<bool>(Ok(Err(
+            "org.freedesktop.DBus.Error.NoReply: Did not receive a reply".into(),
+        ))) {
+            Attempt::Unanswered(_) => {}
+            other => panic!("a NoReply is silence, not absence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn silence_is_reported_as_silence_to_the_caller() {
+        let message =
+            unanswered_call("invoke", "probe-toggle", "no reply within 1200ms").to_string();
+        assert!(
+            message.starts_with("accessibility lookup failed: "),
+            "not a capture problem, not a pattern problem: {message}"
+        );
+        assert!(
+            message.contains("did not get an answer for invoke"),
+            "{message}"
+        );
+        assert!(
+            message.contains("This is not \"the control has no invoke pattern\""),
+            "must name the misreading it prevents: {message}"
+        );
+    }
+
+    #[test]
     fn a_state_ordinal_is_a_bit_index_into_the_reply_words() {
         // Ordinal 4 is word 0 bit 4; ordinal 32 is word 1 bit 0. Getting this
         // wrong would silently report a different state than the one set.
@@ -876,6 +1307,120 @@ mod tests {
         assert_eq!(
             decode_state(&node("Button", "plain"), &words_for(&[])).expanded,
             None
+        );
+    }
+
+    #[test]
+    fn a_read_that_never_returns_is_bounded_and_not_retried() {
+        // No bus needed: the point is that a call which never comes back cannot
+        // pin the caller, and that the caller does not keep spawning helpers
+        // against the same deaf peer.
+        let bus = "[:9.999-deadline-test]";
+        let started = Instant::now();
+        let first = timed(bus, || loop {
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let waited = started.elapsed();
+        assert!(
+            matches!(first, Err(Stall::NoReply)),
+            "a stuck read must return"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "the caller waited {waited:?}, not indefinitely"
+        );
+
+        let second_started = Instant::now();
+        let second = timed(bus, || 7u32);
+        assert!(
+            matches!(second, Err(Stall::CoolingDown)),
+            "a bus already known deaf is not poked again"
+        );
+        assert!(
+            second_started.elapsed() < Duration::from_millis(200),
+            "the cooldown path must not wait a second deadline"
+        );
+
+        // And an unrelated bus is still tried, so one wedged application does not
+        // shade the whole desktop.
+        let other = timed("[:9.998-other-bus]", || 42u32);
+        assert!(matches!(other, Ok(42)), "other peers are unaffected");
+    }
+
+    #[test]
+    fn a_missing_interface_is_not_reported_as_an_unanswered_read() {
+        // One sample per marker the classifier recognises, so dropping any single
+        // one of them reddens exactly one case. (An earlier draft put two markers
+        // in one sentence, and quietly covered for its own removal.)
+        for absent in [
+            "org.freedesktop.DBus.Error.UnknownInterface: Thread main reply",
+            "No such interface 'org.a11y.atspi.Component' on object at path /org/a11y/atspi/accessible/1",
+            "org.freedesktop.DBus.Error.UnknownProperty: Property Name not found",
+            "org.freedesktop.DBus.Error.NotSupported: this method is not implemented",
+            // Verbatim from a real tree (CI run 40118967046): an application root
+            // that has no Component interface. The first version of the
+            // classifier reported this as a hole, which is precisely the noise
+            // that would bury a genuinely wedged application.
+            "org.freedesktop.DBus.Error.UnknownMethod: Method \"GetExtents\" with signature \"u\" on interface \"org.a11y.atspi.Component\" does not exist",
+        ] {
+            assert_eq!(
+                unanswered(absent),
+                None,
+                "not implementing an interface is normal, not a hung app: {absent}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_that_did_not_get_an_answer_is_reported() {
+        for stuck in [
+            "org.freedesktop.DBus.Error.NoReply: Did not receive a reply. Possible causes include: the remote application did not send a reply",
+            "FfiError: timeout expired",
+            "io error: connection closed",
+            "Exec timeout(25s)",
+        ] {
+            let noted = unanswered(stuck);
+            assert!(noted.is_some(), "must be reported, not swallowed: {stuck}");
+            assert!(
+                noted.unwrap().chars().count() <= 160,
+                "the reason must not eat the context window"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_is_kept_to_one_bounded_line() {
+        let long = "io error: boom\nsecond line of the banner\nthird";
+        assert_eq!(shorten(long), "boom");
+        let padded = "x".repeat(400);
+        assert_eq!(shorten(&padded).chars().count(), 160);
+    }
+
+    #[test]
+    fn the_ledger_names_a_few_holes_and_counts_the_rest() {
+        use crate::{unreadable_note, Unreadable};
+        assert_eq!(unreadable_note(&[]), None, "a complete tree says nothing");
+
+        let hole = |i: usize| Unreadable {
+            bus: if i == 0 {
+                String::new()
+            } else {
+                format!(":1.{i}")
+            },
+            path: format!("/org/a11y/atspi/accessible/{i}"),
+            reason: "children: NoReply".into(),
+        };
+        let many: Vec<Unreadable> = (0..8).map(hole).collect();
+        let note = unreadable_note(&many).expect("eight holes must be reported");
+        assert!(note.contains("/org/a11y/atspi/accessible/0"), "{note}");
+        assert!(note.contains("[?]"), "an unnamed bus shows as ?");
+        assert!(
+            note.contains("...and 2 more unreadable subtree(s)"),
+            "the cap must still tell the caller how many there were: {note}"
+        );
+        assert!(
+            !note.contains("/org/a11y/atspi/accessible/7"),
+            "past the cap only the count is shown"
         );
     }
 }

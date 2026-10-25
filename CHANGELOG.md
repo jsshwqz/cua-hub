@@ -199,6 +199,80 @@ Linux 上**不设** `CUA_HUB_BROWSER` 直接
   写进第二个文件，脚本断言它恰好是 `["1"]`。少了这一条，"读回来的 toggle 变了"完全可能是
   我把序号解错、恰好命中另一个被置位的状态——控件自己的说法和总线的数字必须分开证。
 
+### 新增：读不到的部分要说出读不到（issue #11 第 6 项）
+
+`atspi.rs` 的遍历原先把所有 zbus 错误咽掉：每个节点串行发 4~5 个 blocking 调用、不设超时
+（走 D-Bus 默认的 ~25s），失败就留空字段继续走。后果比"慢"更糟——一个卡死的应用会让树
+**看起来是完整的**，只是少了它的子树，调用方据此得出"这个应用里没有那个控件"。
+
+按定下的契约改成**带诊断的部分成功**：
+
+- `UiSnapshot` 多一本 `unreadable` 账：每个读不到的子树记下 bus 名、AT-SPI 对象路径
+  （就是索引注册表用的那个标识）以及是哪几个读没应答（`name` / `role` / `children` /
+  `extents`）。节点仍按能读到的部分返回，少掉的部分不再无声。
+- **把"没人答"和"这个控件没这个接口"分开记**：`UnknownInterface` / `UnknownProperty` /
+  `NotSupported` 不记账——没有这条区分，每个 panel 都会变成故障，真卡死的应用反倒被淹掉。
+  分类器写成"去空格再比"，因为同一次失败有两种措辞：
+  `org.freedesktop.DBus.Error.UnknownInterface` 和 `No such interface ... on object`。
+- **一次读最多等 1200ms** —— 但**不是**靠 `method_timeout` 做到的。zbus 5 的 blocking API
+  没有客户端应答超时：`Proxy::call` 与 `blocking::Connection::call_method` 都只是
+  `block_on` 那个 async 调用，而 `Builder::method_timeout` 只在 async `Connection::call`
+  里被读取，blocking 类型不暴露那个方法。真机实测（run `40118056194`）：对端被 `SIGSTOP`
+  之后，设了 `method_timeout(1200ms)` 的连接**连 180s 都没回来**。
+  所以期限改在这里实现：每次节点读跑在一个持有连接克隆的工作线程上，调用方只等
+  `CALL_TIMEOUT`，超时就把这棵子树记成读不到并继续。**代价说清楚**：那次跑着的线程没法取消，
+  会停在 socket 上；因此加了一个 30s 的"这家人聋过"名单，同一 bus 在窗口内不再敲门——
+  把一个装死应用的成本从"每次观测漏一个线程"压到"每 30 秒最多一个"。
+- 整棵树的遍历另有一个 6s 的总预算（`WALK_BUDGET`），超了就停下并点名第一个**没被尝试**的节点。
+  单次期限管不住"200 个节点 × 每节点若干次调用"，总预算才管得住。
+- 输出口：`accessibility_tree` 的文本尾部加 `! parts of this tree were not read:`
+  （最多点名 6 条，其余只给条数）；`window_state` 的 `accessibility` 里多一个
+  **只在有情况时**出现的 `unreadable` 键。
+
+Windows（UIA）那侧**没有**同一本账：`unreadable` 恒空，代码里写明原因（审计这条的范围就是
+AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
+
+### 测试与验证（issue #11 第 6 项）
+
+- 5 条测试（每个宿主都编译）：两种"接口缺失"措辞都不该进账、`NoReply`/timeout/
+  `connection closed` 必须进账且长度受限、`shorten` 只留一行截到 160、账本点名 6 条后
+  仍报剩余条数、以及**永不返回的读会被期限截下且同一 bus 在冷却窗口内不再重试**
+  （这条不要真总线，用一个死循环闭包就能证）。
+- 分类器第一版把 `UnknownMethod` 漏了，CI 的健康树因此出现误报（`[:1.19] extents:
+  UnknownMethod: Method "GetExtents" … does not exist`——那是没有 Component 接口的应用根节点，
+  而同一行输出里 `[:1.20] no reply within 1200ms` 才是真装死的那个）。补 `UnknownMethod` /
+  `UnknownObject`，并加一条**反向断言**：健康的窗口必须什么都不报。缺了它，一个喊狼来的
+  分类器照样全绿。夹具用的是那条真回复的原文。
+- 动作路径（`invoke_control` / `set_control_text` / `control_state`）当时**仍未包期限**，
+  对装死的应用会挂住不返回——不在"加了超时"这句话里混过去。下面一节把它闭合了。
+- **端到端红/绿排在 CI 图形作业里**：新阶段起两个 probe，`SIGSTOP` 其中一个，再取桌面树，
+  三条断言——① 活着那个应用仍在树里（不是整次失败）；② 输出点名读不到的部分；
+  ③ 整体耗时 <10s。
+  **①在修复前就是通的**，这不是我写错的断言，而是这个 bug 的形状：观测"成功"返回，
+  只是静默少了东西。
+
+### 补：动作路径也在期限内，并且不再把沉默当成"不支持"（#28 自己声明的边界）
+
+第 6 项合入前我在 PR 里留了一条边界：**只有树被期限保护**，`invoke_control` /
+`set_control_text` / `control_state` 对装死的应用仍会挂住。这条现在闭合了，
+过程里又挖出同一族的两个问题：
+
+- **沉默、"没这个接口"、"答了"是三件事**。旧代码里 `DoAction` / `SetTextContents` 的
+  失败和"这个控件没有 Action / EditableText 接口"走同一个分支，最终都变成 `Ok(None)`——
+  而 `None` 的文档含义是"控件没有该模式"，调用方据此降级成坐标点击。现在统一走
+  `classify()` 三分类，沉默返回 `Error::Lookup`，消息里直接写明
+  "This is not \"the control has no invoke pattern\""。
+- **`DoAction` 的回包 bool 之前被无视**：旧写法是 `.is_ok()`，也就是一把拿"工具包明确回答
+  我拒绝了"也算触发成功。现在只有 `Answered(true)` 才算。这跟当年 `SetTextContents`
+  把 bool 解成 `()` 是同一类错误，只是这次方向相反。
+- **证明放在能确定性触发的地方**：三分类由本机两条单测钉住（`classify` 拆成纯函数，
+  喂死循环 / `UnknownInterface` / `NoReply` 三种输入）。CI 里那三条"动作也要有界限"
+  的断言**只是不变量守卫，不是这条修复的证据**——因为树已经先跳过了聋掉的应用，
+  动作只会打到活着的那个，修复前那三条同样会绿。这一点写在脚本注释里，
+  免得有人把它们当成红/绿对照。
+  负控：把 `classify` 的 `NoReply` 分支折回 `NoPattern`（= 修复前的形状），
+  `a_silent_toolkit_is_not_reported_as_a_missing_pattern` 立刻红。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。

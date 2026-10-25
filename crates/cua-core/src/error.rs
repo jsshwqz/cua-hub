@@ -25,6 +25,13 @@ pub enum Error {
     #[error("not supported on this platform: {0}")]
     Unsupported(String),
 
+    /// A control could not be located, reached, or answered about -- the failure
+    /// is in the lookup, not in the control and not in the capture. Its own
+    /// variant because the alternative was reporting these through
+    /// `capture failed:`, which sends the reader to a screenshot problem.
+    #[error("accessibility lookup failed: {0}")]
+    Lookup(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 

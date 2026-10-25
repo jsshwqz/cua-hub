@@ -74,6 +74,52 @@ pub fn child_signature(
 pub struct UiSnapshot {
     pub nodes: Vec<UiNode>,
     pub truncated: bool,
+    /// Subtrees the bus did not answer for, so a shorter tree can say what is
+    /// missing instead of looking complete. Empty means every node asked got a
+    /// reply -- not that nothing was missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<Unreadable>,
+}
+
+/// One AT-SPI object the tree could not be read from.
+///
+/// Recorded when an application fails to answer, never when a control simply
+/// does not implement an interface: a panel with no Component interface is the
+/// normal case, and reporting that would bury the applications that actually hung.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Unreadable {
+    /// Bus name the read was attempted against, when one was known.
+    pub bus: String,
+    /// AT-SPI object path, which is also the identity the index registry keys on.
+    pub path: String,
+    /// Which reads went unanswered, joined for a human.
+    pub reason: String,
+}
+
+/// How many unreadable subtrees one observation names before falling back to a
+/// count. Six is enough to show a pattern (one application, not scattered nodes)
+/// without letting a stuck app crowd the tree out of the context window.
+const MAX_UNREADABLE_NAMED: usize = 6;
+
+/// Render the ledger for a model, or `None` when the bus answered everything.
+pub fn unreadable_note(unreadable: &[Unreadable]) -> Option<String> {
+    if unreadable.is_empty() {
+        return None;
+    }
+    let mut out = String::from("! parts of this tree were not read:\n");
+    for u in unreadable.iter().take(MAX_UNREADABLE_NAMED) {
+        out.push_str(&format!(
+            "  {} [{}] {}\n",
+            u.path,
+            if u.bus.is_empty() { "?" } else { &u.bus },
+            u.reason
+        ));
+    }
+    let more = unreadable.len().saturating_sub(MAX_UNREADABLE_NAMED);
+    if more > 0 {
+        out.push_str(&format!("  ...and {more} more unreadable subtree(s)\n"));
+    }
+    Some(out)
 }
 
 /// Snapshot of a control's actionable state.
@@ -266,6 +312,9 @@ impl UiSnapshot {
         if self.truncated {
             out.push_str("... (truncated)\n");
         }
+        if let Some(note) = unreadable_note(&self.unreadable) {
+            out.push_str(&note);
+        }
         out
     }
 
@@ -280,6 +329,8 @@ impl UiSnapshot {
         UiSnapshot {
             nodes: selected,
             truncated: false,
+            // A projection of nodes already read cannot add a new blind spot.
+            unreadable: Vec::new(),
         }
         .to_text()
         .lines()
@@ -569,7 +620,13 @@ mod imp {
             nodes.push(node);
             false
         })?;
-        Ok(UiSnapshot { nodes, truncated })
+        Ok(UiSnapshot {
+            nodes,
+            truncated,
+            // UIA reads walk a live element tree and have no per-subtree blind
+            // spot to report yet; only the AT-SPI backend keeps this ledger.
+            unreadable: Vec::new(),
+        })
     }
 
     /// Limits for signature lookup: an action target may sit deeper in the tree
