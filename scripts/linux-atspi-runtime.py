@@ -564,7 +564,15 @@ def scenario(identity: str) -> None:
         # Item 8's hard case, the one the audit found on a panel: a control whose
         # reply says "done" whether or not anything appeared. The verdict is checked
         # against the tree, an independent witness, rather than against the reply.
-        popped = call("invoke_control", {"name": "probe-menu"})
+        # The target names the role because `probe-menu` is also a substring of
+        # the popup item `probe-menu-item`: a bare name now matches both and is
+        # refused, which is the rule this stage is about. The role says which one
+        # this check means without hiding the ambiguity behind an exact-match
+        # special case.
+        popped = call(
+            "invoke_control",
+            {"target": {"name": "probe-menu", "role": "ToggleButton"}},
+        )
         tree_after = call("accessibility_tree", {"max_nodes": 400, "depth": 8})
         opened = "probe-menu-item" in tree_after["text"]
         check(
