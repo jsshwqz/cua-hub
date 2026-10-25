@@ -333,9 +333,24 @@ click" loop, not to be a correctness oracle.
 * **Linux AT-SPI**: `Action.DoAction(0)` for invoke and
   `EditableText.SetTextContents` for set-value. Implemented and compiled in CI,
   but not yet exercised on a live Linux desktop.
-* Controls can be addressed as `name` or `id:<AutomationId>`. The id form is
-  required when the accessible name is dynamic or empty (Win32 edit `15`,
-  Calculator `num1Button`, display `CalculatorResults`).
+* Controls are addressed by a **target**: `name` (case-insensitive substring, a
+  `re:` pattern, or `id:<AutomationId>`) plus optional `role`, `container` and
+  `nth` (0-based). A target that matches more than one control is an error that
+  lists the candidates. Taking the first match -- or the most "actionable" role
+  -- is how a slightly wrong guess used to become a click on a control nobody
+  named. A bare `name` remains shorthand for `{"target": {"name": ...}}`, and
+  sending both `target` and `name` is refused.
+* Resolution and action use the same node. AT-SPI acts on the `(bus name,
+  object path)` pair the walk read; UIA acts on the element RawViewWalker
+  returned. There is deliberately no second lookup by name after resolving,
+  because that re-applies the question to a tree that may have changed.
+* The id form is required when the accessible name is dynamic or empty (Win32
+  edit `15`, Calculator `num1Button`, display `CalculatorResults`). It goes
+  through the same matcher, so it is exact and an ambiguous id is refused too.
+* Cost, measured rather than assumed: a UIA action now walks the tree instead
+  of `FindFirst`. On a 2,326-node desktop a lookup takes about 15s; the
+  control-view snapshot of the same desktop takes about 14s, so the walk is
+  priced by tree size, not by the walker.
 
 Verified on Windows: `set_control_text(id:15)` filled Notepad through
 ValuePattern (readback via `control_state`), and `invoke_control(id:num1Button)`

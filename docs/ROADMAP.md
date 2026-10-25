@@ -24,6 +24,10 @@
 - [x] Linux AT-SPI2 tree + find (verified in WSL with a GTK3 window)
 - [x] Linux AT-SPI action invocation (DoAction) and full CLI build on Linux
   （DoAction 见上；workspace 在 ubuntu-24.04 上 fmt/clippy/test/release build 全绿）
+- [x] Identity addressing: `target` (name/role/container/nth) on both backends,
+  ambiguous targets refused instead of picked, actions fire on the walked node
+  ((bus, path) on AT-SPI, RawViewWalker element on UIA), `name` kept as
+  shorthand (PR #37)
 - [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health
 - [ ] Engine fallback on repeated failure
