@@ -5,6 +5,7 @@
 //! printed for debugging. Invoking controls by name comes next.
 
 pub mod atspi;
+pub mod target;
 
 use cua_core::Result;
 use serde::{Deserialize, Serialize};

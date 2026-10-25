@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 cua-core = { path = "../cua-core" }
+regex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 # Pure-Rust D-Bus client; used by the Linux AT-SPI backend. Kept unconditional
 # so the module type-checks on every host, not just Linux.
 zbus = { version = "5", features = ["blocking-api"] }
