@@ -158,7 +158,7 @@ export OPENROUTER_API_KEY=sk-or-...
 
 解析和动手对着同一个节点：Linux 上身份是 `(bus name, object path)`，Windows 上用
 RawViewWalker 走到哪个元素就对哪个元素动手，解析之后不再按名二次查找。代价是 Windows
-动作从"按名 FindFirst"变成每次走一遍树：本机 2326 个可见节点的桌面上一次 `find_control`
+动作从"按名 FindFirst"变成每次走一遍树：本机约 2300 个可见节点的桌面上一次 `find_control`
 约 15s（同等节点的 control-view 快照也要 14s，慢在树的大小，不在 walker）。
 
 远程/容器内调用可以走 HTTP（streamable POST）：

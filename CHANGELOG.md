@@ -36,7 +36,7 @@ RawViewWalker 走到的元素，解析之后不再按名二次查找（二次查
 - 截断的 walk 继续报 `did not reach`（不是"没有这个控件/没有这个模式"）；歧义与 `nth`
   越界明说重跑不会改变。两个后端共用同一套措辞。
 - **代价（不藏在"更准"后面）**：Windows 动作从按名 `FindFirst` 改为每次动作走一遍树。
-  本机 Windows 10、2326 个 control-view 节点的桌面、debug 构建、单轮测量：`find` 约 15s；
+  本机 Windows 10、约 2300 个 control-view 节点的桌面、debug 构建、单轮测量：`find` 约 15s；
   同轮同规模的 control-view 快照约 14s——成本在树的大小，不在 walker 本身。共享机上有
   并发任务，这组数字用于说明量级，不作为基准；release 未单独取数。
 - workspace 测试 194 passed / 2 ignored；`cargo fmt --check` 与
