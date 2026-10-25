@@ -269,28 +269,32 @@ fn main() -> Result<()> {
             name,
             max_nodes,
             depth,
-        } => match cua_engine_access::find(&name, max_nodes, depth)? {
-            Some(node) => {
-                let (x, y, w, h) = node.rect;
-                println!(
-                    "{} \"{}\" at ({x},{y},{w},{h}) center=({},{})",
-                    node.control_type,
-                    node.name,
-                    x + w / 2,
-                    y + h / 2
-                );
-                Ok(())
+        } => {
+            let target = cua_engine_access::target::Target::by_name(&name);
+            match cua_engine_access::find_target(&target, max_nodes, depth) {
+                Ok(node) => {
+                    let (x, y, w, h) = node.rect;
+                    println!(
+                        "{} \"{}\" at ({x},{y},{w},{h}) center=({},{})",
+                        node.control_type,
+                        node.name,
+                        x + w / 2,
+                        y + h / 2
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
             }
-            None => bail!("no control matching {name:?}"),
-        },
+        }
         Command::Invoke {
             name,
             max_nodes,
             depth,
         } => {
-            // Prefer the Invoke pattern: no pointer movement, works when the
+            let target = cua_engine_access::target::Target::by_name(&name);
+            // Prefer the accessibility action: no pointer movement, works when the
             // control is covered by another window.
-            if let Some(report) = cua_engine_access::invoke(&name)? {
+            if let Some(report) = cua_engine_access::invoke_target(&target, max_nodes, depth)? {
                 println!(
                     "invoked {} \"{}\" via accessibility pattern; effect={}",
                     report.node.control_type,
@@ -299,8 +303,7 @@ fn main() -> Result<()> {
                 );
                 return Ok(());
             }
-            let node = cua_engine_access::find(&name, max_nodes, depth)?
-                .ok_or_else(|| anyhow::anyhow!("no control matching {name:?}"))?;
+            let node = cua_engine_access::find_target(&target, max_nodes, depth)?;
             let (x, y, w, h) = node.rect;
             let action = Action::Click {
                 at: cua_core::Point::new(x + w / 2, y + h / 2),

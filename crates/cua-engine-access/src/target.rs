@@ -18,8 +18,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
-    /// Case-insensitive substring of the accessible name, or a pattern when it starts
-    /// with `re:` (matched case-insensitively, unanchored unless you anchor it).
+    /// Case-insensitive substring of the accessible name, a pattern when it starts
+    /// with `re:` (matched case-insensitively, unanchored unless you anchor it), or
+    /// `id:<AutomationId>` for a control whose name is dynamic or empty.
     pub name: String,
     /// The control type it must be, e.g. `Button`. Case-insensitive exact match.
     #[serde(default)]
@@ -50,6 +51,9 @@ pub struct Facts<'a> {
     pub name: &'a str,
     /// The control type as the tree reports it (`Button`, `CheckBox`, ...).
     pub role: &'a str,
+    /// The provider's automation id, for `id:<AutomationId>` targets. On AT-SPI
+    /// this is empty: the bus has no such id, so `id:` finds nothing there.
+    pub automation_id: &'a str,
     /// Enclosing groups, **nearest first**: a `container` matches if any of them does.
     pub ancestors: &'a [String],
 }
@@ -126,9 +130,15 @@ impl Miss {
 enum NameTest {
     Contains(String),
     Regex(regex::Regex),
+    /// `id:<AutomationId>`: exact, case-sensitive, against the provider's id.
+    /// Controls whose accessible name changes (or is empty) still need an address.
+    AutomationId(String),
 }
 
 fn name_test(pattern: &str) -> Result<NameTest, Miss> {
+    if let Some(id) = pattern.strip_prefix("id:") {
+        return Ok(NameTest::AutomationId(id.to_string()));
+    }
     if let Some(re) = pattern.strip_prefix("re:") {
         return regex::RegexBuilder::new(re)
             .case_insensitive(true)
@@ -147,12 +157,22 @@ impl NameTest {
         match self {
             NameTest::Contains(needle) => haystack.to_lowercase().contains(needle),
             NameTest::Regex(re) => re.is_match(haystack),
+            NameTest::AutomationId(_) => false,
+        }
+    }
+
+    /// The same question against a candidate: a name test looks at the name,
+    /// an `id:` test at the automation id.
+    fn holds_fact(&self, facts: &Facts) -> bool {
+        match self {
+            NameTest::AutomationId(id) => facts.automation_id == id,
+            other => other.holds(facts.name),
         }
     }
 }
 
 fn matches_one(facts: &Facts, target: &Target, name: &NameTest, container: &NameTest) -> bool {
-    if !name.holds(facts.name) {
+    if !name.holds_fact(facts) {
         return false;
     }
     if let Some(role) = &target.role {
@@ -185,7 +205,7 @@ pub fn select(facts: &[Facts<'_>], target: &Target) -> Result<usize, Miss> {
         }
         // Worth mentioning only when the name is the part that matched: that is the
         // case where a missing `role` or `container` is the caller's real problem.
-        if name.holds(fact.name) && nearby.len() < 6 {
+        if name.holds_fact(fact) && nearby.len() < 6 {
             nearby.push(fact.describe());
         }
     }
@@ -246,6 +266,7 @@ mod tests {
             .map(|(role, name, ancestors)| Facts {
                 name,
                 role,
+                automation_id: "",
                 ancestors,
             })
             .collect()
@@ -434,17 +455,48 @@ mod tests {
     }
 
     #[test]
+    fn an_automation_id_names_a_control_whose_name_is_dynamic_or_empty() {
+        let held = vec![
+            Facts {
+                name: "",
+                role: "Edit",
+                automation_id: "15",
+                ancestors: NONE,
+            },
+            Facts {
+                name: "",
+                role: "Edit",
+                automation_id: "151",
+                ancestors: NONE,
+            },
+        ];
+        assert_eq!(select(&held, &Target::by_name("id:15")), Ok(0));
+        // Exact, not a prefix: `id:1` must not pick the first control that starts
+        // with it, which is just the old first-match rule wearing an id.
+        assert!(matches!(
+            select(&held, &Target::by_name("id:1")),
+            Err(Miss::NotFound { .. })
+        ));
+        assert!(matches!(
+            select(&held, &Target::by_name("id:nothing")),
+            Err(Miss::NotFound { .. })
+        ));
+    }
+
+    #[test]
     fn facts_are_described_the_way_the_error_will_quote_them() {
         let inside = vec!["File menu".to_string()];
         let fact = Facts {
             name: "Open",
             role: "MenuItem",
+            automation_id: "",
             ancestors: &inside,
         };
         assert_eq!(fact.describe(), "MenuItem \"Open\", in \"File menu\"");
         let bare = Facts {
             name: "Open",
             role: "Button",
+            automation_id: "",
             ancestors: NONE,
         };
         assert_eq!(bare.describe(), "Button \"Open\"");

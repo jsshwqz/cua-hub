@@ -3,8 +3,9 @@ fn main() {
     let name = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Click Me".to_string());
-    match cua_engine_access::find(&name, 400, 8) {
-        Ok(Some(node)) => {
+    let target = cua_engine_access::target::Target::by_name(&name);
+    match cua_engine_access::find_target(&target, 400, 8) {
+        Ok(node) => {
             let (x, y, w, h) = node.rect;
             println!(
                 "{} \"{}\" at ({x},{y},{w},{h}) center=({},{})",
@@ -13,10 +14,6 @@ fn main() {
                 x + w / 2,
                 y + h / 2
             );
-        }
-        Ok(None) => {
-            eprintln!("no control matching {name:?}");
-            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("find failed: {e}");
