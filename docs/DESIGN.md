@@ -153,14 +153,19 @@ unless `--headed` is given. It then talks CDP directly over WebSocket:
   target; closing the current tab reconnects to the first remaining page
 
 Security: `eval` executes model-generated JavaScript. The temporary profile has
-no user cookies or saved logins, and the prompt forbids submitting forms,
-purchasing, or logging in unless asked — but that is a policy, not a sandbox.
-Treat the browser engine as executing untrusted code on the model's behalf.
+no user cookies or saved logins. Each step now also passes the shared
+confirmation gate (`cua_core::policy::confirm`) before it is fired: `eval` is
+High and needs `allow_high`, a cross-site `navigate`, a click on a submit-looking
+target and any `press Enter` are Medium and need `yes` — the prompt's ban on
+submitting forms was always a policy rather than a sandbox, and the tiers are
+where that policy stops being only words. Treat the browser engine as executing
+untrusted code on the model's behalf, with a permission switch per tier.
 
 Browser actions live in their own enum rather than `cua_core::Action`: DOM
-selectors and page evaluation do not map onto mouse coordinates. The router
-dispatches URL tasks to this engine and maps its outcome back into the shared
-`RunReport`.
+selectors and page evaluation do not map onto mouse coordinates. They carry a
+`risk()` of their own instead, so the one gate serves both action spaces. The
+router dispatches URL tasks to this engine and maps its outcome back into the
+shared `RunReport`.
 
 ## Replay
 

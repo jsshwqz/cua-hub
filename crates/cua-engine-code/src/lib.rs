@@ -30,7 +30,10 @@ impl CodeEngine {
         &self.config.model
     }
 
-    async fn complete(&self, messages: Value) -> Result<String> {
+    /// Returns the reply text together with whether it came out of the model's
+    /// reasoning rather than its content: the caller has to price that difference
+    /// into the action, and a string alone cannot carry it.
+    async fn complete(&self, messages: Value) -> Result<(String, bool)> {
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -61,7 +64,7 @@ impl CodeEngine {
                         let message = &value["choices"][0]["message"];
                         if let Some(s) = message["content"].as_str() {
                             if !s.trim().is_empty() {
-                                return Ok(s.to_string());
+                                return Ok((s.to_string(), false));
                             }
                         }
                         // Reasoning models may spend the whole budget thinking
@@ -69,8 +72,10 @@ impl CodeEngine {
                         // embedded in `reasoning`. Let the parser decide.
                         if let Some(reasoning) = message["reasoning"].as_str() {
                             if !reasoning.trim().is_empty() {
-                                tracing::warn!("code model returned reasoning only; extracting");
-                                return Ok(reasoning.to_string());
+                                tracing::warn!(
+                                    "code model returned reasoning only; extracting the action from it and raising one risk tier"
+                                );
+                                return Ok((reasoning.to_string(), true));
                             }
                         }
                         return Err(Error::Provider(format!(
@@ -152,8 +157,8 @@ impl Engine for CodeEngine {
             { "role": "system", "content": system_prompt(shell_name) },
             { "role": "user", "content": user }
         ]);
-        let content = self.complete(messages).await?;
-        parse_command(&content)
+        let (content, from_reasoning) = self.complete(messages).await?;
+        parse_command_with(&content, from_reasoning)
     }
 }
 
@@ -182,8 +187,18 @@ fn summary(action: &Action) -> String {
     }
 }
 
-/// Parse `{"command":..}` / `{"done":..}` / `{"fail":..}` from a model reply.
+/// Parse a reply the model stated as its answer.
 pub fn parse_command(content: &str) -> Result<Action> {
+    parse_command_with(content, false)
+}
+
+/// Parse `{"command":..}` / `{"done":..}` / `{"fail":..}` from a model reply.
+///
+/// `from_reasoning` marks where the text was recovered from, which costs the command
+/// one risk tier at [`Action::risk`]: a chain of thought holds hypotheticals and
+/// negations, and an extractor that scans it for JSON cannot tell "do not run X"
+/// from "run X".
+pub fn parse_command_with(content: &str, from_reasoning: bool) -> Result<Action> {
     let value = extract_object(content).ok_or(Error::NoActionableContent)?;
 
     if value.get("command").is_some() {
@@ -198,6 +213,7 @@ pub fn parse_command(content: &str) -> Result<Action> {
         return Ok(Action::RunCommand {
             command,
             shell: ShellKind::Auto,
+            from_reasoning,
         });
     }
     if value.get("done").and_then(Value::as_bool).unwrap_or(false) {
@@ -276,11 +292,50 @@ fn extract_object(s: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cua_core::Risk;
 
     #[test]
     fn parses_command() {
         let a = parse_command(r#"{"command":"Get-PSDrive C"}"#).unwrap();
         assert!(matches!(a, Action::RunCommand { command, .. } if command == "Get-PSDrive C"));
+    }
+
+    #[test]
+    fn a_stated_reply_is_not_marked_as_reasoning() {
+        // The default matters as much as the flag: `parse_command` is what every
+        // caller that has content uses, and it must not price them up.
+        let a = parse_command(r#"{"command":"ls"}"#).unwrap();
+        assert!(matches!(
+            a,
+            Action::RunCommand {
+                from_reasoning: false,
+                ..
+            }
+        ));
+        assert_eq!(a.risk(), Risk::Low);
+    }
+
+    #[test]
+    fn a_command_mined_out_of_reasoning_costs_a_tier() {
+        // The audit's exact worry: in a chain of thought this is a negative example,
+        // and an extractor scanning for JSON has no way to know that. What we can do
+        // is refuse to treat it as if the model had said it.
+        let hypothetical = r#"do not run {"command":"cargo build"} here"#;
+        let a = parse_command_with(hypothetical, true).unwrap();
+        assert!(matches!(
+            a,
+            Action::RunCommand {
+                from_reasoning: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            a.risk(),
+            Risk::High,
+            "the same command stated would be {} risk",
+            Risk::Medium.as_str()
+        );
+        assert_eq!(parse_command(hypothetical).unwrap().risk(), Risk::Medium);
     }
 
     #[test]

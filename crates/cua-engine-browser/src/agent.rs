@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use cua_engine_vision::OpenAiConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::cdp::{self, LaunchOptions, PageSummary};
 
@@ -66,11 +67,156 @@ fn default_scroll() -> i32 {
     600
 }
 
+/// Where an action came from, because the same action is not equally trustworthy
+/// from both places. A chain of thought contains hypotheticals and negations
+/// ("do not run `{"action": ...}`"), and none of it was addressed to us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionSource {
+    Content,
+    Reasoning,
+}
+
+/// The host of an http(s) URL, lowercased.
+///
+/// `None` for anything that is not one, including `about:blank`, `mailto:...` and a
+/// bare path: those have no site to be the *same as*, and pretending the word before
+/// a colon is a host would grade `about:blank` as a cross-site jump to a place
+/// called "about".
+fn host_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .split('@')
+        .next_back()
+        .unwrap_or("");
+    let host = host.split(':').next().unwrap_or(host).trim_matches('.');
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn navigate_risk(url: &str, page_url: Option<&str>) -> cua_core::Risk {
+    use cua_core::Risk;
+    // A `javascript:` URL is the eval path wearing a navigate hat, so it takes the
+    // eval tier. The contract did not name it; it named the thing it does.
+    if url
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("javascript:")
+    {
+        return Risk::High;
+    }
+    let Some(target) = host_of(url) else {
+        // Cannot tell where this goes, which is not the same as it being safe.
+        return Risk::Medium;
+    };
+    match page_url.and_then(host_of) {
+        Some(current) if current == target => Risk::Low,
+        // No page to compare against (a fresh tab) is not evidence of same-site.
+        Some(_) => Risk::Medium,
+        None => Risk::Medium,
+    }
+}
+
+fn is_submitting_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "enter" | "return" | "\\r" | "\r"
+    )
+}
+
+/// Does this selector name something that submits?
+///
+/// Reads the selector's shape -- see [`BrowserAction::risk`] for what that can and
+/// cannot catch.
+fn addresses_submit_control(selector: &str) -> bool {
+    let flat = selector.to_ascii_lowercase();
+    [
+        "submit",
+        "type=submit",
+        "type='submit'",
+        "type=\"submit\"",
+        "login",
+        "log-in",
+        "signin",
+        "sign-in",
+        "password",
+        "send",
+        "pay",
+        "purchase",
+        "checkout",
+        "order",
+        "register",
+        "confirm",
+        "proceed",
+    ]
+    .iter()
+    .any(|needle| flat.contains(needle))
+}
+
 fn default_wait_ms() -> u64 {
     5000
 }
 
 impl BrowserAction {
+    /// Whether this action is about to touch the page, or only ends the run.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            BrowserAction::Done { .. } | BrowserAction::Fail { .. }
+        )
+    }
+
+    /// The tier the confirmation gate demands before firing this action.
+    ///
+    /// `page_url` is the page the action would act on, used only to tell a
+    /// same-site navigation from a cross-site one; `None` means there is no page to
+    /// compare against, which is not evidence of sameness.
+    ///
+    /// `Click`'s submit judgement reads the **selector's shape**, not the element it
+    /// resolves to -- nothing has been queried yet at this point. A selector that
+    /// names a submit-ish control is treated as submitting; a precise `#save-button`
+    /// that happens to post a form is not caught here. That is the same limit the
+    /// command classifier has (ROADMAP: 读形状不读意图), and it errs toward Medium.
+    pub fn risk(&self, page_url: Option<&str>) -> cua_core::Risk {
+        use cua_core::Risk;
+        match self {
+            // Arbitrary JavaScript in the page: it can read cookies, forge requests,
+            // and exfiltrate whatever the origin can reach. Never anything less.
+            BrowserAction::Eval { .. } => Risk::High,
+            BrowserAction::Navigate { url } => navigate_risk(url, page_url),
+            BrowserAction::TabNew { url } => navigate_risk(url, page_url),
+            BrowserAction::Click { selector } => {
+                if addresses_submit_control(selector) {
+                    Risk::Medium
+                } else {
+                    Risk::Low
+                }
+            }
+            // The contract puts Enter with the submitting actions, not with the keys:
+            // in a form field it is the submit, whatever the selector looked like.
+            BrowserAction::Press { key } => {
+                if is_submitting_key(key) {
+                    Risk::Medium
+                } else {
+                    Risk::Low
+                }
+            }
+            BrowserAction::Type { .. }
+            | BrowserAction::Wait { .. }
+            | BrowserAction::WaitFor { .. }
+            | BrowserAction::Scroll { .. }
+            | BrowserAction::TabList
+            | BrowserAction::TabSwitch { .. }
+            | BrowserAction::TabClose { .. } => Risk::Low,
+            // Nothing is fired at the browser for these; the run just stops.
+            BrowserAction::Done { .. } | BrowserAction::Fail { .. } => Risk::None,
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             BrowserAction::Navigate { url } => format!("navigate {url}"),
@@ -103,7 +249,9 @@ impl BrowserAction {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Options for one browser task. `Clone` but deliberately not `Debug`: the approval
+/// hook is a `dyn Fn`, same as `RunOptions` in the CLI.
+#[derive(Clone)]
 pub struct BrowserRunOptions {
     pub task: String,
     pub max_steps: u32,
@@ -113,6 +261,12 @@ pub struct BrowserRunOptions {
     pub start_url: Option<String>,
     pub run_dir: Option<PathBuf>,
     pub screenshot_quality: u8,
+    /// The same three switches the single-action path uses. They live here because
+    /// this loop plans and fires its own actions, and a gate that only guards the
+    /// other path is a gate with a door in it.
+    pub yes: bool,
+    pub allow_high: bool,
+    pub approver: Option<cua_core::policy::Approver>,
 }
 
 impl Default for BrowserRunOptions {
@@ -126,6 +280,11 @@ impl Default for BrowserRunOptions {
             start_url: None,
             run_dir: None,
             screenshot_quality: 70,
+            // Neither default may be `true`: letting a model drive a real browser has
+            // to be said out loud, or answered by a client that can confirm.
+            yes: false,
+            allow_high: false,
+            approver: None,
         }
     }
 }
@@ -201,10 +360,31 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
         let shot = session.screenshot_jpeg(opts.screenshot_quality).await?;
         std::fs::write(run_dir.join(format!("browser-step-{index:02}.jpg")), &shot)?;
 
-        let action = ask(&http, &config, &opts.task, &summary, &history, &shot)
+        let (action, source) = ask(&http, &config, &opts.task, &summary, &history, &shot)
             .await
             .with_context(|| format!("model failed at browser step {index}"))?;
-        eprintln!("[{index:02}] {}", action.describe());
+        let base_risk = action.risk(Some(&summary.url));
+        let risk = if source == ActionSource::Reasoning {
+            base_risk.escalate()
+        } else {
+            base_risk
+        };
+        eprintln!(
+            "[{index:02}] {} [risk={}]",
+            action.describe(),
+            risk.as_str()
+        );
+        if source == ActionSource::Reasoning {
+            // It used to parse the chain of thought in silence, so a step that came
+            // from a hypothetical rather than from what the model chose to say looked
+            // exactly like a normal one in every log.
+            warn!(
+                action = action.describe(),
+                risk = risk.as_str(),
+                stated_risk = base_risk.as_str(),
+                "browser action recovered from model reasoning, not content: raising one tier"
+            );
+        }
 
         match &action {
             BrowserAction::Done { summary } => {
@@ -222,7 +402,26 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
 
         if opts.dry_run {
             record(&mut log, index, &action, "dry-run")?;
-            outcome = BrowserOutcome::DryRun(action.describe());
+            outcome =
+                BrowserOutcome::DryRun(format!("{} [risk={}]", action.describe(), risk.as_str()));
+            break;
+        }
+
+        if let Err(refused) = cua_core::policy::confirm(
+            risk,
+            &action.describe(),
+            opts.yes,
+            opts.allow_high,
+            opts.approver.as_ref(),
+        )
+        .await
+        {
+            // Stop the run rather than skipping one step: the next plan would be built
+            // on a page we deliberately did not touch.
+            let note = format!("blocked before execution: {refused}");
+            record(&mut log, index, &action, &note)?;
+            history.push(format!("#{index} {} => {note}", action.describe()));
+            outcome = BrowserOutcome::Failed(note);
             break;
         }
 
@@ -349,7 +548,7 @@ async fn ask(
     page: &PageSummary,
     history: &[String],
     screenshot: &[u8],
-) -> Result<BrowserAction> {
+) -> Result<(BrowserAction, ActionSource)> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(screenshot);
 
@@ -410,7 +609,11 @@ async fn ask(
                     if content.trim().is_empty() {
                         if let Some(reasoning) = message["reasoning"].as_str() {
                             if reasoning.contains("\"action\"") {
-                                return parse_browser_action(reasoning);
+                                // Kept, not refused -- but it is a chain of thought, not
+                                // something the model decided to say. The caller raises
+                                // the tier and logs where the step really came from.
+                                return parse_browser_action(reasoning)
+                                    .map(|action| (action, ActionSource::Reasoning));
                             }
                         }
                         return Err(anyhow::anyhow!(
@@ -418,7 +621,8 @@ async fn ask(
                             text.chars().take(300).collect::<String>()
                         ));
                     }
-                    return parse_browser_action(content);
+                    return parse_browser_action(content)
+                        .map(|action| (action, ActionSource::Content));
                 }
                 last_err = format!(
                     "HTTP {status}: {}",
@@ -584,6 +788,220 @@ fn default_run_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cua_core::Risk;
+
+    #[test]
+    fn arbitrary_script_is_never_anything_but_high() {
+        assert_eq!(
+            BrowserAction::Eval {
+                script: "document.cookie".into()
+            }
+            .risk(Some("https://example.com")),
+            Risk::High,
+            "eval reads cookies and can send them anywhere the origin can reach"
+        );
+    }
+
+    #[test]
+    fn navigation_is_judged_against_the_page_it_leaves() {
+        let here = Some("https://example.com/products");
+        assert_eq!(
+            BrowserAction::Navigate {
+                url: "https://example.com/cart".into()
+            }
+            .risk(here),
+            Risk::Low,
+            "same host: the contract calls this Low"
+        );
+        assert_eq!(
+            BrowserAction::Navigate {
+                url: "https://other.test/".into()
+            }
+            .risk(here),
+            Risk::Medium,
+            "cross-site is where a task can be carried off to somewhere else"
+        );
+        assert_eq!(
+            BrowserAction::Navigate {
+                url: "https://example.com/".into()
+            }
+            .risk(None),
+            Risk::Medium,
+            "no page to compare against is not evidence of same-site"
+        );
+        assert_eq!(
+            BrowserAction::Navigate {
+                url: "not a url".into()
+            }
+            .risk(here),
+            Risk::Medium,
+            "undeterminable counts as Medium, per the contract"
+        );
+    }
+
+    #[test]
+    fn a_javascript_url_is_the_eval_path_wearing_a_navigate_hat() {
+        // Not named by the contract's table; it is stated there as Eval -> High, and
+        // `javascript:` executes exactly that. Flagged in the PR as an addition.
+        assert_eq!(
+            BrowserAction::Navigate {
+                url: "javascript:fetch('//attacker')".into()
+            }
+            .risk(Some("https://example.com")),
+            Risk::High
+        );
+    }
+
+    #[test]
+    fn a_submit_looking_target_is_medium_and_a_plain_one_low() {
+        // The judgement reads the selector's shape: nothing has been resolved yet.
+        assert_eq!(
+            BrowserAction::Click {
+                selector: "button[type=submit]".into()
+            }
+            .risk(None),
+            Risk::Medium
+        );
+        assert_eq!(
+            BrowserAction::Click {
+                selector: "#login-button".into()
+            }
+            .risk(None),
+            Risk::Medium
+        );
+        assert_eq!(
+            BrowserAction::Click {
+                selector: "#cookie-banner-accept".into()
+            }
+            .risk(None),
+            Risk::Low
+        );
+    }
+
+    #[test]
+    fn enter_is_a_submit_whatever_it_was_typed_into() {
+        assert_eq!(
+            BrowserAction::Press {
+                key: "Enter".into()
+            }
+            .risk(None),
+            Risk::Medium
+        );
+        assert_eq!(
+            BrowserAction::Press {
+                key: "Return".into()
+            }
+            .risk(None),
+            Risk::Medium
+        );
+        assert_eq!(
+            BrowserAction::Press { key: "Tab".into() }.risk(None),
+            Risk::Low
+        );
+    }
+
+    #[test]
+    fn the_quiet_steps_stay_low_and_the_stoppers_are_nothing() {
+        for action in [
+            BrowserAction::Type {
+                selector: "#q".into(),
+                text: "hello".into(),
+            },
+            BrowserAction::Wait { ms: 500 },
+            BrowserAction::WaitFor {
+                selector: "#done".into(),
+                timeout_ms: 1000,
+            },
+            BrowserAction::Scroll { dx: 0, dy: 400 },
+            BrowserAction::TabList,
+            BrowserAction::TabSwitch { index: 2 },
+            BrowserAction::TabClose { index: None },
+        ] {
+            assert_eq!(action.risk(None), Risk::Low, "{}", action.describe());
+        }
+        assert_eq!(
+            BrowserAction::Done {
+                summary: "ok".into()
+            }
+            .risk(None),
+            Risk::None
+        );
+        assert!(BrowserAction::Done {
+            summary: "ok".into()
+        }
+        .is_terminal());
+    }
+
+    #[test]
+    fn opening_a_new_tab_to_another_site_is_a_navigation_not_a_tab_housekeeping() {
+        // The contract lists "Tab 类" as Low. A `tab_new` carrying a URL is that same
+        // cross-site move, so it is judged as one; `TabList`/`Switch`/`Close` stay Low.
+        // Raised in the PR as the one place I did not follow the letter.
+        assert_eq!(
+            BrowserAction::TabNew {
+                url: "https://other.test/".into()
+            }
+            .risk(Some("https://example.com")),
+            Risk::Medium
+        );
+        assert_eq!(
+            BrowserAction::TabNew {
+                url: "https://example.com/other".into()
+            }
+            .risk(Some("https://example.com")),
+            Risk::Low
+        );
+    }
+
+    #[test]
+    fn an_action_recovered_from_reasoning_is_one_tier_up_and_capped() {
+        // The composition the loop relies on: the same action is not equally
+        // trustworthy from reasoning, and the ceiling is the top tier, not a wrap.
+        let typed = BrowserAction::Type {
+            selector: "#q".into(),
+            text: "hi".into(),
+        };
+        assert_eq!(typed.risk(None).escalate(), Risk::Medium);
+        let eval = BrowserAction::Eval { script: "1".into() };
+        assert_eq!(eval.risk(None).escalate(), Risk::High);
+    }
+
+    #[test]
+    fn hosts_compare_without_the_noise_that_makes_them_look_different() {
+        // Uppercase, a path, a port, or a trailing dot must not turn a same-site move
+        // into a cross-site one -- or the reverse: no host at all is not "the same host".
+        assert_eq!(
+            host_of("HTTPS://Example.COM/A?b=1").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host_of("https://example.com.").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host_of("https://example.com:8443/x").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(host_of("about:blank"), None);
+        assert_eq!(host_of("/just/a/path"), None);
+        // A scheme that is not http(s) has no site to be the same as: the word before
+        // the colon is a scheme name, not a host.
+        assert_eq!(host_of("mailto:someone@example.com"), None);
+        assert_eq!(host_of("ftp://example.com/x"), None);
+        assert_eq!(host_of("file:///C:/secrets.txt"), None);
+    }
+
+    #[test]
+    fn a_non_http_target_is_undeterminable_rather_than_same_site() {
+        assert_eq!(
+            BrowserAction::Navigate {
+                url: "file:///C:/Users/me/.ssh/id_ed25519".into()
+            }
+            .risk(Some("https://example.com")),
+            Risk::Medium,
+            "not a site move, and not a safe one either"
+        );
+    }
 
     #[test]
     fn parses_navigate() {

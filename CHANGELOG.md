@@ -413,6 +413,73 @@ AT-SPI，UIA 的失败面要另立一条），不假装两平台一致。
 - 没做的：`x`/`y` 仍按窗口左上角算，不含 DPI 逻辑/物理换算（现有窗口矩形就是这个口径，
   与 `click {element_index}` 一致）；`window_state` 的观测坐标另有一套 `point_in` 校验，未动。
 
+### 新增：浏览器动作也过同一道确认门（issue #12 第 1 项）
+
+审计那条"模型动作全自动执行"是真的：四个入口（`run_task` 路由到浏览器、`orchestrate`、
+MCP `browser_task`、CLI `cua-hub browser`）都在 `confirm()` 执行门**之前**就返回，
+`BrowserAction::Eval` 是任意 JS。system prompt 里"未经任务明确要求不提交表单/不登录"
+是软约束——DESIGN.md 自己就写着"that is a policy, not a sandbox"。
+
+- 浏览器动作**不**并入 `cua_core::Action`（契约认了 DESIGN.md 的理由），改为在自家 enum 上
+  加 `risk(page_url)`，并在每一步执行前过**同一个** `cua_core::policy::confirm`。
+  档位按契约：`Eval` 一律 High；`Navigate` 跨站 Medium、同站 Low；`Click` 指向提交控件
+  Medium、其余 Low；`Type`/`Press` Low 但 **Enter 一律 Medium**；`Wait`/`Scroll`/`Tab` 类 Low；
+  判不出来按 Medium。
+- `yes` / `allow_high` / `approver` 由 `BrowserRunOptions` 传进去，四个入口全部接上；
+  MCP 侧 `browser_task` 新增这两个参数，CLI 侧 `cua-hub browser` 新增 `--yes` / `--allow-high`。
+  默认全是关的——和 #8 那次默认档反转一个口径。
+- **dry-run 打印档位**：`[00] eval document.cookie [risk=high]`，规划阶段就能看见要付什么许可。
+- 被拦时**整轮停下**而不是跳过这一步：下一步的计划是建立在"这个页面我没动过"之上的。
+  `steps.jsonl` 里记 `blocked before execution: ...`。
+- 执行门本体从 `cua-cli/runner.rs` 提到 `cua-core::policy::confirm`，两边共用一套梯子
+  （重复一份梯子正是两个入口对"`yes` 能买到什么"说法不一的方式）。`Approver` 现在带
+  `(Risk, String)`：只收到描述的连接串无法按档位措辞，而"approve this?"就是这样变成回车键的。
+- 一处我没按契约字面执行，**请指一句**：契约把 `Tab` 类列为 Low，但 `TabNew` 带 url 做的
+  就是跨站跳转，我按导航判（跨站 Medium）。代码与测试都按这个走，改哪边你们定。
+
+### 变更：从思维链提取的动作降档使用，不再与"说出来的"同价（issue #12 第 2 项）
+
+契约是"保留回退、不拒绝，但升一档风险并打日志"。两处都做了：
+
+- **代码引擎**：`Action::RunCommand` 新增 `from_reasoning`（`serde(default)`，
+  老的 `steps.jsonl` 照样能回放），`Action::risk()` 在该位置上一档、High 封顶。
+  于是思维链里那句"do not run `{"command": "cargo build"}`"不再是和"模型决定执行"同一价。
+- **浏览器引擎**：`ask()` 现在返回 `(action, ActionSource)`；来源是 reasoning 时升一档并
+  `warn!`（旧代码是**静默**解析思维链的）。content 与 reasoning 都拿不到动作时照旧报错。
+- **可观测到的代价，说清楚**：读-only 命令从 Low 升到 Medium，也就是说
+  **只在思维链里出现的 `ls` 现在也要一次决定**。这是契约"升一档"的字面后果，我没有偷偷
+  给读操作开例外——开了就不是"升一档"而是另一套形状判据。
+- `describe()` 会写出 `(from reasoning)`，确认提示里人看得见来源。
+
+### 变更：`window_input` 在 Linux 明确说"这台机器没实现"（issue #12 第 3 项后半）
+
+`focus_window` / `perform_secondary_action` 之前把"本平台没实现"标成 `Error::InvalidAction`
+（意思是"引擎给了个非法动作"），于是 `window_input` 在 Linux 每答 `focus_failed` +
+`retry:true` ——一个会让人反复重试的假可重试。现在改为 `Error::Unsupported`，
+`window_input` 据此返回 `code:"unsupported"` + `retry:false` + 下一步该怎么做的提示。
+`cua-io/apps.rs` 里 `launch_app` 有同一处误标，**本 PR 没动**（不属这条契约，单独提）。
+X11 的窗口激活实现仍在 ROADMAP backlog。
+
+### 测试与验证（issue #12 第 1、2 项）
+
+- 本机新增 25 条（档位表 10 条、执行门 6 条、来源升档 4 条、其余为宿主比较等），
+  workspace **166 passed / 1 ignored**。
+- **真端到端（本机 Chrome + 本地桩模型，不要 API key）**：`tests/anthropic-pairing/stub.cjs`
+  的先例做法——桩按 `STUB_ACTION` 返回固定动作，`cua-hub browser` 真起真浏览器真跑循环：
+
+  | 桩返回 | 参数 | 结果 |
+  |--------|------|------|
+  | `eval document.cookie` | 无 | `blocked before execution: high-risk action blocked: ... Re-run with --allow-high` |
+  | `eval document.cookie` | `--allow-high` | 执行了（页面里脚本真跑了，浏览器回的是 cookie 权限错，正说明它到了执行层） |
+  | `press Enter` | 无 | `blocked before execution: medium risk action requires --yes / yes=true, or a client that can answer confirmations` |
+  | `press Enter` | `--yes` | 执行 |
+  | `wait 10ms` | 无 | `waited 10ms`，没要任何许可（低危不打扰） |
+
+  每步都打印档位，如 `[00] eval document.cookie [risk=high]`。跑完没有残留浏览器进程
+  （0 个 `cua-hub-browser-*`），顺带把 #10 那套收尾在真实循环里又核了一次。
+- 桩脚本：`D:\Temp\2026-10-25_browser_model_stub.cjs`（要的话可以收进 `tests/`，
+  现在还没入库——入库要放对目录并写清它只用于本地验证）。
+
 ## 0.1.5 — 2026-10-23
 
 把确认链关掉的一版：命令分级改为读参数形状、默认档反转，三个模型驱动入口的自动放行默认取消。

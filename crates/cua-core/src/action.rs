@@ -78,6 +78,12 @@ pub enum Action {
         command: String,
         #[serde(default)]
         shell: ShellKind,
+        /// True when the text came out of the model's reasoning rather than the
+        /// content it chose to return. `serde(default)` keeps every step recorded
+        /// before this field existed replayable, and the default is the safer reading:
+        /// an absent flag means "this was stated".
+        #[serde(default)]
+        from_reasoning: bool,
     },
     /// Task completed successfully.
     Done { summary: String },
@@ -109,7 +115,22 @@ impl Action {
             Action::Screenshot | Action::Move { .. } | Action::Wait { .. } => Risk::Safe,
             Action::Done { .. } | Action::Fail { .. } => Risk::None,
             Action::Click { .. } | Action::Scroll { .. } => Risk::Low,
-            Action::RunCommand { command, .. } => command_risk(command),
+            Action::RunCommand {
+                command,
+                from_reasoning,
+                ..
+            } => {
+                // A chain of thought holds hypotheticals and negations -- "do not run
+                // `{"command": "rm -rf ..."}`" reads as a command to a parser. The same
+                // command is not equally trustworthy from there, so it costs one tier
+                // more, capped at High.
+                let base = command_risk(command);
+                if *from_reasoning {
+                    base.escalate()
+                } else {
+                    base
+                }
+            }
             Action::Type { text, .. } => typed_text_risk(text),
             Action::Key { combo } => {
                 let c = combo.to_ascii_lowercase();
@@ -452,8 +473,38 @@ mod tests {
         Action::RunCommand {
             command: command.to_string(),
             shell: ShellKind::Auto,
+            from_reasoning: false,
         }
         .risk()
+    }
+
+    fn risk_of_reasoning(command: &str) -> Risk {
+        Action::RunCommand {
+            command: command.to_string(),
+            shell: ShellKind::Auto,
+            from_reasoning: true,
+        }
+        .risk()
+    }
+
+    #[test]
+    fn a_command_recovered_from_reasoning_costs_one_tier_more() {
+        // The audit's case: a chain of thought that merely mentions a command is not
+        // the model deciding to run it, and the parser cannot tell the two apart.
+        assert_eq!(risk_of("cargo build"), Risk::Medium);
+        assert_eq!(risk_of_reasoning("cargo build"), Risk::High);
+        assert_eq!(
+            risk_of_reasoning("ls -la"),
+            Risk::Medium,
+            "a read stated is Low; the same text found in reasoning costs one tier, \
+             which is the contract's literal consequence and is worth knowing: \
+             a read-only command that appears only in the chain of thought now asks"
+        );
+        assert_eq!(
+            risk_of_reasoning("rm -rf /"),
+            Risk::High,
+            "already High: capped at the top, not wrapped past it"
+        );
     }
 
     /// Every one of these was rated `Medium` by the substring list, which the
@@ -625,6 +676,7 @@ mod tests {
         assert!(Action::RunCommand {
             command: "dir".to_string(),
             shell: ShellKind::Auto,
+            from_reasoning: false,
         }
         .is_mutating());
     }

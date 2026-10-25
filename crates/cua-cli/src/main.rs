@@ -138,6 +138,13 @@ enum Command {
         /// Optional page to open before the loop starts.
         #[arg(long)]
         start_url: Option<String>,
+        /// Skip confirmation for medium-risk browser actions.
+        #[arg(long, env = "CUA_HUB_YES")]
+        yes: bool,
+        /// Permit high-risk actions (arbitrary JavaScript in the page).
+        /// Never implied by --yes.
+        #[arg(long)]
+        allow_high: bool,
     },
     /// Plan a task across browser/code/vision engines and execute the steps.
     Orchestrate {
@@ -370,6 +377,8 @@ fn main() -> Result<()> {
             model,
             run_dir,
             start_url,
+            yes,
+            allow_high,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
             let report = runtime.block_on(cua_engine_browser::run_task(
@@ -382,6 +391,11 @@ fn main() -> Result<()> {
                     start_url,
                     run_dir,
                     screenshot_quality: 70,
+                    yes,
+                    allow_high,
+                    // A CLI run has no client to ask, so the gate falls back to the
+                    // terminal prompt it uses for every other engine.
+                    approver: None,
                 },
             ))?;
             if !report.outcome.is_success() {

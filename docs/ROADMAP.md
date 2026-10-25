@@ -82,19 +82,31 @@
 - [x] 无鉴权远程绑定会大声说（issue #12 第 4 项）：穿过 `CUA_HUB_ALLOW_REMOTE=1` 这道 opt-in
   之后以前只打一行普通 `listening`；现在非回环 + 无 token 打醒目横幅 + `tracing::warn!`。
   回环或已设 token 不打——把假警告刷在每次正常启动上，只会让人跳过真警告那一条。
-- [ ] `window_input` 在 Linux 上整条不可用（本次做第 3 项时查出来的）：`focus_window` 只对
-  Windows 实现，AT-SPI 侧没有等价物，任何一次 `window_input` 都停在 `focus_failed`。
-  所以审计 #12 第 3 项那个坐标越界洞在 Linux 上"存在但不可达"——被前面那一步挡住了。
-  要么给 Linux 实现窗口激活（X11 `_NET_ACTIVE_WINDOW`），要么让 `window_input` 在没有聚焦
-  能力时明确降级成"不聚焦、只按坐标注入"并在结果里说明。定口径前不动。
-- [ ] issue #12 剩下两项，都需要先定契约（不打算自己拍）：
-  ① **浏览器引擎零闸门**——四个入口（runner / orchestrator / `browser_task` / CLI）全部绕过
-  `confirm()` 执行门，`BrowserAction::Eval` 是任意 JS（可读 cookie、可向外发请求），
-  system prompt 里"不提交表单/不登录"是软约束。要做的是给 `BrowserAction` 建一套到
-  `cua_core::Risk` 的显式映射（DESIGN.md 明写浏览器动作故意不放进 `Action`，所以映射是设计决定）；
-  ② **从思维链里提取动作**——`content` 为空时改从 `reasoning` 扫描 JSON 执行，
-  思维链中的假设/否定示例会被当真指令落地，两处都没有来源标记（只有 code 引擎打了一行 warn）。
-  这一项减能力（有的模型确实只回 reasoning），要定的是"拒绝执行"还是"降级成必须显式许可的来源"。
+- [x] 浏览器动作过同一道确认门（issue #12 第 1 项，契约见 #12 评论 6394674200）：
+  浏览器 enum **不**并入 `cua_core::Action`（DESIGN.md 的理由成立），改为在自家 enum 上加
+  `risk(page_url)`，执行前走 `cua_core::policy::confirm` —— 门本体从 `cua-cli/runner.rs` 提到
+  cua-core，两个引擎共用一套梯子（重复一份梯子正是两个入口对"`yes` 买到什么"说法不一的方式）。
+  档位：`Eval` 一律 High；`Navigate` 跨站 Medium / 同站 Low；`Click` 指向提交控件 Medium、其余 Low；
+  `Type` Low，但 **`Press Enter` 一律 Medium**（表单里它就是提交）；`Wait`/`Scroll`/`Tab` 类 Low；
+  判不出来按 Medium。`yes`/`allow_high`/`approver` 由 `BrowserRunOptions` 传入，四个入口全接上、默认关；
+  `dry_run` 打印档位；被拦就**整轮停下**（下一步的计划会建立在"这页我没动过"之上）。
+  **一处没按契约字面做**：`TabNew` 带 url 我按导航判（跨站 Medium），契约写的是"Tab 类 Low"——
+  代码与测试按前者，改哪边请指一句。
+  真端到端（本机 Chrome + 本地桩模型，无需 API key）：eval 无许可→拦；`--allow-high`→执行；
+  `press Enter` 无许可→拦；`--yes`→执行；`wait`→不打扰。
+- [x] 从思维链提取的动作降档使用（issue #12 第 2 项）：回退保留、不拒绝，但
+  ① `Action::RunCommand` 加 `from_reasoning`（`serde(default)`，老 `steps.jsonl` 仍可回放），
+  `risk()` 在该位升一档、High 封顶；② `describe()` 标出 `(from reasoning)`，确认提示里看得见来源；
+  ③ 浏览器侧 `ask()` 返回 `(action, ActionSource)`，回退时 `warn!`（旧代码是**静默**解析思维链的）。
+  代价如实写明：**只在思维链里出现的 `ls` 也要一次决定**（Low→Medium）——这是"升一档"的字面后果，
+  我没给读操作开例外，开了就不是升档而是另造一套形状判据。
+- [x] `window_input` 在 Linux 改为**明确降级**（契约第 3 项）：`focus_window` /
+  `perform_secondary_action` 原把"本平台没实现"标成 `Error::InvalidAction`（那是"引擎给了非法动作"），
+  于是每答 `focus_failed` + `retry:true`，一个引人反复重试的假可重试。现在标 `Error::Unsupported`，
+  `window_input` 据此回 `code:"unsupported"` + `retry:false` + 下一步提示。
+  **还剩**：给 X11 实现窗口激活（`_NET_ACTIVE_WINDOW`），或让 `window_input` 在无聚焦能力时
+  降级成"不聚焦、只按坐标注入"并说明——那是补能力，不在这条契约里。
+  `cua-io/apps.rs` 的 `launch_app` 有同一处误标，本次没动（不属这条契约，单独提）。
 - [x] `then:[…]` 服务端动作链：一次调用按序跑确定性图元动作，只回一份逐步 trace
   加一次观测；步骤继承 `observation_id`/`window`，失败即停在 `stopped_at`，
   模型驱动工具与嵌套 `then` 一律拒绝（本机实测 5 次调用 → 2 次，字节省 55%）
