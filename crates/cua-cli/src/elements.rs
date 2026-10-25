@@ -437,6 +437,7 @@ mod tests {
             actions: vec!["Invoke".into()],
             focused: false,
             selected: false,
+            checked: None,
         }
     }
 
@@ -707,6 +708,36 @@ mod tests {
         assert!(
             !diff.lines().any(|line| line.starts_with('-')),
             "nothing was removed: {diff}"
+        );
+    }
+
+    #[test]
+    fn toggling_checked_state_shows_inline_and_diffs() {
+        let mut opt_before = typed("/0:Window/99:Group", "Group", "Option A", 1);
+        opt_before.checked = Some(false);
+        let mut first_nodes = vec![node("/0:Window", "Quiz", 0)];
+        first_nodes.extend(filler(20));
+        first_nodes.push(opt_before);
+        let mut first = snapshot(first_nodes);
+        let view1 = observe(7701, &mut first, false);
+        assert!(
+            view1.text.contains("Group \"Option A\" checked=false"),
+            "initial tree should show checked=false: {}",
+            view1.text
+        );
+
+        let mut opt_after = typed("/0:Window/99:Group", "Group", "Option A", 1);
+        opt_after.checked = Some(true);
+        let mut second_nodes = vec![node("/0:Window", "Quiz", 0)];
+        second_nodes.extend(filler(20));
+        second_nodes.push(opt_after);
+        let mut second = snapshot(second_nodes);
+        let view2 = observe(7701, &mut second, false);
+        assert_eq!(view2.mode, TreeMode::Diff);
+        assert!(
+            view2.text.contains("Group \"Option A\" checked=true"),
+            "diff should highlight checked=true: {}",
+            view2.text
         );
     }
 }

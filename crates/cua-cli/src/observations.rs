@@ -152,6 +152,7 @@ mod tests {
             actions: Vec::new(),
             focused: false,
             selected: false,
+            checked: None,
         }
     }
 

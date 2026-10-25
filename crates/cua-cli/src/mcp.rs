@@ -655,6 +655,95 @@ fn window_state_hash(window: &cua_io::WindowInfo) -> std::result::Result<u64, Va
     Ok(composite)
 }
 
+/// Result of attempting to snapshot a window's accessibility tree with a
+/// single automatic recovery (rebuild client / reset wedged cooldown + refocus
+/// window) when the initial read returns an error or an empty node list.
+#[derive(Debug)]
+enum SnapshotAttempt {
+    Available {
+        snapshot: cua_engine_access::UiSnapshot,
+        retried: bool,
+    },
+    CoordinateOnly {
+        retried: bool,
+        reason: String,
+    },
+}
+
+fn snapshot_with_retry<F, R>(mut fetch: F, mut recover: R) -> SnapshotAttempt
+where
+    F: FnMut() -> cua_core::Result<cua_engine_access::UiSnapshot>,
+    R: FnMut(),
+{
+    let first_reason = match fetch() {
+        Ok(snap) if !snap.nodes.is_empty() => {
+            return SnapshotAttempt::Available {
+                snapshot: snap,
+                retried: false,
+            };
+        }
+        Ok(_) => "accessibility snapshot returned 0 nodes".to_string(),
+        Err(e) => e.to_string(),
+    };
+
+    recover();
+
+    match fetch() {
+        Ok(snap) if !snap.nodes.is_empty() => SnapshotAttempt::Available {
+            snapshot: snap,
+            retried: true,
+        },
+        Ok(_) => SnapshotAttempt::CoordinateOnly {
+            retried: true,
+            reason: format!("{first_reason}; retry also returned 0 nodes"),
+        },
+        Err(e) => SnapshotAttempt::CoordinateOnly {
+            retried: true,
+            reason: format!("{first_reason}; retry failed: {e}"),
+        },
+    }
+}
+
+fn coordinate_only_accessibility(retried: bool, reason: &str) -> Value {
+    let notice = if retried {
+        format!(
+            "accessibility tree unavailable after 1 retry (rebuilt client and refocused window: {reason}); degraded to coordinate-only mode"
+        )
+    } else {
+        format!("accessibility tree disabled ({reason}); operating in coordinate-only mode")
+    };
+    json!({
+        "mode": "coordinate-only",
+        "available": false,
+        "retried": retried,
+        "node_count": 0,
+        "reason": reason,
+        "notice": notice,
+    })
+}
+
+fn related_title_summaries(related: &[cua_io::WindowInfo]) -> Vec<Value> {
+    related
+        .iter()
+        .map(|rel| {
+            json!({
+                "id": rel.id,
+                "title": rel.title,
+            })
+        })
+        .collect()
+}
+
+fn append_related_titles_only(mut tree: String, related: &[cua_io::WindowInfo]) -> String {
+    for rel in related {
+        if !tree.is_empty() && !tree.ends_with('\n') {
+            tree.push('\n');
+        }
+        tree.push_str(&format!("# related window {} \"{}\"\n", rel.id, rel.title));
+    }
+    tree
+}
+
 /// An index or pixel that came from an observation the server no longer holds,
 /// or that does not exist in it. Treated as retryable but never silently
 /// re-resolved: the caller must re-observe and choose again.
@@ -1339,7 +1428,8 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                 Err(e) => return e,
             };
             let include_screenshot = args["include_screenshot"].as_bool().unwrap_or(true);
-            let include_text = args["include_text"].as_bool().unwrap_or(false);
+            let include_text = args["include_text"].as_bool().unwrap_or(true);
+            let include_related = args["include_related"].as_bool().unwrap_or(false);
             let disable_diffing = args["disable_diffing"].as_bool().unwrap_or(false);
             let max_edge = args["max_edge"].as_u64().unwrap_or(1280) as u32;
             let quality = args["quality"].as_u64().unwrap_or(75) as u8;
@@ -1353,10 +1443,11 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
             let observation_id = observations::next_id();
 
             // Menus, tooltips and dialogs are separate windows owned by the same
-            // process. They are observed together with the target so a popup can
-            // be read — and clicked by index — as part of one observation.
+            // process. By default only their titles are listed; pass
+            // include_related=true to expand their full trees and screenshots.
             let related =
                 cua_io::related_windows(window.pid, window.id, MAX_RELATED).unwrap_or_default();
+            let related_titles = related_title_summaries(&related);
 
             if include_screenshot {
                 match cua_io::capture_window(&window.id.to_string(), max_edge, quality) {
@@ -1387,40 +1478,47 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                         // window that owns it.
                         let mut composite = cap.hash;
                         let mut related_meta = Vec::new();
-                        for (n, rel) in related.iter().enumerate() {
-                            if let Ok(rel_cap) =
-                                cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
-                            {
-                                let rel_shot_id = format!("{observation_id}:s{}", n + 1);
-                                composite = composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
-                                let mut meta = window_capture_meta(&rel_cap);
-                                if let Some(map) = meta.as_object_mut() {
-                                    map.insert("role".into(), json!("related"));
-                                    map.insert("screenshot_id".into(), json!(rel_shot_id));
+                        if include_related {
+                            for (n, rel) in related.iter().enumerate() {
+                                if let Ok(rel_cap) =
+                                    cua_io::capture_window(&rel.id.to_string(), max_edge, quality)
+                                {
+                                    let rel_shot_id = format!("{observation_id}:s{}", n + 1);
+                                    composite =
+                                        composite.wrapping_mul(31).wrapping_add(rel_cap.hash);
+                                    let mut meta = window_capture_meta(&rel_cap);
+                                    if let Some(map) = meta.as_object_mut() {
+                                        map.insert("role".into(), json!("related"));
+                                        map.insert("screenshot_id".into(), json!(rel_shot_id));
+                                    }
+                                    shots.push(observations::Shot {
+                                        id: rel_shot_id,
+                                        window_id: rel.id,
+                                        role: "related",
+                                        origin: (rel_cap.info.x, rel_cap.info.y),
+                                        scale: rel_cap.frame.scale,
+                                        size: (
+                                            rel_cap.frame.observation.width,
+                                            rel_cap.frame.observation.height,
+                                        ),
+                                        hash: rel_cap.hash,
+                                    });
+                                    related_meta.push(meta);
+                                    content.push(json!({
+                                        "type": "image",
+                                        "data": encode_base64(&rel_cap.frame.observation.image),
+                                        "mimeType": rel_cap.frame.observation.media_type,
+                                    }));
                                 }
-                                shots.push(observations::Shot {
-                                    id: rel_shot_id,
-                                    window_id: rel.id,
-                                    role: "related",
-                                    origin: (rel_cap.info.x, rel_cap.info.y),
-                                    scale: rel_cap.frame.scale,
-                                    size: (
-                                        rel_cap.frame.observation.width,
-                                        rel_cap.frame.observation.height,
-                                    ),
-                                    hash: rel_cap.hash,
-                                });
-                                related_meta.push(meta);
-                                content.push(json!({
-                                    "type": "image",
-                                    "data": encode_base64(&rel_cap.frame.observation.image),
-                                    "mimeType": rel_cap.frame.observation.media_type,
-                                }));
                             }
                         }
                         if !related_meta.is_empty() {
                             if let Some(map) = screenshot.as_mut().and_then(Value::as_object_mut) {
                                 map.insert("related".into(), json!(related_meta));
+                            }
+                        } else if !related_titles.is_empty() {
+                            if let Some(map) = screenshot.as_mut().and_then(Value::as_object_mut) {
+                                map.insert("related_titles".into(), json!(related_titles));
                             }
                         }
                         hash = Some(composite);
@@ -1439,40 +1537,41 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
 
             let mut nodes: Vec<cua_engine_access::UiNode> = Vec::new();
             let mut node_windows: Vec<u32> = Vec::new();
-            let mut accessibility: Option<Value> = None;
-            if include_text {
-                match cua_engine_access::snapshot_window(
-                    window.id,
-                    &window.app,
-                    &window.title,
-                    window.pid,
-                    max_nodes,
-                    depth,
+            let mut accessibility: Value = if include_text {
+                match snapshot_with_retry(
+                    || {
+                        cua_engine_access::snapshot_window(
+                            window.id,
+                            &window.app,
+                            &window.title,
+                            window.pid,
+                            max_nodes,
+                            depth,
+                        )
+                    },
+                    || {
+                        cua_engine_access::atspi::reset_wedged();
+                        let _ = cua_engine_access::focus_window(window.id);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    },
                 ) {
-                    Ok(mut snap) => {
+                    SnapshotAttempt::Available {
+                        snapshot: mut snap,
+                        retried,
+                    } => {
                         // Popups contribute their own tree section under a header
-                        // line, sharing one index namespace with the target, so an
-                        // element_index is unambiguous across the observation.
+                        // line only when include_related=true; otherwise only their
+                        // titles are reported so unrelated windows do not bloat the
+                        // observation.
                         let mut related_snaps: Vec<(
                             cua_io::WindowInfo,
                             cua_engine_access::UiSnapshot,
                         )> = Vec::new();
-                        // UIA already parents most popups inside the owning
-                        // window's logical tree. Re-reading those through their
-                        // own HWND would duplicate every menu item under a second
-                        // index, so a popup only gets its own section when the
-                        // target tree does not already show that area. Overlap,
-                        // not equality: a menu's HWND is a few pixels larger than
-                        // the UIA node for the same menu, and its drop shadow
-                        // larger again.
                         let shown: Vec<(i32, i32, i32, i32)> =
                             snap.nodes.iter().map(|n| n.rect).collect();
                         let target_area = window.width as i64 * window.height as i64;
+                        let mut uncovered_related: Vec<cua_io::WindowInfo> = Vec::new();
                         for rel in &related {
-                            // A popup is smaller than the window it belongs to.
-                            // Something bigger is the owner: observing a modal
-                            // dialog should not drag the whole parent window's
-                            // tree — and therefore a copy of the dialog — along.
                             if rel.width as i64 * rel.height as i64 > target_area {
                                 continue;
                             }
@@ -1480,15 +1579,18 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                             if covered_by(&shown, popup) {
                                 continue;
                             }
-                            if let Ok(rel_snap) = cua_engine_access::snapshot_window(
-                                rel.id,
-                                &rel.app,
-                                &rel.title,
-                                rel.pid,
-                                MAX_POPUP_NODES,
-                                depth,
-                            ) {
-                                related_snaps.push((rel.clone(), rel_snap));
+                            uncovered_related.push(rel.clone());
+                            if include_related {
+                                if let Ok(rel_snap) = cua_engine_access::snapshot_window(
+                                    rel.id,
+                                    &rel.app,
+                                    &rel.title,
+                                    rel.pid,
+                                    MAX_POPUP_NODES,
+                                    depth,
+                                ) {
+                                    related_snaps.push((rel.clone(), rel_snap));
+                                }
                             }
                         }
                         let mut parts: Vec<elements::TreePart> =
@@ -1507,9 +1609,12 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                                 snapshot: rel_snap,
                             });
                         }
-                        // observe_group takes the parts by value, so the borrows
-                        // end with the call and the snapshots are readable again.
                         let view = elements::observe_group(window.id, parts, disable_diffing);
+                        let tree_text = if !include_related && !uncovered_related.is_empty() {
+                            append_related_titles_only(view.text, &uncovered_related)
+                        } else {
+                            view.text
+                        };
                         nodes = snap.nodes.clone();
                         node_windows = vec![window.id; snap.nodes.len()];
                         let mut truncated = snap.truncated;
@@ -1520,29 +1625,26 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                             truncated |= rel_snap.truncated;
                             unreadable.extend(rel_snap.unreadable.iter().cloned());
                         }
-                        accessibility = Some(json!({
+                        let mut acc = json!({
                             "mode": view.mode.as_str(),
-                            "tree": view.text,
+                            "tree": tree_text,
                             "node_count": view.node_count,
                             "changed_lines": view.changed_lines,
                             "truncated": truncated,
+                            "retried": retried,
+                            "include_related": include_related,
+                            "related": related_titles,
                             "notice": view.notice,
-                        }));
-                        // Only present when something went unanswered: a tree
-                        // that is shorter than the window needs to say which
-                        // parts it is missing, not just be shorter.
+                        });
                         if let Some(note) = cua_engine_access::unreadable_note(&unreadable) {
-                            if let Some(map) = accessibility.as_mut().and_then(Value::as_object_mut)
-                            {
+                            if let Some(map) = acc.as_object_mut() {
                                 map.insert("unreadable".to_string(), json!(note.trim_end()));
                             }
                         }
-                        // Selection and document text save a second observation
-                        // when the task is "what is selected / what does it say".
                         let text_ctx =
                             cua_engine_access::text_context(window.id).unwrap_or_default();
                         let selected_lines = snap.selected_lines();
-                        if let Some(map) = accessibility.as_mut().and_then(Value::as_object_mut) {
+                        if let Some(map) = acc.as_object_mut() {
                             if let Some(selected) = text_ctx.selected_text {
                                 map.insert("selected_text".into(), json!(selected));
                             }
@@ -1553,8 +1655,18 @@ async fn call_tool_single(name: &str, args: &Value) -> Value {
                                 map.insert("selected_elements".into(), json!(selected_lines));
                             }
                         }
+                        acc
                     }
-                    Err(e) => return tool_err(e),
+                    SnapshotAttempt::CoordinateOnly { retried, reason } => {
+                        coordinate_only_accessibility(retried, &reason)
+                    }
+                }
+            } else {
+                coordinate_only_accessibility(false, "include_text=false")
+            };
+            if let Some(map) = accessibility.as_object_mut() {
+                if !map.contains_key("related") && !related_titles.is_empty() {
+                    map.insert("related".into(), json!(related_titles));
                 }
             }
 
@@ -2400,7 +2512,8 @@ fn tool_defs() -> Value {
                 "properties": {
                     "window": { "description": "Window id, selector, or {app,id}", "oneOf": [ { "type": "string" }, { "type": "integer", "minimum": 1 }, { "type": "object", "properties": { "app": { "type": "string" }, "id": { "type": "integer", "minimum": 1 } }, "required": ["id"] } ] },
                     "include_screenshot": { "type": "boolean", "default": true },
-                    "include_text": { "type": "boolean", "default": false, "description": "Add the window-scoped accessibility tree with element indexes" },
+                    "include_text": { "type": "boolean", "default": true, "description": "Add the window-scoped accessibility tree with element indexes (defaults to true; retries once on empty/null and explicitly reports coordinate-only mode when unavailable)" },
+                    "include_related": { "type": "boolean", "default": false, "description": "Expand full accessibility trees and screenshots for related same-process windows; defaults to false (titles only)" },
                     "disable_diffing": { "type": "boolean", "default": false, "description": "Return the complete tree and rebuild the numbering baseline; use it when you no longer have the baseline needed to apply a diff" },
                     "max_edge": { "type": "integer", "default": 1280 },
                     "quality": { "type": "integer", "default": 75 },
@@ -3247,5 +3360,133 @@ mod tests {
         let orchestrated = orchestrate_options_from_args(&json!({ "task": "x", "yes": true }))
             .expect("orchestrate options");
         assert!(orchestrated.yes);
+    }
+
+    fn sample_ui_node(index: usize, control_type: &str, name: &str) -> cua_engine_access::UiNode {
+        cua_engine_access::UiNode {
+            index,
+            depth: 0,
+            control_type: control_type.into(),
+            name: name.into(),
+            automation_id: String::new(),
+            rect: (10, 20, 80, 30),
+            signature: format!("/{index}:{control_type}"),
+            value: String::new(),
+            actions: Vec::new(),
+            focused: false,
+            selected: false,
+            checked: None,
+        }
+    }
+
+    #[test]
+    fn accessibility_null_retries_once_and_recovers_or_degrades_to_coordinate_only() {
+        let mut attempts = 0usize;
+        let mut recovered = 0usize;
+        let recovered_attempt = snapshot_with_retry(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(cua_engine_access::UiSnapshot {
+                        nodes: Vec::new(),
+                        truncated: false,
+                        unreadable: Vec::new(),
+                    })
+                } else {
+                    Ok(cua_engine_access::UiSnapshot {
+                        nodes: vec![sample_ui_node(0, "Window", "Quiz")],
+                        truncated: false,
+                        unreadable: Vec::new(),
+                    })
+                }
+            },
+            || {
+                recovered += 1;
+            },
+        );
+        assert_eq!(
+            attempts, 2,
+            "must retry once when initial snapshot is empty"
+        );
+        assert_eq!(
+            recovered, 1,
+            "must invoke client rebuild/refocus before retry"
+        );
+        match recovered_attempt {
+            SnapshotAttempt::Available { snapshot, retried } => {
+                assert!(retried);
+                assert_eq!(snapshot.nodes.len(), 1);
+            }
+            other => panic!("expected recovered snapshot, got {other:?}"),
+        }
+
+        let mut fail_attempts = 0usize;
+        let mut fail_recovered = 0usize;
+        let degraded = snapshot_with_retry(
+            || {
+                fail_attempts += 1;
+                Err(cua_core::Error::Capture("UIA root unavailable".into()))
+            },
+            || {
+                fail_recovered += 1;
+            },
+        );
+        assert_eq!(fail_attempts, 2);
+        assert_eq!(fail_recovered, 1);
+        match degraded {
+            SnapshotAttempt::CoordinateOnly { retried, reason } => {
+                assert!(retried);
+                let payload = coordinate_only_accessibility(retried, &reason);
+                assert!(
+                    !payload.is_null(),
+                    "accessibility must never be silent null"
+                );
+                assert_eq!(payload["mode"], "coordinate-only");
+                assert_eq!(payload["available"], false);
+                assert_eq!(payload["retried"], true);
+                assert!(payload["notice"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("coordinate-only"));
+            }
+            other => panic!("expected coordinate-only fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn related_windows_default_to_titles_only_until_include_related_is_true() {
+        let defs = tool_defs();
+        let def = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "window_state")
+            .expect("window_state tool");
+        assert_eq!(
+            def["inputSchema"]["properties"]["include_related"]["default"],
+            json!(false)
+        );
+        assert_eq!(
+            def["inputSchema"]["properties"]["include_text"]["default"],
+            json!(true)
+        );
+
+        let related = vec![
+            test_window(91, "browser", "Confirm Submission"),
+            test_window(92, "browser", "Helper Tooltip"),
+        ];
+        let titles = related_title_summaries(&related);
+        assert_eq!(
+            titles,
+            vec![
+                json!({ "id": 91, "title": "Confirm Submission" }),
+                json!({ "id": 92, "title": "Helper Tooltip" }),
+            ]
+        );
+        let tree_with_titles =
+            append_related_titles_only("[0] Window \"Quiz\"\n".to_string(), &related);
+        assert!(tree_with_titles.contains("# related window 91 \"Confirm Submission\"\n"));
+        assert!(tree_with_titles.contains("# related window 92 \"Helper Tooltip\"\n"));
+        assert!(!tree_with_titles.contains("[1]"));
     }
 }

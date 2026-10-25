@@ -40,6 +40,38 @@ pub struct UiNode {
     /// True when this control is currently selected (list items, tabs, rows).
     #[serde(default, skip_serializing_if = "is_false")]
     pub selected: bool,
+    /// Toggle/checked state when the control is checkable (checkboxes, radio
+    /// buttons, toggle buttons, or web ARIA `checked` groups/items).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+}
+
+/// Extract a boolean ARIA property (such as `checked=true` or `selected=false`)
+/// from UIA's semicolon-separated `AriaProperties` string.
+pub fn parse_aria_bool(aria: &str, key: &str) -> Option<bool> {
+    for entry in aria.split(';') {
+        let Some((k, v)) = entry.split_once('=') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case(key) {
+            return match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "on" | "yes" => Some(true),
+                "false" | "0" | "off" | "no" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Map a UIA `ToggleState` ordinal (`0` = Off, `1` = On, `2` = Indeterminate)
+/// to a boolean `checked` value.
+pub fn toggle_state_to_checked(state: i32) -> Option<bool> {
+    match state {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -394,8 +426,11 @@ impl UiSnapshot {
             if n.focused {
                 out.push_str(" FOCUSED");
             }
+            if let Some(checked) = n.checked {
+                out.push_str(&format!(" checked={checked}"));
+            }
             if n.selected {
-                out.push_str(" SELECTED");
+                out.push_str(" selected=true");
             }
             if !n.actions.is_empty() {
                 out.push_str(&format!(" actions={}", n.actions.join(",")));
@@ -415,11 +450,16 @@ impl UiSnapshot {
         out
     }
 
-    /// Tree-formatted lines for the controls that are currently selected, so a
-    /// caller can see a list's or tab strip's selection without scanning the
-    /// whole tree.
+    /// Tree-formatted lines for the controls that are currently selected or
+    /// checked, so a caller can see a list's, tab strip's, or option group's
+    /// active state without scanning the whole tree.
     pub fn selected_lines(&self) -> Vec<String> {
-        let selected: Vec<UiNode> = self.nodes.iter().filter(|n| n.selected).cloned().collect();
+        let selected: Vec<UiNode> = self
+            .nodes
+            .iter()
+            .filter(|n| n.selected || n.checked == Some(true))
+            .cloned()
+            .collect();
         if selected.is_empty() {
             return Vec::new();
         }
@@ -1200,7 +1240,16 @@ mod imp {
                 "unknown"
             }
         })
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            node.checked.map(|c| {
+                if c {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            })
+        });
 
         let value =
             unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
@@ -1309,18 +1358,59 @@ mod imp {
         Ok(None)
     }
 
+    fn live_checked(
+        el: &IUIAutomationElement,
+        control_type: &str,
+        selection_selected: bool,
+    ) -> Option<bool> {
+        use windows::Win32::UI::Accessibility::{IUIAutomationTogglePattern, UIA_TogglePatternId};
+
+        if let Ok(pattern) =
+            unsafe { el.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId) }
+        {
+            if let Ok(state) = unsafe { pattern.CurrentToggleState() } {
+                return super::toggle_state_to_checked(state.0);
+            }
+        }
+        if let Ok(aria) = unsafe { el.CurrentAriaProperties() } {
+            let aria_str = aria.to_string();
+            if let Some(checked) = super::parse_aria_bool(&aria_str, "checked") {
+                return Some(checked);
+            }
+        }
+        if matches!(control_type, "RadioButton" | "CheckBox") {
+            return Some(selection_selected);
+        }
+        None
+    }
+
     fn element_to_node(el: &IUIAutomationElement) -> UiNode {
         use windows::Win32::UI::Accessibility::{
             IUIAutomationSelectionItemPattern, UIA_SelectionItemPatternId,
         };
 
+        let control_type = unsafe { el.CurrentControlType() }
+            .map(|id| control_type_name(id.0 as u32))
+            .unwrap_or("Unknown")
+            .to_string();
+        let selection_selected = unsafe {
+            el.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+        }
+        .ok()
+        .and_then(|p| unsafe { p.CurrentIsSelected().ok() })
+        .map(|b| b.as_bool())
+        .or_else(|| {
+            unsafe { el.CurrentAriaProperties() }
+                .ok()
+                .and_then(|b| super::parse_aria_bool(&b.to_string(), "selected"))
+        })
+        .unwrap_or(false);
+        let checked = live_checked(el, &control_type, selection_selected);
+
         UiNode {
             index: 0,
             depth: 0,
-            control_type: unsafe { el.CurrentControlType() }
-                .map(|id| control_type_name(id.0 as u32))
-                .unwrap_or("Unknown")
-                .to_string(),
+            control_type,
             name: unsafe { el.CurrentName() }
                 .map(|b| b.to_string())
                 .unwrap_or_default(),
@@ -1342,15 +1432,8 @@ mod imp {
             focused: unsafe { el.CurrentHasKeyboardFocus() }
                 .map(|b| b.as_bool())
                 .unwrap_or(false),
-            selected: unsafe {
-                el.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
-                    UIA_SelectionItemPatternId,
-                )
-            }
-            .ok()
-            .and_then(|p| unsafe { p.CurrentIsSelected().ok() })
-            .map(|b| b.as_bool())
-            .unwrap_or(false),
+            selected: selection_selected,
+            checked,
         }
     }
 
@@ -1561,12 +1644,47 @@ mod imp {
         actions: Vec<String>,
         focused: bool,
         selected: bool,
+        checked: Option<bool>,
     }
 
     /// Whether a control is part of the current selection, from the cache.
-    fn cached_selected(el: &IUIAutomationElement) -> bool {
+    fn cached_selected(el: &IUIAutomationElement, aria_props: Option<&str>) -> bool {
         use windows::Win32::UI::Accessibility::UIA_SelectionItemIsSelectedPropertyId;
-        cached_flag(el, UIA_SelectionItemIsSelectedPropertyId)
+        if cached_flag(el, UIA_SelectionItemIsSelectedPropertyId) {
+            return true;
+        }
+        aria_props
+            .and_then(|aria| super::parse_aria_bool(aria, "selected"))
+            .unwrap_or(false)
+    }
+
+    /// Cached toggle/checked state from UIA `ToggleState`, web `AriaProperties`,
+    /// or `SelectionItem` on radio/checkbox controls.
+    fn cached_checked(
+        el: &IUIAutomationElement,
+        control_type: &str,
+        selection_selected: bool,
+        aria_props: Option<&str>,
+    ) -> Option<bool> {
+        use windows::Win32::UI::Accessibility::{
+            UIA_IsTogglePatternAvailablePropertyId, UIA_ToggleToggleStatePropertyId,
+        };
+        if cached_flag(el, UIA_IsTogglePatternAvailablePropertyId) {
+            if let Some(state) = cached_int(el, UIA_ToggleToggleStatePropertyId) {
+                if let Some(checked) = super::toggle_state_to_checked(state) {
+                    return Some(checked);
+                }
+            }
+        }
+        if let Some(aria) = aria_props {
+            if let Some(checked) = super::parse_aria_bool(aria, "checked") {
+                return Some(checked);
+            }
+        }
+        if matches!(control_type, "RadioButton" | "CheckBox") {
+            return Some(selection_selected);
+        }
+        None
     }
 
     fn cached_facts(el: &IUIAutomationElement) -> Facts {
@@ -1574,6 +1692,12 @@ mod imp {
             .map(|id| control_type_name(id.0 as u32))
             .unwrap_or("Unknown")
             .to_string();
+        let aria_props = unsafe { el.CachedAriaProperties() }
+            .ok()
+            .map(|b| b.to_string())
+            .filter(|s| !s.is_empty());
+        let selected = cached_selected(el, aria_props.as_deref());
+        let checked = cached_checked(el, &control_type, selected, aria_props.as_deref());
         Facts {
             name: unsafe { el.CachedName() }
                 .map(|b| b.to_string())
@@ -1590,7 +1714,8 @@ mod imp {
             focused: unsafe { el.CachedHasKeyboardFocus() }
                 .map(|b| b.as_bool())
                 .unwrap_or(false),
-            selected: cached_selected(el),
+            selected,
+            checked,
         }
     }
 
@@ -1605,6 +1730,7 @@ mod imp {
             actions: node.actions,
             focused: node.focused,
             selected: node.selected,
+            checked: node.checked,
         }
     }
 
@@ -1628,7 +1754,8 @@ mod imp {
 
         use windows::Win32::UI::Accessibility::{
             IUIAutomation, IUIAutomationCacheRequest, TreeScope_Children, TreeScope_Element,
-            UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
+            UIA_AriaPropertiesPropertyId, UIA_AutomationIdPropertyId,
+            UIA_BoundingRectanglePropertyId, UIA_ControlTypePropertyId,
             UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_HasKeyboardFocusPropertyId,
             UIA_IsEnabledPropertyId, UIA_IsExpandCollapsePatternAvailablePropertyId,
             UIA_IsInvokePatternAvailablePropertyId, UIA_IsKeyboardFocusablePropertyId,
@@ -1637,6 +1764,7 @@ mod imp {
             UIA_IsValuePatternAvailablePropertyId, UIA_IsWindowPatternAvailablePropertyId,
             UIA_NamePropertyId, UIA_ScrollHorizontallyScrollablePropertyId,
             UIA_ScrollVerticallyScrollablePropertyId, UIA_SelectionItemIsSelectedPropertyId,
+            UIA_ToggleToggleStatePropertyId,
         };
 
         // One cache request batches every property fetch into the COM call that
@@ -1675,6 +1803,8 @@ mod imp {
                 .and_then(|_| cache.AddProperty(UIA_ScrollVerticallyScrollablePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_ScrollHorizontallyScrollablePropertyId))
                 .and_then(|_| cache.AddProperty(UIA_SelectionItemIsSelectedPropertyId))
+                .and_then(|_| cache.AddProperty(UIA_ToggleToggleStatePropertyId))
+                .and_then(|_| cache.AddProperty(UIA_AriaPropertiesPropertyId))
                 .and_then(|_| cache.SetTreeScope(TreeScope_Element))
                 .map_err(|e| Error::Capture(format!("UIA cache setup: {e}")))?;
         }
@@ -1747,6 +1877,7 @@ mod imp {
                     actions: facts.actions,
                     focused: facts.focused,
                     selected: facts.selected,
+                    checked: facts.checked,
                 };
                 if visit(&node, &element) {
                     return Ok((truncated, true));
@@ -1774,5 +1905,81 @@ mod imp {
         }
 
         Ok((truncated, false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_aria_bool, toggle_state_to_checked, UiNode, UiSnapshot};
+
+    fn sample_node(index: usize, control_type: &str, name: &str) -> UiNode {
+        UiNode {
+            index,
+            depth: 0,
+            control_type: control_type.into(),
+            name: name.into(),
+            automation_id: String::new(),
+            rect: (10, 20, 100, 30),
+            signature: format!("/{index}:{control_type}"),
+            value: String::new(),
+            actions: Vec::new(),
+            focused: false,
+            selected: false,
+            checked: None,
+        }
+    }
+
+    #[test]
+    fn to_text_renders_inline_checked_and_selected() {
+        let mut group_checked = sample_node(67, "Group", "");
+        group_checked.checked = Some(true);
+        group_checked.rect = (0, 0, 0, 0);
+
+        let mut radio_unchecked = sample_node(68, "RadioButton", "Option B");
+        radio_unchecked.checked = Some(false);
+
+        let mut list_selected = sample_node(69, "ListItem", "Choice 1");
+        list_selected.selected = true;
+
+        let snap = UiSnapshot {
+            nodes: vec![group_checked, radio_unchecked, list_selected],
+            truncated: false,
+            unreadable: Vec::new(),
+        };
+
+        let text = snap.to_text();
+        assert!(
+            text.contains("[67] Group checked=true\n"),
+            "expected inline checked=true on Group, got:\n{text}"
+        );
+        assert!(
+            text.contains("[68] RadioButton \"Option B\" checked=false (10,20,100,30)\n"),
+            "expected inline checked=false on RadioButton, got:\n{text}"
+        );
+        assert!(
+            text.contains("[69] ListItem \"Choice 1\" selected=true (10,20,100,30)\n"),
+            "expected inline selected=true on ListItem, got:\n{text}"
+        );
+
+        let selected = snap.selected_lines();
+        assert_eq!(selected.len(), 2);
+        assert!(selected[0].contains("[67] Group checked=true"));
+        assert!(selected[1].contains("[69] ListItem \"Choice 1\" selected=true"));
+    }
+
+    #[test]
+    fn parse_aria_bool_and_toggle_state_helpers() {
+        assert_eq!(
+            parse_aria_bool("role=radio;checked=true;posinset=1", "checked"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_aria_bool("checked=false;disabled=false", "checked"),
+            Some(false)
+        );
+        assert_eq!(parse_aria_bool("checked=mixed", "checked"), None);
+        assert_eq!(toggle_state_to_checked(0), Some(false));
+        assert_eq!(toggle_state_to_checked(1), Some(true));
+        assert_eq!(toggle_state_to_checked(2), None);
     }
 }

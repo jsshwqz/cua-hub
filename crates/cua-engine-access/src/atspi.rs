@@ -132,6 +132,16 @@ fn mark_wedged(bus: &str) {
     }
 }
 
+/// Clear any recorded deaf-bus cooldowns so a caller retrying an empty or
+/// failed snapshot can attempt a fresh bus read immediately.
+pub fn reset_wedged() {
+    if let Ok(mut guard) = WEDGED.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.clear();
+        }
+    }
+}
+
 fn is_wedged(bus: &str) -> bool {
     let Ok(guard) = WEDGED.lock() else {
         return false;
@@ -276,18 +286,20 @@ fn read_node_data(conn: &Connection, dest: &str, path: &str) -> NodeData {
 ///
 /// Returns an empty node plus the reason when the peer is deaf, so the caller can
 /// report the hole instead of losing it.
-fn read_node(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
+fn read_node(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<u32>, Vec<String>) {
     let conn = conn.clone();
     let dest_owned = dest.to_string();
     let path_owned = path.to_string();
     match timed(dest, move || read_node_raw(&conn, &dest_owned, &path_owned)) {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(Stall::NoReply) => (
             (String::new(), 0, (0, 0, 0, 0), Vec::new()),
+            Vec::new(),
             vec![format!("no reply within {}ms", CALL_TIMEOUT.as_millis())],
         ),
         Err(Stall::CoolingDown) => (
             (String::new(), 0, (0, 0, 0, 0), Vec::new()),
+            Vec::new(),
             vec![format!(
                 "not re-attempted: this bus was deaf within the last {}s",
                 WEDGED_COOLDOWN.as_secs()
@@ -302,10 +314,11 @@ fn read_node(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String
 /// unknown but whose rectangle answered is useful, and dropping it silently was
 /// the old failure. What changed is that the caller now also learns which reads
 /// nobody answered.
-fn read_node_raw(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<String>) {
+fn read_node_raw(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<u32>, Vec<String>) {
     let mut name = String::new();
     let mut role = 0u32;
     let mut kids = Vec::new();
+    let mut states = Vec::new();
     let mut problems = Vec::new();
 
     match Proxy::new(conn, dest, path, "org.a11y.atspi.Accessible") {
@@ -331,6 +344,11 @@ fn read_node_raw(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<St
                 Ok(k) => kids = k,
                 Err(e) => note(&mut problems, "children", &e.to_string()),
             }
+            if problems.is_empty() {
+                states = proxy
+                    .call::<_, _, Vec<u32>>("GetState", &())
+                    .unwrap_or_default();
+            }
         }
         Err(e) => note(&mut problems, "accessible", &e.to_string()),
     }
@@ -347,7 +365,7 @@ fn read_node_raw(conn: &Connection, dest: &str, path: &str) -> (NodeData, Vec<St
         Err(_) => (0, 0, 0, 0),
     };
 
-    ((name, role, rect, kids), problems)
+    ((name, role, rect, kids), states, problems)
 }
 
 /// Fallback mapping when only a localized role name is available.
@@ -424,7 +442,7 @@ fn walk_from(
             continue;
         }
 
-        let ((name, role, rect, kids), problems) = read_node(conn, &dest, &path);
+        let ((name, role, rect, kids), words, problems) = read_node(conn, &dest, &path);
         // Recorded whether or not the node survives: a control whose rectangle
         // nobody answered is still a hole in what the caller can trust.
         if !problems.is_empty() {
@@ -439,10 +457,12 @@ fn walk_from(
         }
 
         visited += 1;
+        let control_type = control_type_name(role).to_string();
+        let (checked, selected, focused) = node_states_from_words(&control_type, &words);
         let node = UiNode {
             index: 0,
             depth,
-            control_type: control_type_name(role).to_string(),
+            control_type,
             name,
             automation_id: String::new(),
             rect,
@@ -451,8 +471,9 @@ fn walk_from(
             signature: path.clone(),
             value: String::new(),
             actions: Vec::new(),
-            focused: false,
-            selected: false,
+            focused,
+            selected,
+            checked,
         };
         if visit(conn, &node, &dest, &path) {
             return Ok(WalkReport {
@@ -967,6 +988,8 @@ mod atspi_state {
     pub const COLLAPSED: u32 = 5;
     pub const EXPANDABLE: u32 = 9;
     pub const EXPANDED: u32 = 10;
+    pub const FOCUSED: u32 = 12;
+    pub const SELECTED: u32 = 23;
     pub const SENSITIVE: u32 = 24;
     pub const SHOWING: u32 = 25;
     pub const VISIBLE: u32 = 30;
@@ -979,6 +1002,25 @@ fn has_state(words: &[u32], ordinal: u32) -> bool {
     words
         .get(ordinal as usize / 32)
         .is_some_and(|mask| mask & (1 << (ordinal % 32)) != 0)
+}
+
+/// Extract `(checked, selected, focused)` for a tree node from its AT-SPI
+/// `GetState` bitset.
+fn node_states_from_words(control_type: &str, words: &[u32]) -> (Option<bool>, bool, bool) {
+    if words.is_empty() {
+        return (None, false, false);
+    }
+    let checkable = has_state(words, atspi_state::CHECKABLE)
+        || has_state(words, atspi_state::CHECKED)
+        || matches!(control_type, "CheckBox" | "RadioButton" | "ToggleButton");
+    let checked = if checkable && !has_state(words, atspi_state::INDETERMINATE) {
+        Some(has_state(words, atspi_state::CHECKED))
+    } else {
+        None
+    };
+    let selected = has_state(words, atspi_state::SELECTED);
+    let focused = has_state(words, atspi_state::FOCUSED);
+    (checked, selected, focused)
 }
 
 /// Map an AT-SPI state set onto the fields this backend reports, in the same
@@ -1185,6 +1227,7 @@ mod tests {
             actions: Vec::new(),
             focused: false,
             selected: false,
+            checked: None,
         }
     }
 
@@ -1252,11 +1295,36 @@ mod tests {
         assert_eq!(atspi_state::COLLAPSED, 5);
         assert_eq!(atspi_state::EXPANDABLE, 9);
         assert_eq!(atspi_state::EXPANDED, 10);
+        assert_eq!(atspi_state::FOCUSED, 12);
+        assert_eq!(atspi_state::SELECTED, 23);
         assert_eq!(atspi_state::SENSITIVE, 24);
         assert_eq!(atspi_state::SHOWING, 25);
         assert_eq!(atspi_state::VISIBLE, 30);
         assert_eq!(atspi_state::INDETERMINATE, 32);
         assert_eq!(atspi_state::CHECKABLE, 41);
+    }
+
+    #[test]
+    fn node_states_extracts_checked_selected_and_focused() {
+        assert_eq!(
+            node_states_from_words("CheckBox", &[]),
+            (None, false, false)
+        );
+        let checked_group = words_for(&[atspi_state::CHECKABLE, atspi_state::CHECKED]);
+        assert_eq!(
+            node_states_from_words("Group", &checked_group),
+            (Some(true), false, false)
+        );
+        let unchecked_radio = words_for(&[atspi_state::SENSITIVE]);
+        assert_eq!(
+            node_states_from_words("RadioButton", &unchecked_radio),
+            (Some(false), false, false)
+        );
+        let selected_item = words_for(&[atspi_state::SELECTED, atspi_state::FOCUSED]);
+        assert_eq!(
+            node_states_from_words("ListItem", &selected_item),
+            (None, true, true)
+        );
     }
 
     #[test]
