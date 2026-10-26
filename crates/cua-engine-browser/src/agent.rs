@@ -1,6 +1,8 @@
 //! Model-driven browser loop: one JSON action per step.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -267,6 +269,8 @@ pub struct BrowserRunOptions {
     pub yes: bool,
     pub allow_high: bool,
     pub approver: Option<cua_core::policy::Approver>,
+    pub timeout: Option<Duration>,
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for BrowserRunOptions {
@@ -285,8 +289,24 @@ impl Default for BrowserRunOptions {
             yes: false,
             allow_high: false,
             approver: None,
+            timeout: None,
+            cancel: None,
         }
     }
+}
+
+/// Check if cancellation was requested via a sentinel file in `run_dir`
+/// (`cancel` or `.cancel`) or an in-memory `AtomicBool` signal.
+pub fn is_cancelled(run_dir: &Path, cancel: Option<&Arc<AtomicBool>>) -> bool {
+    if run_dir.join("cancel").exists() || run_dir.join(".cancel").exists() {
+        return true;
+    }
+    if let Some(c) = cancel {
+        if c.load(Ordering::Relaxed) {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, PartialEq)]
@@ -324,6 +344,9 @@ pub struct BrowserReport {
 }
 
 pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
+    let total_timeout = opts.timeout.unwrap_or(Duration::from_secs(600));
+    let task_start = std::time::Instant::now();
+
     let config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
     eprintln!("provider: browser model={}", config.model);
     let http = reqwest::Client::builder()
@@ -351,14 +374,53 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
     let mut executed_steps = 0usize;
 
     for index in 0..opts.max_steps {
+        if is_cancelled(&run_dir, opts.cancel.as_ref()) {
+            outcome = BrowserOutcome::Failed(
+                "cancelled: task cancelled via signal or sentinel file".into(),
+            );
+            break;
+        }
+        if task_start.elapsed() >= total_timeout {
+            let note = format!(
+                "timeout: task exceeded total timeout of {}s",
+                total_timeout.as_secs()
+            );
+            outcome = BrowserOutcome::Failed(note);
+            break;
+        }
+
         let summary = session.page_summary().await.unwrap_or(PageSummary {
             url: String::new(),
             title: String::new(),
             text: String::new(),
             ax: String::new(),
         });
-        let shot = session.screenshot_jpeg(opts.screenshot_quality).await?;
-        std::fs::write(run_dir.join(format!("browser-step-{index:02}.jpg")), &shot)?;
+        let shot = match session.screenshot_jpeg(opts.screenshot_quality).await {
+            Ok(s) => s,
+            Err(e) => {
+                let note = format!("screenshot failed: {e}");
+                eprintln!("[{index:02}] {note}");
+                let fail_action = BrowserAction::Fail {
+                    reason: note.clone(),
+                };
+                record(&mut log, index, &fail_action, &note)?;
+                executed_steps += 1;
+                outcome = BrowserOutcome::Failed(note);
+                break;
+            }
+        };
+        if let Err(e) = std::fs::write(run_dir.join(format!("browser-step-{index:02}.jpg")), &shot)
+        {
+            let note = format!("screenshot failed: failed to save step image: {e}");
+            eprintln!("[{index:02}] {note}");
+            let fail_action = BrowserAction::Fail {
+                reason: note.clone(),
+            };
+            record(&mut log, index, &fail_action, &note)?;
+            executed_steps += 1;
+            outcome = BrowserOutcome::Failed(note);
+            break;
+        }
 
         let (action, source) = ask(&http, &config, &opts.task, &summary, &history, &shot)
             .await
@@ -425,7 +487,22 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
             break;
         }
 
-        let result = execute(&mut session, &action).await;
+        if is_cancelled(&run_dir, opts.cancel.as_ref()) {
+            outcome = BrowserOutcome::Failed(
+                "cancelled: task cancelled via signal or sentinel file".into(),
+            );
+            break;
+        }
+        if task_start.elapsed() >= total_timeout {
+            let note = format!(
+                "timeout: task exceeded total timeout of {}s",
+                total_timeout.as_secs()
+            );
+            outcome = BrowserOutcome::Failed(note);
+            break;
+        }
+
+        let result = execute(&mut session, &action, &run_dir, opts.cancel.as_ref()).await;
         let note = match result {
             Ok(note) => note,
             Err(e) => format!("error: {e}"),
@@ -434,6 +511,22 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
         record(&mut log, index, &action, &note)?;
         history.push(format!("#{index} {} => {}", action.describe(), note));
         executed_steps += 1;
+
+        if is_cancelled(&run_dir, opts.cancel.as_ref()) {
+            outcome = BrowserOutcome::Failed(
+                "cancelled: task cancelled via signal or sentinel file".into(),
+            );
+            break;
+        }
+        if task_start.elapsed() >= total_timeout {
+            let note = format!(
+                "timeout: task exceeded total timeout of {}s",
+                total_timeout.as_secs()
+            );
+            outcome = BrowserOutcome::Failed(note);
+            break;
+        }
+
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
@@ -455,7 +548,32 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
     Ok(report)
 }
 
-async fn execute(session: &mut cdp::BrowserSession, action: &BrowserAction) -> Result<String> {
+pub async fn execute_wait(ms: u64, run_dir: &Path, cancel: Option<&Arc<AtomicBool>>) -> String {
+    const MAX_SINGLE_WAIT_MS: u64 = 60_000;
+    let clamped = ms > MAX_SINGLE_WAIT_MS;
+    let effective_ms = ms.min(MAX_SINGLE_WAIT_MS);
+    let mut remaining = effective_ms;
+    while remaining > 0 {
+        if is_cancelled(run_dir, cancel) {
+            break;
+        }
+        let chunk = remaining.min(100);
+        tokio::time::sleep(Duration::from_millis(chunk)).await;
+        remaining = remaining.saturating_sub(chunk);
+    }
+    if clamped {
+        format!("waited {effective_ms}ms (clamped from {ms}ms)")
+    } else {
+        format!("waited {effective_ms}ms")
+    }
+}
+
+async fn execute(
+    session: &mut cdp::BrowserSession,
+    action: &BrowserAction,
+    run_dir: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<String> {
     match action {
         BrowserAction::Navigate { url } => {
             session.navigate(url).await?;
@@ -486,8 +604,8 @@ async fn execute(session: &mut cdp::BrowserSession, action: &BrowserAction) -> R
             Ok(text.chars().take(2000).collect())
         }
         BrowserAction::Wait { ms } => {
-            tokio::time::sleep(Duration::from_millis(*ms)).await;
-            Ok(format!("waited {ms}ms"))
+            let note = execute_wait(*ms, run_dir, cancel).await;
+            Ok(note)
         }
         BrowserAction::Scroll { dx, dy } => {
             session.scroll(*dx, *dy).await?;
@@ -1053,5 +1171,77 @@ mod tests {
     #[test]
     fn rejects_unknown_action() {
         assert!(parse_browser_action(r#"{"action":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn test_is_cancelled_detects_sentinel_files_and_atomic_bool() {
+        let temp_dir = std::env::temp_dir().join(format!("cua-test-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Neither set
+        assert!(!is_cancelled(&temp_dir, None));
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!is_cancelled(&temp_dir, Some(&flag)));
+
+        // 2. AtomicBool set
+        flag.store(true, Ordering::Relaxed);
+        assert!(is_cancelled(&temp_dir, Some(&flag)));
+        flag.store(false, Ordering::Relaxed);
+        assert!(!is_cancelled(&temp_dir, Some(&flag)));
+
+        // 3. Sentinel file "cancel"
+        let sentinel = temp_dir.join("cancel");
+        std::fs::write(&sentinel, "stop").unwrap();
+        assert!(is_cancelled(&temp_dir, None));
+        std::fs::remove_file(&sentinel).unwrap();
+        assert!(!is_cancelled(&temp_dir, None));
+
+        // 4. Sentinel file ".cancel"
+        let dot_sentinel = temp_dir.join(".cancel");
+        std::fs::write(&dot_sentinel, "stop").unwrap();
+        assert!(is_cancelled(&temp_dir, None));
+        std::fs::remove_file(&dot_sentinel).unwrap();
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_execute_wait_clamping_and_cancellation() {
+        let temp_dir = std::env::temp_dir().join(format!("cua-test-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Normal wait (10ms)
+        let note_normal = execute_wait(10, &temp_dir, None).await;
+        assert_eq!(note_normal, "waited 10ms");
+
+        // Clamped wait with cancellation (simulating cancellation during a 120s wait)
+        let flag = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+        let note_clamped = execute_wait(120_000, &temp_dir, Some(&flag)).await;
+        assert_eq!(note_clamped, "waited 60000ms (clamped from 120000ms)");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_browser_outcome_summary_formats() {
+        let outcome_timeout =
+            BrowserOutcome::Failed("timeout: task exceeded total timeout of 600s".into());
+        assert_eq!(
+            outcome_timeout.summary(3),
+            "failed: timeout: task exceeded total timeout of 600s"
+        );
+
+        let outcome_cancel =
+            BrowserOutcome::Failed("cancelled: task cancelled via signal or sentinel file".into());
+        assert_eq!(
+            outcome_cancel.summary(2),
+            "failed: cancelled: task cancelled via signal or sentinel file"
+        );
+
+        let outcome_shot = BrowserOutcome::Failed("screenshot failed: browser closed".into());
+        assert_eq!(
+            outcome_shot.summary(1),
+            "failed: screenshot failed: browser closed"
+        );
     }
 }

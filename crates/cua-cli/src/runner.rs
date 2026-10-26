@@ -168,6 +168,8 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             yes: opts.yes,
             allow_high: opts.allow_high,
             approver: opts.approver.clone(),
+            timeout: None,
+            cancel: None,
         })
         .await?;
         let outcome = match report.outcome {

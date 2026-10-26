@@ -15,11 +15,8 @@ fn enigo() -> Result<MutexGuard<'static, Enigo>> {
             .map_err(|e| Error::Input(format!("enigo init: {e}")))?;
         let _ = INSTANCE.set(Mutex::new(created));
     }
-    INSTANCE
-        .get()
-        .expect("just initialised")
-        .lock()
-        .map_err(|e| Error::Input(format!("enigo lock: {e}")))
+    let m = INSTANCE.get().expect("just initialised");
+    m.lock().or_else(|p| Ok(p.into_inner()))
 }
 
 /// Execute a mutating action. Points are in model space and are scaled by
@@ -53,17 +50,14 @@ pub fn apply(action: &Action, scale: f32) -> Result<()> {
             enigo
                 .move_mouse(x1, y1, Coordinate::Abs)
                 .map_err(input_err)?;
-            enigo
-                .button(Button::Left, Direction::Press)
-                .map_err(input_err)?;
-            std::thread::sleep(Duration::from_millis(80));
-            enigo
-                .move_mouse(x2, y2, Coordinate::Abs)
-                .map_err(input_err)?;
-            std::thread::sleep(Duration::from_millis(80));
-            enigo
-                .button(Button::Left, Direction::Release)
-                .map_err(input_err)?;
+            let mut guard = InputGuard::new(&mut *enigo);
+            guard.run_and_release(|g| {
+                g.press_button(Button::Left)?;
+                std::thread::sleep(Duration::from_millis(80));
+                g.device.send_move_mouse(x2, y2, Coordinate::Abs)?;
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(())
+            })?;
         }
         Action::Type { text, interval_ms } => {
             // Qt/FreeCAD and some industrial apps ignore Unicode key events for
@@ -151,12 +145,29 @@ pub fn key_state(combo: &str, down: bool) -> Result<()> {
             .ok_or_else(|| Error::InvalidAction(format!("unknown key: {part}")))?;
         keys.push(key);
     }
-    // Release in reverse order so chords unwind cleanly.
-    if !down {
+    if down {
+        let mut guard = InputGuard::new(&mut *enigo);
+        for key in keys {
+            guard.press_key(key)?;
+        }
+        // Success: caller wants them held down, disarm guard without releasing
+        guard.held.clear();
+    } else {
+        // Release in reverse order so chords unwind cleanly.
         keys.reverse();
-    }
-    for key in keys {
-        enigo.key(key, direction).map_err(input_err)?;
+        let mut errors = Vec::new();
+        for key in keys {
+            if let Err(e) = enigo.key(key, direction) {
+                errors.push(e.to_string());
+            }
+        }
+        if !errors.is_empty() {
+            return Err(Error::Input(format!(
+                "failed to release {} key(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )));
+        }
     }
     Ok(())
 }
@@ -190,6 +201,116 @@ fn shifted_base(ch: char) -> Option<char> {
     })
 }
 
+/// Common interface for keyboard, mouse button, and pointer movement injection.
+pub trait InputDevice {
+    fn send_key(&mut self, key: Key, direction: Direction) -> Result<()>;
+    fn send_button(&mut self, button: Button, direction: Direction) -> Result<()>;
+    fn send_move_mouse(&mut self, x: i32, y: i32, coordinate: Coordinate) -> Result<()>;
+}
+
+impl InputDevice for Enigo {
+    fn send_key(&mut self, key: Key, direction: Direction) -> Result<()> {
+        Keyboard::key(self, key, direction).map_err(input_err)
+    }
+
+    fn send_button(&mut self, button: Button, direction: Direction) -> Result<()> {
+        Mouse::button(self, button, direction).map_err(input_err)
+    }
+
+    fn send_move_mouse(&mut self, x: i32, y: i32, coordinate: Coordinate) -> Result<()> {
+        Mouse::move_mouse(self, x, y, coordinate).map_err(input_err)
+    }
+}
+
+/// A held key or mouse button tracked for RAII release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldInput {
+    Key(Key),
+    Button(Button),
+}
+
+/// RAII Drop guard ensuring pressed keys and mouse buttons are released upon scope exit,
+/// preventing stuck Shift/Ctrl/Alt or mouse buttons on error paths or panics.
+pub struct InputGuard<'a, D: InputDevice = Enigo> {
+    pub device: &'a mut D,
+    pub held: Vec<HeldInput>,
+}
+
+impl<'a, D: InputDevice> InputGuard<'a, D> {
+    pub fn new(device: &'a mut D) -> Self {
+        Self {
+            device,
+            held: Vec::new(),
+        }
+    }
+
+    pub fn press_key(&mut self, key: Key) -> Result<()> {
+        self.device.send_key(key, Direction::Press)?;
+        self.held.push(HeldInput::Key(key));
+        Ok(())
+    }
+
+    pub fn press_button(&mut self, button: Button) -> Result<()> {
+        self.device.send_button(button, Direction::Press)?;
+        self.held.push(HeldInput::Button(button));
+        Ok(())
+    }
+
+    /// Explicitly release all held inputs in reverse order (LIFO).
+    /// If one fails, still makes a best-effort attempt to release the rest,
+    /// and aggregates/reports any errors encountered.
+    pub fn release_all(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        while let Some(item) = self.held.pop() {
+            let res = match item {
+                HeldInput::Key(k) => self.device.send_key(k, Direction::Release),
+                HeldInput::Button(b) => self.device.send_button(b, Direction::Release),
+            };
+            if let Err(e) = res {
+                errors.push(e.to_string());
+            }
+        }
+        if !errors.is_empty() {
+            return Err(Error::Input(format!(
+                "failed to release {} held input(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Execute a fallible operation and ensure all held inputs are released afterwards.
+    /// If the operation fails, all held inputs are released, and if releasing also fails,
+    /// both errors are combined into a descriptive error message.
+    pub fn run_and_release<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let res = f(self);
+        let rel_res = self.release_all();
+        match (res, rel_res) {
+            (Ok(val), Ok(())) => Ok(val),
+            (Ok(_), Err(rel_err)) => Err(rel_err),
+            (Err(op_err), Ok(())) => Err(op_err),
+            (Err(op_err), Err(rel_err)) => Err(Error::Input(format!(
+                "{op_err}; additionally failed to release inputs: {rel_err}"
+            ))),
+        }
+    }
+}
+
+impl<'a, D: InputDevice> Drop for InputGuard<'a, D> {
+    fn drop(&mut self) {
+        while let Some(item) = self.held.pop() {
+            let _ = match item {
+                HeldInput::Key(k) => self.device.send_key(k, Direction::Release),
+                HeldInput::Button(b) => self.device.send_button(b, Direction::Release),
+            };
+        }
+    }
+}
+
 fn type_ascii_char(enigo: &mut Enigo, ch: char) -> Result<()> {
     match ch {
         '\n' | '\r' => {
@@ -205,13 +326,12 @@ fn type_ascii_char(enigo: &mut Enigo, ch: char) -> Result<()> {
         _ => {}
     }
     if let Some(base) = shifted_base(ch) {
-        enigo.key(Key::Shift, Direction::Press).map_err(input_err)?;
-        enigo
-            .key(Key::Unicode(base), Direction::Click)
-            .map_err(input_err)?;
-        enigo
-            .key(Key::Shift, Direction::Release)
-            .map_err(input_err)?;
+        let mut guard = InputGuard::new(enigo);
+        guard.run_and_release(|g| {
+            g.press_key(Key::Shift)?;
+            g.device.send_key(Key::Unicode(base), Direction::Click)?;
+            Ok(())
+        })?;
     } else {
         enigo
             .key(Key::Unicode(ch), Direction::Click)
@@ -239,12 +359,12 @@ fn map_button(b: cua_core::MouseButton) -> Button {
 /// dropped or mis-hit by canvas/edit controls that sample the pointer on
 /// press, so the hold is explicit.
 fn press_release(enigo: &mut Enigo, button: Button, hold_ms: u64) -> Result<()> {
-    enigo.button(button, Direction::Press).map_err(input_err)?;
-    std::thread::sleep(Duration::from_millis(hold_ms));
-    enigo
-        .button(button, Direction::Release)
-        .map_err(input_err)?;
-    Ok(())
+    let mut guard = InputGuard::new(enigo);
+    guard.run_and_release(|g| {
+        g.press_button(button)?;
+        std::thread::sleep(Duration::from_millis(hold_ms));
+        Ok(())
+    })
 }
 
 fn input_err(e: impl std::fmt::Display) -> Error {
@@ -253,6 +373,10 @@ fn input_err(e: impl std::fmt::Display) -> Error {
 
 /// Press a chord like `ctrl+c`, `alt+Tab`, `Return`.
 fn key_combo(enigo: &mut Enigo, combo: &str) -> Result<()> {
+    key_combo_with_device(enigo, combo)
+}
+
+fn key_combo_with_device<D: InputDevice>(device: &mut D, combo: &str) -> Result<()> {
     let parts: Vec<&str> = combo
         .split('+')
         .map(str::trim)
@@ -266,22 +390,20 @@ fn key_combo(enigo: &mut Enigo, combo: &str) -> Result<()> {
     let key = parse_key(key_name[0])
         .ok_or_else(|| Error::InvalidAction(format!("unknown key: {}", key_name[0])))?;
 
-    let mut pressed = Vec::new();
-    for m in mods {
-        if let Some(k) = parse_modifier(m) {
-            enigo.key(k, Direction::Press).map_err(input_err)?;
-            pressed.push(k);
-        } else {
-            return Err(Error::InvalidAction(format!("unknown modifier: {m}")));
+    let mut guard = InputGuard::new(device);
+    guard.run_and_release(|g| {
+        for m in mods {
+            if let Some(k) = parse_modifier(m) {
+                g.press_key(k)?;
+            } else {
+                return Err(Error::InvalidAction(format!("unknown modifier: {m}")));
+            }
         }
-    }
 
-    enigo.key(key, Direction::Click).map_err(input_err)?;
-    std::thread::sleep(Duration::from_millis(20));
-    for k in pressed.into_iter().rev() {
-        enigo.key(k, Direction::Release).map_err(input_err)?;
-    }
-    Ok(())
+        g.device.send_key(key, Direction::Click)?;
+        std::thread::sleep(Duration::from_millis(20));
+        Ok(())
+    })
 }
 
 fn parse_modifier(name: &str) -> Option<Key> {
@@ -341,7 +463,7 @@ fn parse_key(name: &str) -> Option<Key> {
 
 #[cfg(test)]
 mod tests {
-    use super::shifted_base;
+    use super::*;
 
     #[test]
     fn maps_shifted_keys_but_not_plain_ones() {
@@ -354,5 +476,160 @@ mod tests {
         assert_eq!(shifted_base('a'), None);
         assert_eq!(shifted_base('1'), None);
         assert_eq!(shifted_base(' '), None);
+    }
+
+    #[derive(Default)]
+    struct MockDevice {
+        events: Vec<(String, Direction)>,
+        fail_press: Option<String>,
+        fail_release: Option<String>,
+        fail_move: bool,
+    }
+
+    impl InputDevice for MockDevice {
+        fn send_key(&mut self, key: Key, direction: Direction) -> Result<()> {
+            let name = format!("{key:?}");
+            if direction == Direction::Press && self.fail_press.as_deref() == Some(&name) {
+                return Err(Error::Input(format!("simulated press failure on {name}")));
+            }
+            if direction == Direction::Release && self.fail_release.as_deref() == Some(&name) {
+                return Err(Error::Input(format!("simulated release failure on {name}")));
+            }
+            self.events.push((name, direction));
+            Ok(())
+        }
+
+        fn send_button(&mut self, button: Button, direction: Direction) -> Result<()> {
+            let name = format!("{button:?}");
+            if direction == Direction::Press && self.fail_press.as_deref() == Some(&name) {
+                return Err(Error::Input(format!("simulated press failure on {name}")));
+            }
+            if direction == Direction::Release && self.fail_release.as_deref() == Some(&name) {
+                return Err(Error::Input(format!("simulated release failure on {name}")));
+            }
+            self.events.push((name, direction));
+            Ok(())
+        }
+
+        fn send_move_mouse(&mut self, _x: i32, _y: i32, _coordinate: Coordinate) -> Result<()> {
+            if self.fail_move {
+                return Err(Error::Input("simulated move failure".into()));
+            }
+            self.events.push(("mouse_move".into(), Direction::Press));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_empty_key_combo_returns_error() {
+        let mut mock = MockDevice::default();
+        let res = key_combo_with_device(&mut mock, "   ");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_key_combo_invalid_modifier_unwinds_pressed_keys() {
+        let mut mock = MockDevice::default();
+        let res = key_combo_with_device(&mut mock, "ctrl+nonexistent_modifier+c");
+        assert!(res.is_err());
+        let err_str = res.unwrap_err().to_string();
+        assert!(err_str.contains("unknown modifier"), "{err_str}");
+
+        assert_eq!(
+            mock.events,
+            vec![
+                (format!("{:?}", Key::Control), Direction::Press),
+                (format!("{:?}", Key::Control), Direction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_input_guard_run_and_release_success() {
+        let mut mock = MockDevice::default();
+        let mut guard = InputGuard::new(&mut mock);
+        let res = guard.run_and_release(|g| {
+            g.press_key(Key::Shift)?;
+            assert_eq!(g.held.len(), 1);
+            Ok(42)
+        });
+        assert_eq!(res.unwrap(), 42);
+        assert!(guard.held.is_empty());
+        assert_eq!(
+            guard.device.events,
+            vec![
+                (format!("{:?}", Key::Shift), Direction::Press),
+                (format!("{:?}", Key::Shift), Direction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_input_guard_run_and_release_error_unwinds() {
+        let mut mock = MockDevice::default();
+        let mut guard = InputGuard::new(&mut mock);
+        let res: Result<()> = guard.run_and_release(|g| {
+            g.press_key(Key::Shift)?;
+            g.press_button(Button::Left)?;
+            assert_eq!(g.held.len(), 2);
+            Err(Error::Input("simulated action failure".into()))
+        });
+        assert!(res.is_err());
+        let err_str = res.unwrap_err().to_string();
+        assert!(err_str.contains("simulated action failure"), "{err_str}");
+        assert!(guard.held.is_empty(), "guard must be released after error");
+        assert_eq!(
+            guard.device.events,
+            vec![
+                (format!("{:?}", Key::Shift), Direction::Press),
+                (format!("{:?}", Button::Left), Direction::Press),
+                (format!("{:?}", Button::Left), Direction::Release),
+                (format!("{:?}", Key::Shift), Direction::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_input_guard_best_effort_release_and_aggregate_errors() {
+        let mut mock = MockDevice {
+            fail_release: Some(format!("{:?}", Button::Left)),
+            ..Default::default()
+        };
+        let mut guard = InputGuard::new(&mut mock);
+        let res: Result<()> = guard.run_and_release(|g| {
+            g.press_key(Key::Shift)?;
+            g.press_button(Button::Left)?;
+            Err(Error::Input("action failed".into()))
+        });
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("action failed"), "{err}");
+        assert!(err.contains("failed to release"), "{err}");
+        assert!(
+            guard
+                .device
+                .events
+                .contains(&(format!("{:?}", Key::Shift), Direction::Release)),
+            "Shift release must still have executed despite Button::Left release failure"
+        );
+    }
+
+    #[test]
+    fn test_drop_guard_releases_held_inputs_on_scope_exit() {
+        let mut mock = MockDevice::default();
+        {
+            let mut guard = InputGuard::new(&mut mock);
+            guard.press_key(Key::Alt).unwrap();
+            guard.press_button(Button::Right).unwrap();
+        }
+        assert_eq!(
+            mock.events,
+            vec![
+                (format!("{:?}", Key::Alt), Direction::Press),
+                (format!("{:?}", Button::Right), Direction::Press),
+                (format!("{:?}", Button::Right), Direction::Release),
+                (format!("{:?}", Key::Alt), Direction::Release),
+            ]
+        );
     }
 }
