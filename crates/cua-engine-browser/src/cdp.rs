@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +15,119 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Park the real OS cursor on a **screen point in desktop-independent pixels
+/// (DIP)**, pressing nothing.
+///
+/// The caller that owns the desktop input backend supplies this; the browser
+/// engine deliberately does not link one, so the same engine still runs where
+/// there is no pointer to move. DIP rather than raw pixels because the page only
+/// ever speaks DIP — the multiply to physical pixels belongs with the OS scale,
+/// which the desktop layer is the only party that knows. So although
+/// [`cua_core::Point`] is documented as physical pixels, this argument is not.
+pub type PointerMover = Arc<dyn Fn(cua_core::Point) -> Result<()> + Send + Sync + 'static>;
+
+/// How long the cursor holds still on the target before the action fires. At
+/// full speed a move-and-go is invisible to a human, which defeats the point.
+const POINTER_DWELL: Duration = Duration::from_millis(300);
+
+/// Window and page geometry as the page sees it, in DIP.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WindowGeometry {
+    pub screen_x: f64,
+    pub screen_y: f64,
+    pub outer_w: f64,
+    pub outer_h: f64,
+    pub inner_w: f64,
+    pub inner_h: f64,
+    pub screen_w: f64,
+    pub screen_h: f64,
+    pub dpr: f64,
+}
+
+/// Map a viewport CSS-pixel point onto the screen.
+///
+/// The frame is split the usual way: everything the window is wider than the
+/// viewport is one border on each side, and the vertical difference is that same
+/// bottom border plus all of the browser chrome above. `zoom` is the page zoom,
+/// so a page the user zoomed does not slide the cursor off the element it was
+/// aiming at.
+///
+/// Returns `None` rather than a guess: a cursor parked on the wrong thing is
+/// worse than no cursor at all.
+fn viewport_to_screen(
+    geo: &WindowGeometry,
+    cx: f64,
+    cy: f64,
+    zoom: f64,
+) -> Option<cua_core::Point> {
+    if !(geo.inner_w > 0.0 && geo.inner_h > 0.0 && geo.dpr > 0.0 && zoom > 0.0) {
+        return None;
+    }
+    let border_x = (geo.outer_w - geo.inner_w) / 2.0;
+    let chrome_top = (geo.outer_h - geo.inner_h) - border_x;
+    if border_x < 0.0 || chrome_top < 0.0 {
+        return None;
+    }
+    let x = geo.screen_x + border_x + cx / zoom;
+    let y = geo.screen_y + chrome_top + cy / zoom;
+    if !(x.is_finite() && y.is_finite()) {
+        return None;
+    }
+    // Off every screen means the numbers stopped describing a window.
+    if x < 0.0 || y < 0.0 || x >= geo.screen_w || y >= geo.screen_h {
+        return None;
+    }
+    Some(cua_core::Point::new(x.round() as i32, y.round() as i32))
+}
+
+/// Why the cursor will not be moved for this action, if it will not be.
+///
+/// Separated from [`BrowserSession::indicate_cursor`] so the whole decision is
+/// testable without a browser or a display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerSkip {
+    /// No window on this screen to point at.
+    Headless,
+    /// The visibility gate could not give an element centre.
+    NoCentre,
+    /// The page's own geometry does not describe a place on any screen.
+    Unmappable,
+}
+
+/// Decide where the cursor should sit, or why it will not move.
+fn plan_pointer(
+    headed: bool,
+    cx: Option<f64>,
+    cy: Option<f64>,
+    geo: Option<&WindowGeometry>,
+    zoom: f64,
+) -> std::result::Result<cua_core::Point, PointerSkip> {
+    if !headed {
+        return Err(PointerSkip::Headless);
+    }
+    let (Some(cx), Some(cy)) = (cx, cy) else {
+        return Err(PointerSkip::NoCentre);
+    };
+    let Some(geo) = geo else {
+        return Err(PointerSkip::Unmappable);
+    };
+    viewport_to_screen(geo, cx, cy, zoom).ok_or(PointerSkip::Unmappable)
+}
+
+/// Put the cursor on the point and hold it there long enough to be noticed.
+///
+/// A mover that cannot move — no display, no permission, a rejected coordinate —
+/// is logged and dropped. The action it was decorating still runs, which is the
+/// whole reason the hint is allowed to exist.
+async fn park_cursor(mover: &PointerMover, point: cua_core::Point) -> bool {
+    if let Err(why) = mover(point) {
+        tracing::warn!("pointer hint failed ({why}); acting anyway");
+        return false;
+    }
+    tokio::time::sleep(POINTER_DWELL).await;
+    true
+}
 
 pub struct LaunchOptions {
     pub headed: bool,
@@ -39,6 +153,12 @@ pub struct BrowserSession {
     pub port: u16,
     /// Target id of the page we are attached to.
     target_id: String,
+    /// Whether the browser has a window on screen for a cursor to follow.
+    headed: bool,
+    /// `devicePixelRatio` as it read while the page was certainly unzoomed. Page
+    /// zoom is the current ratio divided by this; Chrome gives no direct readout.
+    base_dpr: Option<f64>,
+    pointer: Option<PointerMover>,
 }
 
 #[derive(Debug, Clone)]
@@ -536,14 +656,24 @@ async fn launch_with(
         .with_context(|| format!("failed to connect to {ws_url} (pid {child_pid})"))?;
 
     let (child, profile_dir) = pending.commit();
-    Ok(BrowserSession {
+    let mut session = BrowserSession {
         child,
         profile_dir,
         ws,
         next_id: 1,
         port,
         target_id,
-    })
+        headed: opts.headed,
+        base_dpr: None,
+        pointer: None,
+    };
+    if opts.headed {
+        // Baseline the pixel ratio while the page is still certainly unzoomed, so a
+        // later indication can tell page zoom apart from OS scaling. Best effort: no
+        // baseline simply means "assume zoom 1".
+        session.base_dpr = session.current_dpr().await;
+    }
+    Ok(session)
 }
 
 /// Shared element lookup, as a JavaScript expression that evaluates to the element or
@@ -1080,6 +1210,83 @@ impl BrowserSession {
     ///
     /// Automatically ensures target element is scrolled into view, resolves any
     /// sticky header occlusion via single-shot compensation, and supports click proxying.
+    /// Arm the cursor hint: before each click or type, the real cursor is parked
+    /// on the target so a human watching the screen can follow what is next.
+    /// `None` leaves the session silent, which is the default.
+    pub fn set_pointer_hint(&mut self, mover: Option<PointerMover>) {
+        self.pointer = mover;
+    }
+
+    /// Best effort, and only ever a visual aid: no button is pressed, no focus is
+    /// taken, nothing is read back, and every failure path ends in a log line
+    /// rather than an error the action has to survive.
+    pub(crate) async fn indicate_cursor(&mut self, cx: Option<f64>, cy: Option<f64>) {
+        let Some(mover) = self.pointer.clone() else {
+            return;
+        };
+        // Only ask the page where its window is when a move is even possible.
+        let geo = if self.headed && cx.is_some() && cy.is_some() {
+            self.window_geometry().await
+        } else {
+            None
+        };
+        let zoom = match (self.base_dpr.filter(|b| *b > 0.0), geo.as_ref()) {
+            (Some(base), Some(g)) => g.dpr / base,
+            _ => 1.0,
+        };
+        match plan_pointer(self.headed, cx, cy, geo.as_ref(), zoom) {
+            Err(PointerSkip::Headless) => tracing::debug!(
+                "pointer hint skipped: a headless browser has no cursor on screen to follow"
+            ),
+            Err(PointerSkip::NoCentre) => {
+                tracing::debug!("pointer hint skipped: the visibility gate gave no element centre")
+            }
+            Err(PointerSkip::Unmappable) => tracing::warn!(
+                "pointer hint skipped: this window's geometry does not map the target onto any screen"
+            ),
+            Ok(point) => {
+                park_cursor(&mover, point).await;
+            }
+        }
+    }
+
+    /// `devicePixelRatio`, which is the OS scale multiplied by the page zoom.
+    async fn current_dpr(&mut self) -> Option<f64> {
+        self.eval("window.devicePixelRatio")
+            .await
+            .ok()?
+            .as_f64()
+            .filter(|d| *d > 0.0)
+    }
+
+    /// Where the window sits and how big its viewport is, in DIP.
+    async fn window_geometry(&mut self) -> Option<WindowGeometry> {
+        let js = r#"({
+            screenX: window.screenX,
+            screenY: window.screenY,
+            outerW: window.outerWidth,
+            outerH: window.outerHeight,
+            innerW: window.innerWidth,
+            innerH: window.innerHeight,
+            screenW: (window.screen && window.screen.width) || 0,
+            screenH: (window.screen && window.screen.height) || 0,
+            dpr: window.devicePixelRatio
+        })"#;
+        let v = self.eval(js).await.ok()?;
+        let get = |k: &str| v.get(k)?.as_f64();
+        Some(WindowGeometry {
+            screen_x: get("screenX")?,
+            screen_y: get("screenY")?,
+            outer_w: get("outerW")?,
+            outer_h: get("outerH")?,
+            inner_w: get("innerW")?,
+            inner_h: get("innerH")?,
+            screen_w: get("screenW")?,
+            screen_h: get("screenH")?,
+            dpr: get("dpr")?,
+        })
+    }
+
     pub async fn click(&mut self, selector: &str) -> Result<String> {
         let before = self.read_state(selector).await?;
         if !before.found {
@@ -1108,6 +1315,8 @@ impl BrowserSession {
                 vis.remedy
             ));
         }
+
+        self.indicate_cursor(vis.cx, vis.cy).await;
 
         // The pixels are only worth taking when the element cannot answer for itself.
         let shot_before = if before.comparable() {
@@ -1308,6 +1517,8 @@ impl BrowserSession {
             ));
         }
 
+        self.indicate_cursor(vis.cx, vis.cy).await;
+
         let rich = before.kind == "contenteditable";
         let expected_chars = text.chars().count();
 
@@ -1447,6 +1658,12 @@ impl BrowserSession {
             next_id: 1,
             port: 0,
             target_id: String::new(),
+            // Someone else's browser: we cannot tell whether it has a window on
+            // this screen, so no cursor is moved here. Pointing at the wrong
+            // thing is worse than pointing at nothing.
+            headed: false,
+            base_dpr: None,
+            pointer: None,
         };
 
         let targets = session.send("Target.getTargets", json!({})).await?;
@@ -1738,6 +1955,114 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 1440x900 viewport in a window with a 8px side border and a 78px browser
+    /// bar, on a 1920x1080 screen, at 125% OS scaling.
+    fn window_at_origin() -> WindowGeometry {
+        WindowGeometry {
+            screen_x: 0.0,
+            screen_y: 0.0,
+            outer_w: 1456.0,
+            outer_h: 986.0,
+            inner_w: 1440.0,
+            inner_h: 900.0,
+            screen_w: 1920.0,
+            screen_h: 1080.0,
+            dpr: 1.25,
+        }
+    }
+
+    #[test]
+    fn the_viewport_centre_maps_past_the_window_frame() {
+        let geo = window_at_origin();
+        // 720,450 in the page is 8px of border and 78px of chrome further out.
+        assert_eq!(
+            viewport_to_screen(&geo, 720.0, 450.0, 1.0),
+            Some(cua_core::Point::new(728, 528))
+        );
+        // The same element in a window dragged to (400,120) moves with it.
+        let moved = WindowGeometry {
+            screen_x: 400.0,
+            screen_y: 120.0,
+            ..geo
+        };
+        assert_eq!(
+            viewport_to_screen(&moved, 720.0, 450.0, 1.0),
+            Some(cua_core::Point::new(1128, 648))
+        );
+    }
+
+    #[test]
+    fn a_zoomed_page_maps_back_to_the_element_it_was_measured_on() {
+        let geo = window_at_origin();
+        // Page zoom 1.25: the element centre reads 1.25x further out, so dividing
+        // by the zoom must land on the same screen pixel as the unzoomed reading.
+        let zoomed = viewport_to_screen(&geo, 720.0 * 1.25, 450.0 * 1.25, 1.25);
+        assert_eq!(zoomed, viewport_to_screen(&geo, 720.0, 450.0, 1.0));
+    }
+
+    #[test]
+    fn a_point_on_no_screen_is_refused_rather_than_guessed() {
+        let geo = window_at_origin();
+        assert_eq!(viewport_to_screen(&geo, 5000.0, 450.0, 1.0), None);
+        assert_eq!(viewport_to_screen(&geo, 720.0, 5000.0, 1.0), None);
+        // A window that reports no frame at all is not a mapping failure to hide.
+        assert_eq!(
+            viewport_to_screen(
+                &WindowGeometry {
+                    inner_w: 0.0,
+                    ..geo
+                },
+                10.0,
+                10.0,
+                1.0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn headless_and_unmeasured_targets_skip_without_touching_the_mover() {
+        let geo = window_at_origin();
+        assert_eq!(
+            plan_pointer(false, Some(10.0), Some(10.0), Some(&geo), 1.0),
+            Err(PointerSkip::Headless)
+        );
+        assert_eq!(
+            plan_pointer(true, Some(10.0), None, Some(&geo), 1.0),
+            Err(PointerSkip::NoCentre)
+        );
+        assert_eq!(
+            plan_pointer(true, Some(10.0), Some(10.0), None, 1.0),
+            Err(PointerSkip::Unmappable)
+        );
+        assert!(plan_pointer(true, Some(10.0), Some(10.0), Some(&geo), 1.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_mover_that_cannot_move_never_reaches_the_action() {
+        let broken: PointerMover = Arc::new(|_| Err(anyhow!("no display, no permission")));
+        assert!(
+            !park_cursor(&broken, cua_core::Point::new(10, 10)).await,
+            "the failure is reported as 'did not indicate', not propagated"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cursor_is_parked_on_the_mapped_point_and_nothing_else() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mover: PointerMover = Arc::new(move |p| {
+            sink.lock().unwrap().push(p);
+            Ok(())
+        });
+        assert!(park_cursor(&mover, cua_core::Point::new(728, 528)).await);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[cua_core::Point::new(728, 528)],
+            "one move, no button press in sight"
+        );
+    }
 
     /// Profile directories live in a shared temp dir and are found by prefix, so
     /// these tests take turns. An async lock, because the guard is held across

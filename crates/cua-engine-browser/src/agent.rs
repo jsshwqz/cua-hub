@@ -272,6 +272,47 @@ fn max_tokens_from_env() -> Option<u32> {
         .and_then(|v| v.trim().parse::<u32>().ok())
 }
 
+/// Environment override for the cursor hint.
+pub const INDICATE_MOUSE_ENV: &str = "CUA_HUB_BROWSER_INDICATE_MOUSE";
+
+/// Whether to follow the target with the real cursor: an explicit per-run value
+/// wins, then the environment, then **on**. It is on by default because a visual
+/// aid nobody switches on is a visual aid nobody gets; `=0` is the escape hatch
+/// for someone who wants their mouse back.
+///
+/// Takes the environment value as an argument rather than reading it here, so the
+/// precedence is testable without mutating process state.
+fn resolve_indicate_mouse(requested: Option<bool>, from_env: Option<bool>) -> bool {
+    requested.or(from_env).unwrap_or(true)
+}
+
+/// Whether this run should follow its targets with the real cursor.
+///
+/// A dry run never does: there is no action coming, so a cursor parked on a
+/// submit button would be a promise the run has no intention of keeping.
+fn pointer_hint_wanted(dry_run: bool, requested: Option<bool>, from_env: Option<bool>) -> bool {
+    !dry_run && resolve_indicate_mouse(requested, from_env)
+}
+
+fn indicate_mouse_from_env() -> Option<bool> {
+    parse_indicate_mouse(std::env::var(INDICATE_MOUSE_ENV).ok().as_deref())
+}
+
+/// Read the environment switch. Anything that is not a recognisable on/off word
+/// is ignored rather than obeyed — a typo should not silently disable a safety
+/// feature nobody asked to remove, nor silently enable one they turned off.
+fn parse_indicate_mouse(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "on" => Some(true),
+        other => {
+            warn!("ignoring {INDICATE_MOUSE_ENV}={other:?}: not a recognised on/off value");
+            None
+        }
+    }
+}
+
 /// Options for one browser task. `Clone` but deliberately not `Debug`: the approval
 /// hook is a `dyn Fn`, same as `RunOptions` in the CLI.
 #[derive(Clone)]
@@ -289,6 +330,16 @@ pub struct BrowserRunOptions {
     /// This only bounds how much the model may answer; it does not touch the model,
     /// the sampling temperature, or the message structure.
     pub max_tokens: Option<u32>,
+    /// Whether to park the real cursor on each click/type target first, so a human
+    /// watching can follow the tool. `None` falls back to
+    /// `CUA_HUB_BROWSER_INDICATE_MOUSE`, then to **true**. Only ever a visual aid:
+    /// it presses nothing, and it is skipped entirely for a dry run or a headless
+    /// browser, which has no cursor on screen to follow.
+    pub indicate_mouse: Option<bool>,
+    /// Moves the OS cursor for the hint. Injected by whoever owns the desktop
+    /// input backend — this crate deliberately does not link one, so it still
+    /// runs where there is no pointer. `None` means no hint even when enabled.
+    pub pointer: Option<cdp::PointerMover>,
     /// The same three switches the single-action path uses. They live here because
     /// this loop plans and fires its own actions, and a gate that only guards the
     /// other path is a gate with a door in it.
@@ -311,6 +362,8 @@ impl Default for BrowserRunOptions {
             run_dir: None,
             screenshot_quality: 70,
             max_tokens: None,
+            indicate_mouse: None,
+            pointer: None,
             // Neither default may be `true`: letting a model drive a real browser has
             // to be said out loud, or answered by a client that can confirm.
             yes: false,
@@ -392,6 +445,19 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
     })
     .await
     .context("launch browser")?;
+
+    // The cursor hint is a visual aid for whoever is watching the screen, so it
+    // never gates anything: a dry run has no action to point at, and a headless
+    // browser has no cursor on screen to follow.
+    let indicate =
+        pointer_hint_wanted(opts.dry_run, opts.indicate_mouse, indicate_mouse_from_env());
+    match (indicate, opts.pointer.clone()) {
+        (true, Some(mover)) => session.set_pointer_hint(Some(mover)),
+        (true, None) => tracing::debug!(
+            "pointer hint is on but no desktop input backend was supplied; nothing will be indicated"
+        ),
+        (false, _) => {}
+    }
 
     if let Some(url) = &opts.start_url {
         session.navigate(url).await?;
@@ -984,6 +1050,39 @@ mod tests {
         assert_eq!(resolve_max_tokens(Some(900), Some(500)), 900);
         assert_eq!(resolve_max_tokens(None, Some(500)), 500);
         assert_eq!(resolve_max_tokens(None, None), DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn the_cursor_hint_is_on_unless_someone_says_otherwise() {
+        assert!(resolve_indicate_mouse(None, None), "default is on");
+        assert!(!resolve_indicate_mouse(Some(false), None));
+        assert!(
+            !resolve_indicate_mouse(None, Some(false)),
+            "env can turn it off"
+        );
+        assert!(
+            resolve_indicate_mouse(Some(true), Some(false)),
+            "the per-run answer beats the environment"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_never_points_at_anything() {
+        assert!(!pointer_hint_wanted(true, Some(true), None));
+        assert!(!pointer_hint_wanted(true, None, Some(true)));
+        assert!(pointer_hint_wanted(false, None, None));
+    }
+
+    #[test]
+    fn the_environment_switch_accepts_words_and_ignores_garbage() {
+        assert_eq!(parse_indicate_mouse(Some("0")), Some(false));
+        assert_eq!(parse_indicate_mouse(Some(" off ")), Some(false));
+        assert_eq!(parse_indicate_mouse(Some("FALSE")), Some(false));
+        assert_eq!(parse_indicate_mouse(Some("1")), Some(true));
+        assert_eq!(parse_indicate_mouse(Some("on")), Some(true));
+        assert_eq!(parse_indicate_mouse(None), None);
+        assert_eq!(parse_indicate_mouse(Some("")), None);
+        assert_eq!(parse_indicate_mouse(Some("maybe")), None);
     }
 
     #[test]
