@@ -305,6 +305,8 @@ async fn execute_step(
                 yes: opts.yes,
                 allow_high: opts.allow_high,
                 approver: opts.approver.clone(),
+                timeout: None,
+                cancel: None,
             })
             .await?;
             let ok = report.outcome.is_success();

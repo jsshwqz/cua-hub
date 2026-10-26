@@ -399,6 +399,8 @@ fn main() -> Result<()> {
                     // A CLI run has no client to ask, so the gate falls back to the
                     // terminal prompt it uses for every other engine.
                     approver: None,
+                    timeout: None,
+                    cancel: None,
                 },
             ))?;
             if !report.outcome.is_success() {

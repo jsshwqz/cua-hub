@@ -2542,6 +2542,10 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 yes: args["yes"].as_bool().unwrap_or(false),
                 allow_high: args["allow_high"].as_bool().unwrap_or(false),
                 approver: approver_from_elicitor(),
+                timeout: args["timeout_ms"]
+                    .as_u64()
+                    .map(std::time::Duration::from_millis),
+                cancel: None,
             };
             match cua_engine_browser::run_task(opts).await {
                 Ok(report) => {
