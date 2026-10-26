@@ -55,7 +55,6 @@ jobs:
           # 手工四件套里的第四件是 SKILL.md（源在 integrations/skill/），
           # install-qoder.ps1 往 ~/.qoder/skills/cua-hub 同步的就是它，不能少。
           Copy-Item integrations/skill/SKILL.md dist/
-          Copy-Item LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "cua-hub-windows-x64-$ver.zip"
 
       - name: Upload artifact
