@@ -4,6 +4,20 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
+## Unreleased — 已合入分支，尚未发版
+
+### 审计与路由：MCP 原子工具统一审计落盘与 Access 引擎窄提示路由（issue #14）
+
+- **MCP 原子工具统一审计落盘**：`call_tool_single` 为每一次原子工具调用追加记录一条 JSONL
+  审计记录（包含时间戳、工具名、脱敏参数、ok/failed、effect）；严格保证脱敏规则，参数值仅记录类型
+  与字符/数组/对象长度，绝不落地剪贴板全文、token、密码或完整观测文本；`replay_run` 重放同样落盘
+  并明示 `replay: true`；落盘错误仅 warning 记录，不阻断工具调用且不更改返回值与 MCP 字段定义。
+- **Access 引擎窄提示路由**：在 Code 与 Browser 提示词之后、默认 Vision 之前新增窄 `access_hints`
+  （"无障碍"、"accessibility"、"uia"、"at-spi"、"控件"），命中后主路由为 Access 且配置 fallback 为
+  `[Vision]`；常规桌面任务（如"打开记事本输入 hello"）保持走 Vision，Code/Browser 提示词与显式 forced 规则优先；
+  同步修正 README 引擎状态口径。
+- **Fail 变更状态分类核验**：确认 `Action::Fail.is_mutating() == false` 语义与回归测试 `a_failed_run_did_not_modify_the_machine` 持续在列且通过。
+
 ## 0.1.6 — 2026-10-26
 
 桌面与浏览器动作都改成"回读到什么就报什么"的一版：click/type 给 changed/unchanged/unverifiable，
