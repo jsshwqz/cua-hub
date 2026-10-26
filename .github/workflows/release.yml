@@ -57,7 +57,11 @@ jobs:
           Copy-Item integrations/skill/SKILL.md dist/
           Compress-Archive -Path dist/* -DestinationPath "cua-hub-windows-x64-$ver.zip"
 
+      # tag 构建的交付物是 Release 上那份 zip，再传一遍只是把同一个包在账号级
+      # 产物配额里存两份。手动 workflow_dispatch 不建 Release，artifact 是它
+      # 唯一的产物，必须保留。
       - name: Upload artifact
+        if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: cua-hub-windows-x64
