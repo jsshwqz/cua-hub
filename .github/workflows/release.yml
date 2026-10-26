@@ -30,9 +30,10 @@ jobs:
       # 主线 CI（ci.yml）已证明 windows-latest 上构建本仓库无需额外系统依赖，
       # 故此处不装任何 choco 包。
 
-      - name: Build cua-hub (release, static CRT)
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
+      - name: Build cua-hub (release)
+        # 链接方式与手工发版保持一致：不加 crt-static。已发布的 0.1.4~0.1.6
+        # 包内 exe 都是动态 CRT（导入表里有 VCRUNTIME140.dll），流水线要的是
+        # 复刻做法，不是顺手改进；要转静态另立一单，补配方和 CHANGELOG。
         # 二进制 crate 为 cua-cli，其 [[bin]] 产物名为 cua-hub
         # （见 crates/cua-cli/Cargo.toml）。
         run: cargo build --release -p cua-cli --target x86_64-pc-windows-msvc
@@ -74,4 +75,4 @@ jobs:
             （自动构建草稿：发布说明待维护者补写后发布。）
 
             本包由 GitHub Actions 在 windows-latest 上自动构建，
-            产物 cua-hub.exe（静态 CRT），用法见包内 README。
+            产物 cua-hub.exe，用法见包内 README。
