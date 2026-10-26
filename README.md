@@ -28,7 +28,7 @@ Phase 2 进行中，Windows 真机验证：
 | Vision | 默认 / `--engine vision` | 未知 GUI、跨应用操作 |
 | Code | 任务含"命令/脚本/磁盘空间/进程列表…"或 `--engine code` | 确定性数据获取、批处理 |
 | Browser | 任务含 URL / "浏览器/网页"，或 `cua-hub browser` | 网页读取、点击、表单、滚动、多标签、同源 iframe |
-| Access | 计划中（当前提供快照） | 精确控件操作 |
+| Access | 任务含"无障碍/accessibility/uia/at-spi/控件" | 精确控件操作 |
 
 ## 快速开始
 

@@ -77,6 +77,8 @@ impl Router for RuleRouter {
             "website",
             "url",
         ];
+        // Narrow accessibility / UI automation hints.
+        let access_hints = ["无障碍", "accessibility", "uia", "at-spi", "控件"];
 
         if code_hints.iter().any(|h| t.contains(h)) {
             return RoutingDecision {
@@ -90,6 +92,13 @@ impl Router for RuleRouter {
                 kind: EngineKind::Browser,
                 fallbacks: vec![EngineKind::Vision],
                 reason: "task mentions a browser or URL".into(),
+            };
+        }
+        if access_hints.iter().any(|h| t.contains(h)) {
+            return RoutingDecision {
+                kind: EngineKind::Access,
+                fallbacks: vec![EngineKind::Vision],
+                reason: "task mentions accessibility or UI controls".into(),
             };
         }
 
@@ -130,9 +139,41 @@ mod tests {
     }
 
     #[test]
+    fn access_task_routes_to_access() {
+        let d1 = RuleRouter::new().route("通过无障碍接口点击确定按钮");
+        assert_eq!(d1.kind, EngineKind::Access);
+        assert_eq!(d1.fallbacks, vec![EngineKind::Vision]);
+
+        let d2 = RuleRouter::new().route("inspect elements using uia accessibility");
+        assert_eq!(d2.kind, EngineKind::Access);
+        assert_eq!(d2.fallbacks, vec![EngineKind::Vision]);
+
+        let d3 = RuleRouter::new().route("使用 at-spi 查找窗口控件");
+        assert_eq!(d3.kind, EngineKind::Access);
+        assert_eq!(d3.fallbacks, vec![EngineKind::Vision]);
+    }
+
+    #[test]
+    fn code_and_browser_hints_outrank_access() {
+        // Browser hint takes priority over access hint
+        let db = RuleRouter::new().route("打开浏览器查看无障碍控件");
+        assert_eq!(db.kind, EngineKind::Browser);
+        assert_eq!(db.fallbacks, vec![EngineKind::Vision]);
+
+        // Code hint takes priority over access hint
+        let dc = RuleRouter::new().route("用 powershell 检查控件状态");
+        assert_eq!(dc.kind, EngineKind::Code);
+        assert_eq!(dc.fallbacks, vec![EngineKind::Vision]);
+    }
+
+    #[test]
     fn forced_engine_wins() {
         let d = RuleRouter::forced(EngineKind::Vision).route("打开浏览器");
         assert_eq!(d.kind, EngineKind::Vision);
         assert!(d.fallbacks.is_empty());
+
+        let d_access = RuleRouter::forced(EngineKind::Vision).route("读取无障碍控件");
+        assert_eq!(d_access.kind, EngineKind::Vision);
+        assert!(d_access.fallbacks.is_empty());
     }
 }

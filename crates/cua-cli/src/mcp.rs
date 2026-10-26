@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2395,7 +2396,165 @@ fn error_text(result: &Value) -> String {
         .to_string()
 }
 
+static AUDIT_OVERRIDE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn mcp_audit_log_path() -> PathBuf {
+    if let Ok(guard) = AUDIT_OVERRIDE_PATH.lock() {
+        if let Some(p) = guard.as_ref() {
+            return p.clone();
+        }
+    }
+    if let Ok(p) = std::env::var("CUA_MCP_AUDIT_LOG") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    PathBuf::from(".runs").join("mcp_audit.jsonl")
+}
+
+static MCP_AUDIT_MUTEX: Mutex<()> = Mutex::new(());
+
+fn sanitize_audit_val(v: &Value) -> Value {
+    match v {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(_) => json!({ "type": "bool" }),
+        Value::Number(_) => json!({ "type": "number" }),
+        Value::String(s) => {
+            let len = s.chars().count();
+            json!({
+                "type": "string",
+                "len": len,
+                "length": len,
+            })
+        }
+        Value::Array(arr) => json!({
+            "type": "array",
+            "len": arr.len(),
+            "length": arr.len(),
+        }),
+        Value::Object(map) => json!({
+            "type": "object",
+            "len": map.len(),
+            "length": map.len(),
+        }),
+    }
+}
+
+fn sanitize_audit_args(args: &Value) -> Value {
+    if let Some(map) = args.as_object() {
+        let mut sanitized = serde_json::Map::new();
+        for (k, v) in map {
+            sanitized.insert(k.clone(), sanitize_audit_val(v));
+        }
+        Value::Object(sanitized)
+    } else if args.is_null() {
+        json!({})
+    } else {
+        sanitize_audit_val(args)
+    }
+}
+
+fn determine_audit_effect(tool: &str, result: &Value) -> String {
+    if result["isError"].as_bool().unwrap_or(false) {
+        return "failed".to_string();
+    }
+    if let Some(parts) = result["content"].as_array() {
+        for part in parts {
+            if let Some(text) = part["text"].as_str() {
+                if text.contains("effect=changed") {
+                    return "changed".to_string();
+                }
+                if text.contains("effect=unchanged") {
+                    return "unchanged".to_string();
+                }
+                if text.contains("effect=unverifiable") {
+                    return "unverifiable".to_string();
+                }
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    if let Some(e) = parsed["effect"].as_str() {
+                        return e.to_string();
+                    }
+                    if parsed["verified_effect"].as_bool() == Some(true) {
+                        return "changed".to_string();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(e) = result.get("effect").and_then(|v| v.as_str()) {
+        return e.to_string();
+    }
+    let read_only_tools = [
+        "capture_screen",
+        "window_state",
+        "control_state",
+        "screen_info",
+        "list_windows",
+        "clipboard_get",
+        "list_runs",
+        "inspect_accessibility",
+    ];
+    if read_only_tools.contains(&tool) {
+        return "read_only".to_string();
+    }
+    if tool == "replay_run" {
+        return "replayed".to_string();
+    }
+    "unverifiable".to_string()
+}
+
+fn record_mcp_audit(tool: &str, args: &Value, result: &Value) {
+    if let Err(e) = record_mcp_audit_inner(tool, args, result) {
+        tracing::warn!(error = %e, tool = tool, "failed to record MCP audit log");
+    }
+}
+
+fn record_mcp_audit_inner(tool: &str, args: &Value, result: &Value) -> Result<()> {
+    let path = mcp_audit_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let is_error = result["isError"].as_bool().unwrap_or(false);
+    let effect = determine_audit_effect(tool, result);
+    let is_replay = tool == "replay_run"
+        || args
+            .get("replay")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+    let sanitized_params = sanitize_audit_args(args);
+    let entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "tool": tool,
+        "params": sanitized_params,
+        "ok": !is_error,
+        "status": if is_error { "failed" } else { "ok" },
+        "effect": effect,
+        "replay": is_replay,
+    });
+
+    let line = serde_json::to_string(&entry)?;
+    let _guard = match MCP_AUDIT_MUTEX.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
 async fn call_tool_single(name: &str, args: &Value) -> Value {
+    let result = call_tool_single_routed(name, args).await;
+    record_mcp_audit(name, args, &result);
+    result
+}
+
+async fn call_tool_single_routed(name: &str, args: &Value) -> Value {
     let question_id = extract_question_id(args);
     let max_retries = max_retries_from_args(args);
     if let Some(q) = &question_id {
@@ -5402,5 +5561,140 @@ mod tests {
             assert!(parsed.get("clamped").is_none());
             assert!(parsed.get("requested_timeout_ms").is_none());
         }
+    }
+
+    #[test]
+    fn test_mcp_audit_sanitizes_parameters_and_never_leaks_secrets() {
+        let sensitive = json!({
+            "text": "my secret clipboard text",
+            "token": "sk-ant-api03-very-secret-token",
+            "password": "Password123!",
+            "x": 500,
+            "y": 300,
+            "options": {
+                "active": true,
+                "note": "some note"
+            },
+            "empty": null
+        });
+
+        let sanitized = sanitize_audit_args(&sensitive);
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+
+        // Must never leak content of strings
+        assert!(!serialized.contains("my secret clipboard text"));
+        assert!(!serialized.contains("very-secret-token"));
+        assert!(!serialized.contains("Password123!"));
+        assert!(!serialized.contains("some note"));
+
+        // Must preserve parameter names
+        assert!(sanitized.get("text").is_some());
+        assert!(sanitized.get("token").is_some());
+        assert!(sanitized.get("password").is_some());
+        assert!(sanitized.get("x").is_some());
+        assert!(sanitized.get("y").is_some());
+        assert!(sanitized.get("options").is_some());
+        assert!(sanitized.get("empty").is_some());
+
+        // Check types and lengths
+        assert_eq!(sanitized["text"]["type"], "string");
+        assert_eq!(sanitized["text"]["len"], 24);
+        assert_eq!(sanitized["token"]["type"], "string");
+        assert_eq!(sanitized["token"]["len"], 30);
+        assert_eq!(sanitized["x"]["type"], "number");
+        assert_eq!(sanitized["options"]["type"], "object");
+        assert_eq!(sanitized["options"]["len"], 2);
+        assert_eq!(sanitized["empty"]["type"], "null");
+    }
+
+    static TEST_AUDIT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn test_mcp_audit_logs_call_tool_single_and_replay_flag() {
+        let _lock = TEST_AUDIT_SERIAL.lock().await;
+        let temp_dir =
+            std::env::temp_dir().join(format!("cua-mcp-audit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let log_file = temp_dir.join("audit.jsonl");
+        AUDIT_OVERRIDE_PATH
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(log_file.clone());
+
+        // 1. Normal tool call (deterministic filesystem read, no desktop dependency)
+        let args1 = json!({
+            "root": temp_dir.to_str().unwrap()
+        });
+        let res1 = call_tool_single("list_runs", &args1).await;
+        assert_eq!(res1["isError"], false);
+
+        // 2. replay_run call (will fail due to nonexistent dir, but must log with replay: true)
+        let args2 = json!({
+            "dir": "nonexistent_replay_dir_probe_test_999"
+        });
+        let res2 = call_tool_single("replay_run", &args2).await;
+        assert_eq!(res2["isError"], true);
+
+        // Read audit log
+        let content = std::fs::read_to_string(&log_file).unwrap();
+        let records: Vec<Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        let rec1 = records
+            .iter()
+            .find(|r| r["tool"] == "list_runs")
+            .expect("audit log must contain list_runs entry");
+        assert_eq!(rec1["tool"], "list_runs");
+        assert_eq!(rec1["ok"], true);
+        assert_eq!(rec1["status"], "ok");
+        assert_eq!(rec1["effect"], "read_only");
+        assert_eq!(rec1["replay"], false);
+        assert_eq!(rec1["params"]["root"]["type"], "string");
+        assert!(!serde_json::to_string(rec1)
+            .unwrap()
+            .contains(temp_dir.to_str().unwrap()));
+
+        let rec2 = records
+            .iter()
+            .find(|r| r["tool"] == "replay_run")
+            .expect("audit log must contain replay_run entry");
+        assert_eq!(rec2["tool"], "replay_run");
+        assert_eq!(rec2["ok"], false);
+        assert_eq!(rec2["status"], "failed");
+        assert_eq!(rec2["replay"], true);
+        assert_eq!(rec2["params"]["dir"]["type"], "string");
+
+        AUDIT_OVERRIDE_PATH
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_audit_failure_warns_and_does_not_break_tool_result() {
+        let _lock = TEST_AUDIT_SERIAL.lock().await;
+        // Point audit log to a directory path which cannot be opened as a file
+        let temp_dir =
+            std::env::temp_dir().join(format!("cua-mcp-audit-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        AUDIT_OVERRIDE_PATH
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(temp_dir.clone());
+
+        // Tool call must still succeed and return normal response despite audit log failure
+        let res = call_tool_single("list_runs", &json!({"root": temp_dir.to_str().unwrap()})).await;
+        assert_eq!(res["isError"], false);
+        assert!(res.get("content").is_some());
+
+        AUDIT_OVERRIDE_PATH
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
