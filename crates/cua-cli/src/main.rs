@@ -394,6 +394,7 @@ fn main() -> Result<()> {
                     start_url,
                     run_dir,
                     screenshot_quality: 70,
+                    max_tokens: None,
                     yes,
                     allow_high,
                     // A CLI run has no client to ask, so the gate falls back to the

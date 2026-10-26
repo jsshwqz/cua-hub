@@ -2537,6 +2537,7 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 start_url: args["start_url"].as_str().map(str::to_string),
                 run_dir: None,
                 screenshot_quality: 70,
+                max_tokens: args["max_tokens"].as_u64().map(|n| n as u32),
                 // Same defaults as `run_task`: a caller that lets a model drive a real
                 // browser has to say so, or be able to answer a confirmation.
                 yes: args["yes"].as_bool().unwrap_or(false),
@@ -3790,7 +3791,8 @@ fn tool_defs() -> Value {
                     "yes": { "type": "boolean", "default": false, "description": "Accept medium-risk steps without asking. Never buys a high-risk step" },
                     "allow_high": { "type": "boolean", "default": false, "description": "Permit high-risk steps (arbitrary JavaScript in the page)" },
                     "headed": { "type": "boolean", "default": false, "description": "Show the browser window" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "max_tokens": { "type": "integer", "default": 700, "description": "Output-token cap per planning request. Omit to keep 700, or set CUA_HUB_BROWSER_MAX_TOKENS to change it for every run" }
                 },
                 "required": ["task"]
             }

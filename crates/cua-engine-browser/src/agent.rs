@@ -251,6 +251,27 @@ impl BrowserAction {
     }
 }
 
+/// Output-token cap used for this loop's chat requests when nobody configures one.
+/// One JSON action plus a short reason fits well inside it; raising it buys longer
+/// answers, not better ones.
+pub const DEFAULT_MAX_TOKENS: u32 = 700;
+
+/// Environment override, applied when a run does not pass `max_tokens` itself.
+pub const MAX_TOKENS_ENV: &str = "CUA_HUB_BROWSER_MAX_TOKENS";
+
+/// Pick the output-token cap: an explicit per-run value wins, then the environment,
+/// then the built-in default. Takes the environment value as an argument instead of
+/// reading it here, so the precedence is testable without mutating process state.
+fn resolve_max_tokens(requested: Option<u32>, from_env: Option<u32>) -> u32 {
+    requested.or(from_env).unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
+fn max_tokens_from_env() -> Option<u32> {
+    std::env::var(MAX_TOKENS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+}
+
 /// Options for one browser task. `Clone` but deliberately not `Debug`: the approval
 /// hook is a `dyn Fn`, same as `RunOptions` in the CLI.
 #[derive(Clone)]
@@ -263,6 +284,11 @@ pub struct BrowserRunOptions {
     pub start_url: Option<String>,
     pub run_dir: Option<PathBuf>,
     pub screenshot_quality: u8,
+    /// Output-token cap for this loop's chat-completions requests. `None` falls
+    /// back to `CUA_HUB_BROWSER_MAX_TOKENS`, then to [`DEFAULT_MAX_TOKENS`] (700).
+    /// This only bounds how much the model may answer; it does not touch the model,
+    /// the sampling temperature, or the message structure.
+    pub max_tokens: Option<u32>,
     /// The same three switches the single-action path uses. They live here because
     /// this loop plans and fires its own actions, and a gate that only guards the
     /// other path is a gate with a door in it.
@@ -284,6 +310,7 @@ impl Default for BrowserRunOptions {
             start_url: None,
             run_dir: None,
             screenshot_quality: 70,
+            max_tokens: None,
             // Neither default may be `true`: letting a model drive a real browser has
             // to be said out loud, or answered by a client that can confirm.
             yes: false,
@@ -347,8 +374,12 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
     let total_timeout = opts.timeout.unwrap_or(Duration::from_secs(600));
     let task_start = std::time::Instant::now();
 
-    let config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
-    eprintln!("provider: browser model={}", config.model);
+    let mut config = OpenAiConfig::from_env()?.with_model(opts.model.clone());
+    config.max_tokens = resolve_max_tokens(opts.max_tokens, max_tokens_from_env());
+    eprintln!(
+        "provider: browser model={} max_tokens={}",
+        config.model, config.max_tokens
+    );
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -659,6 +690,24 @@ fn record(file: &mut std::fs::File, index: u32, action: &BrowserAction, note: &s
     Ok(())
 }
 
+/// The chat-completions request for one step of the loop. Pulled out of `ask` so the
+/// shape of the body — in particular the configured `max_tokens` — is checkable
+/// without a network round trip. Every other field is deliberately left as it was.
+fn chat_body(config: &OpenAiConfig, user_text: &str, image_b64: &str) -> Value {
+    json!({
+        "model": config.model,
+        "max_tokens": config.max_tokens,
+        "temperature": 0,
+        "messages": [
+            { "role": "system", "content": system_prompt() },
+            { "role": "user", "content": [
+                { "type": "text", "text": user_text },
+                { "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{image_b64}") } }
+            ]}
+        ]
+    })
+}
+
 async fn ask(
     http: &reqwest::Client,
     config: &OpenAiConfig,
@@ -693,18 +742,7 @@ async fn ask(
         trail
     );
 
-    let body = json!({
-        "model": config.model,
-        "max_tokens": 700,
-        "temperature": 0,
-        "messages": [
-            { "role": "system", "content": system_prompt() },
-            { "role": "user", "content": [
-                { "type": "text", "text": user_text },
-                { "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{b64}") } }
-            ]}
-        ]
-    });
+    let body = chat_body(config, &user_text, &b64);
 
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let mut last_err = String::new();
@@ -908,6 +946,61 @@ fn default_run_dir() -> PathBuf {
 mod tests {
     use super::*;
     use cua_core::Risk;
+
+    fn probe_config(cap: u32) -> OpenAiConfig {
+        OpenAiConfig {
+            api_key: "unit-test".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: "unit-test-model".into(),
+            max_tokens: cap,
+        }
+    }
+
+    #[test]
+    fn the_untouched_default_is_still_700_output_tokens() {
+        assert_eq!(DEFAULT_MAX_TOKENS, 700);
+        assert_eq!(BrowserRunOptions::default().max_tokens, None);
+        assert_eq!(resolve_max_tokens(None, None), 700);
+        let body = chat_body(
+            &probe_config(resolve_max_tokens(None, None)),
+            "TASK",
+            "AA==",
+        );
+        assert_eq!(body["max_tokens"], 700);
+    }
+
+    #[test]
+    fn a_configured_cap_reaches_the_request_body() {
+        let body = chat_body(
+            &probe_config(resolve_max_tokens(Some(4096), None)),
+            "TASK",
+            "AA==",
+        );
+        assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn per_run_value_beats_environment_and_both_beat_the_default() {
+        assert_eq!(resolve_max_tokens(Some(900), Some(500)), 900);
+        assert_eq!(resolve_max_tokens(None, Some(500)), 500);
+        assert_eq!(resolve_max_tokens(None, None), DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn raising_the_cap_moves_no_other_request_field() {
+        // The cap is the only thing this change is allowed to touch in the body, so
+        // say it in a test: same request with two different caps must differ in one
+        // key and nothing else.
+        let low = chat_body(&probe_config(700), "TASK", "AA==");
+        let high = chat_body(&probe_config(4000), "TASK", "AA==");
+        let strip = |mut v: Value| {
+            v.as_object_mut().map(|o| o.remove("max_tokens"));
+            v
+        };
+        assert_eq!(low["max_tokens"], 700);
+        assert_eq!(high["max_tokens"], 4000);
+        assert_eq!(strip(low), strip(high), "only max_tokens may differ");
+    }
 
     #[test]
     fn arbitrary_script_is_never_anything_but_high() {
