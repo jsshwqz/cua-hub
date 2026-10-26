@@ -2997,7 +2997,11 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 Ok(window) => window,
                 Err(e) => return e,
             };
-            let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(3_000);
+            let requested_timeout_ms = args["timeout_ms"].as_u64().unwrap_or(3_000);
+            const MAX_WAIT_FOR_CHANGE_TIMEOUT_MS: u64 = 60_000;
+            let clamped = requested_timeout_ms > MAX_WAIT_FOR_CHANGE_TIMEOUT_MS;
+            let timeout_ms = requested_timeout_ms.min(MAX_WAIT_FOR_CHANGE_TIMEOUT_MS);
+
             let baseline = match args["observation_id"].as_str().and_then(observations::get) {
                 Some(obs) => obs.hash,
                 None => None,
@@ -3016,22 +3020,32 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                     Err(e) => return e,
                 };
                 if current != baseline {
-                    return tool_ok(json!({
+                    let mut payload = json!({
                         "ok": true,
                         "changed": true,
                         "elapsed_ms": started.elapsed().as_millis() as u64,
                         "hash": current,
-                    }));
+                    });
+                    if clamped {
+                        payload["clamped"] = json!(true);
+                        payload["requested_timeout_ms"] = json!(requested_timeout_ms);
+                    }
+                    return tool_ok(payload);
                 }
-                if started.elapsed().as_millis() as u64 > timeout_ms {
-                    return tool_ok(json!({
+                if started.elapsed().as_millis() as u64 >= timeout_ms {
+                    let mut payload = json!({
                         "ok": true,
                         "changed": false,
                         "elapsed_ms": started.elapsed().as_millis() as u64,
                         "hash": current,
-                    }));
+                    });
+                    if clamped {
+                        payload["clamped"] = json!(true);
+                        payload["requested_timeout_ms"] = json!(requested_timeout_ms);
+                    }
+                    return tool_ok(payload);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
         "focus_window" => {
@@ -5334,5 +5348,53 @@ mod tests {
             "say which field was refused: {}",
             error_text(&err)
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_change_clamps_timeout_above_60000ms() {
+        let windows = cua_io::list_windows(None, true).unwrap_or_default();
+        if let Some(win) = windows.first() {
+            let resp = call_tool(
+                "wait_for_change",
+                &json!({
+                    "window": win.id,
+                    "hash": 999_999_999_u64,
+                    "timeout_ms": 120_000,
+                }),
+            )
+            .await;
+            assert_eq!(resp["isError"], false);
+            let text = resp["content"][0]["text"].as_str().unwrap();
+            let parsed: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(parsed["ok"], true);
+            assert_eq!(parsed["changed"], true);
+            assert_eq!(parsed["clamped"], true);
+            assert_eq!(parsed["requested_timeout_ms"], 120_000);
+            assert!(parsed["elapsed_ms"].is_number());
+            assert!(parsed["hash"].is_number());
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_change_normal_timeout_does_not_clamp() {
+        let windows = cua_io::list_windows(None, true).unwrap_or_default();
+        if let Some(win) = windows.first() {
+            let resp = call_tool(
+                "wait_for_change",
+                &json!({
+                    "window": win.id,
+                    "hash": 999_999_999_u64,
+                    "timeout_ms": 5_000,
+                }),
+            )
+            .await;
+            assert_eq!(resp["isError"], false);
+            let text = resp["content"][0]["text"].as_str().unwrap();
+            let parsed: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(parsed["ok"], true);
+            assert_eq!(parsed["changed"], true);
+            assert!(parsed.get("clamped").is_none());
+            assert!(parsed.get("requested_timeout_ms").is_none());
+        }
     }
 }
