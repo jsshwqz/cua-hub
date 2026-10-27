@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
-use cua_core::{Action, EngineKind, Point};
+use cua_core::{Action, Effect, EngineKind, Point};
 use serde_json::{json, Value};
 
 use crate::elements;
@@ -414,6 +414,54 @@ fn effect_note(report: &cua_engine_access::ActionReport, text_write: bool) -> St
         report.effect.as_str(),
         readback.join(" ")
     )
+}
+
+/// What a focused control reported about its own text, or nothing at all when
+/// the platform or the control would not say.
+fn read_focused_value() -> Option<String> {
+    cua_engine_access::focused_element()
+        .ok()
+        .flatten()
+        .map(|node| node.value)
+        .filter(|value| !value.is_empty())
+}
+
+/// Judge a keystroke burst by what the control holds afterwards, not by how many
+/// characters the sender believes it transmitted.
+///
+/// `unchanged` is the case this exists for: the send succeeded, the report said
+/// so, and the field still holds what it held before. Comparing the two reads
+/// rather than looking for the typed text keeps masked fields, completion lists
+/// and caret-in-the-middle edits from being called `changed` just because
+/// something moved.
+fn typed_effect(before: Option<&str>, after: Option<&str>) -> Effect {
+    match (before, after) {
+        (Some(previous), Some(current)) if previous == current => Effect::Unchanged,
+        (Some(_), Some(_)) => Effect::Changed,
+        _ => Effect::Unverifiable,
+    }
+}
+
+fn type_note(chars: usize, effect: Effect, after: Option<&str>) -> String {
+    let detail = match (effect, after) {
+        (Effect::Changed, Some(value)) => {
+            let chars: Vec<char> = value.chars().collect();
+            let shown: String = if chars.len() > 24 {
+                chars[chars.len() - 24..].iter().collect()
+            } else {
+                chars.iter().collect()
+            };
+            if shown.chars().count() < chars.len() {
+                format!("field now reads …{shown}")
+            } else {
+                format!("field now reads {shown}")
+            }
+        }
+        (Effect::Changed, None) => "the field's text differs from before".to_string(),
+        (Effect::Unchanged, _) => "the focused field still reads exactly as before".to_string(),
+        (Effect::Unverifiable, _) => "no readable text at the keyboard focus".to_string(),
+    };
+    format!("typed {chars} chars; effect={} ({detail})", effect.as_str())
 }
 
 /// Where a window-relative offset actually lands, or why it is refused.
@@ -3728,8 +3776,17 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 text: text.clone(),
                 interval_ms: args["interval_ms"].as_u64().unwrap_or(6),
             };
+            let before = read_focused_value();
             match cua_io::apply(&action, 1.0) {
-                Ok(()) => tool_ok(format!("typed {} chars", text.chars().count())),
+                Ok(()) => {
+                    // The control needs a moment to reflect the keystrokes it was
+                    // sent; reading too early reports `unchanged` for a field that
+                    // filled correctly one frame later.
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    let after = read_focused_value();
+                    let effect = typed_effect(before.as_deref(), after.as_deref());
+                    tool_ok(type_note(text.chars().count(), effect, after.as_deref()))
+                }
                 Err(e) => tool_err(e),
             }
         }
@@ -4936,6 +4993,61 @@ mod tests {
             "otherwise the observed window is the one to re-read"
         );
         assert_eq!(chain_window(vec![json!({})]), None);
+    }
+
+    #[test]
+    fn typed_effect_judges_the_field_not_the_send() {
+        assert_eq!(
+            typed_effect(Some("abc"), Some("abc")),
+            Effect::Unchanged,
+            "the report would have said 3 chars typed; the field says otherwise"
+        );
+        assert_eq!(typed_effect(Some("abc"), Some("abcd")), Effect::Changed);
+        // An empty field before and a non-empty one after is still a change.
+        assert_eq!(typed_effect(Some(""), Some("x")), Effect::Changed);
+        assert_eq!(
+            typed_effect(None, Some("x")),
+            Effect::Unverifiable,
+            "no prior read means no basis to claim either way"
+        );
+        assert_eq!(typed_effect(Some("x"), None), Effect::Unverifiable);
+        assert_eq!(typed_effect(None, None), Effect::Unverifiable);
+    }
+
+    #[test]
+    fn type_note_shows_the_effect_word_the_audit_parses() {
+        let long = "0123456789".repeat(6); // 60 chars, only the last 24 may be echoed.
+        let changed = type_note(12, Effect::Changed, Some(&long));
+        assert!(changed.contains("typed 12 chars"), "{changed}");
+        assert!(changed.contains("effect=changed"), "{changed}");
+        assert!(
+            changed.contains('…'),
+            "long values must be clipped: {changed}"
+        );
+        assert!(
+            !changed.contains("0123456789012345678901"),
+            "the head of a long value must not be echoed: {changed}"
+        );
+        assert!(
+            changed.contains(&long[long.len() - 24..]),
+            "the tail is the part worth reading: {changed}"
+        );
+
+        let short = type_note(3, Effect::Changed, Some("abc"));
+        assert_eq!(
+            short, "typed 3 chars; effect=changed (field now reads abc)",
+            "a value that fits must be shown whole, without an ellipsis"
+        );
+
+        let missed = type_note(334, Effect::Unchanged, None);
+        assert!(missed.contains("effect=unchanged"), "{missed}");
+        assert!(
+            missed.contains("still reads exactly as before"),
+            "{missed} must not read like a success"
+        );
+
+        let blind = type_note(5, Effect::Unverifiable, None);
+        assert!(blind.contains("effect=unverifiable"), "{blind}");
     }
 
     #[test]

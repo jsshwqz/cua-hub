@@ -6,6 +6,28 @@
 
 ## Unreleased — 已合入分支，尚未发版
 
+### `type_text` 的答复改成回读裁决（不再只报发送字符数）
+
+以前 `type_text` 成功时只回 `typed 334 chars`。这个数字描述的是**发出去多少键**，
+不是**字段里进了多少字**，而这两件事在网页富文本编辑器上会分叉：实测一次 334 字的
+输入，页面自己的计数器只动了 11，工具却报全数成功。调用方据此继续往下做，
+直到最后核对才发现整段没进去。
+
+现在输入前后各读一次焦点元素的文本（`focused_element().value`），比对后给出
+`typed N chars; effect=changed|unchanged|unverifiable`：
+
+- `changed` — 字段内容确实变了，并附末 24 个字符供确认（长值只回显尾部，不整段倒灌）
+- `unchanged` — 字段与输入前逐字相同，**这条就是过去的"静默失败"**
+- `unverifiable` — 焦点控件不暴露可读文本（网页 iframe、密码框），或该平台读不到焦点
+
+判据是"前后两次读数是否相同"，不是"字段里有没有出现我打的字"：后者会被自动补全、
+输入法合成、光标落在文本中部三种情况误判成成功。读不到时明确说读不到，
+不拿发送计数冒充效果——这与 `browser_task` 的 CDP 路径早先采用的
+`[verified: value reads as sent]` 是同一标准，桌面原语这次补齐。
+
+审计侧无需改动：`determine_audit_effect` 已按 `effect=` 字样解析，
+`mcp_audit.jsonl` 从此对 `type_text` 记录真实档位而非一律 `unverifiable`。
+
 ### 审计与路由：MCP 原子工具统一审计落盘与 Access 引擎窄提示路由（issue #14）
 
 - **MCP 原子工具统一审计落盘**：`call_tool_single` 为每一次原子工具调用追加记录一条 JSONL
