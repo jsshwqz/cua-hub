@@ -1,0 +1,20 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build Release
+      run: cargo build --release
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cua-forge-windows
+        path: target/release/cua-forge-core.exe
