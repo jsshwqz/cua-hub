@@ -301,6 +301,8 @@ async fn execute_step(
                 run_dir: Some(step_dir.to_path_buf()),
                 screenshot_quality: 70,
                 max_tokens: None,
+                indicate_mouse: None,
+                pointer: Some(crate::pointer::pointer_mover()),
                 // A planned browser step is not a lower-risk step: the plan came from
                 // a model, which is exactly why these have to be threaded through.
                 yes: opts.yes,

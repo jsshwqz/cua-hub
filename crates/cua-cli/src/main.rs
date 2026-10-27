@@ -6,6 +6,7 @@ mod jobs;
 mod mcp;
 mod observations;
 mod orchestrator;
+mod pointer;
 mod replay;
 mod runner;
 
@@ -395,6 +396,8 @@ fn main() -> Result<()> {
                     run_dir,
                     screenshot_quality: 70,
                     max_tokens: None,
+                    indicate_mouse: None,
+                    pointer: Some(crate::pointer::pointer_mover()),
                     yes,
                     allow_high,
                     // A CLI run has no client to ask, so the gate falls back to the

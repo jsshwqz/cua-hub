@@ -120,7 +120,7 @@ export OPENROUTER_API_KEY=sk-or-...
 |------|------|
 | `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径 |
 | `start_task` / `task_status` / `task_cancel` | 后台任务：立即返回 job_id，可查进度、可取消 |
-| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false`。click/type 的答复是**回读裁决**：`clicked <sel> [effect=changed] (checked Some(false)->Some(true))`、`typed N chars into <sel> [verified: value reads as sent]`；富文本走 `Input.insertText`（光标落末尾、不覆盖已有内容）并按三条标准回读；读不一致报 `FAILED:`，**这条路径不再出现 `OK`**。另有 `max_tokens`（整数，默认 700）限制每步规划请求的输出 token 上限，不传就用环境变量 `CUA_HUB_BROWSER_MAX_TOKENS`，都没有就是 700 |
+| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false`。click/type 的答复是**回读裁决**：`clicked <sel> [effect=changed] (checked Some(false)->Some(true))`、`typed N chars into <sel> [verified: value reads as sent]`；富文本走 `Input.insertText`（光标落末尾、不覆盖已有内容）并按三条标准回读；读不一致报 `FAILED:`，**这条路径不再出现 `OK`**。另有 `max_tokens`（整数，默认 700）限制每步规划请求的输出 token 上限，不传就用环境变量 `CUA_HUB_BROWSER_MAX_TOKENS`，都没有就是 700。`indicate_mouse`（布尔，默认 true）在每次点击/输入前把真实光标移到目标上停约 300ms 给旁观者看，只动光标不按键，`dry_run` 与 headless 自动跳过，失败只记日志不影响动作 |
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |
 | `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
 | `capture_screen` | 返回主屏 JPEG + 尺寸 |
@@ -224,6 +224,7 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 | `CUA_HUB_OPENAI_BASE_URL` | 默认取 `OPENROUTER_BASE_URL`，否则 `https://api.openai.com/v1` |
 | `CUA_HUB_MODEL` | Anthropic 默认 `claude-sonnet-4-5`；OpenAI 默认取 `OPENROUTER_MODEL` 或 `gpt-4o-mini` |
 | `CUA_HUB_BROWSER_MAX_TOKENS` | 浏览器 agent 每步规划请求的**输出 token 上限**；不设则用内置默认 **700**。单次调用还可用 `browser_task` 的 `max_tokens` 参数覆盖它（参数 > 环境变量 > 700）。只限制模型能答多长，不改模型、温度与消息结构 |
+| `CUA_HUB_BROWSER_INDICATE_MOUSE` | 浏览器 agent 的**鼠标指示**：点击/输入前先把真实光标移到目标上停约 300ms，让旁观的人看得见要动哪里。默认 **开**（`1`/`0`/`true`/`false`/`on`/`off`）；单次调用可用 `browser_task` 的 `indicate_mouse` 参数覆盖（参数 > 环境变量 > 默认开）。只移动光标，不按键、不抢焦点、不参与回读裁决；`dry_run` 与无窗口的 headless 浏览器自动跳过，指示失败也只记日志、绝不阻塞动作 |
 | `CUA_HUB_YES` | 设为 1 跳过**中危**确认（CLI 入口）；高危动作始终还要 `--allow-high` |
 | `CUA_HUB_MCP_TOKEN` | HTTP 模式的 Bearer token；设置后强制鉴权 |
 | `CUA_HUB_ALLOW_REMOTE` | 允许无 token 绑定非回环地址（仅限已有前置鉴权） |

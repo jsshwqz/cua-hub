@@ -15,5 +15,6 @@ pub use agent::{
     parse_browser_action, run_task, BrowserAction, BrowserOutcome, BrowserReport, BrowserRunOptions,
 };
 pub use cdp::{
-    launch, BrowserSession, LaunchOptions, OccluderInfo, ScrollVisibilityResult, TabInfo,
+    launch, BrowserSession, LaunchOptions, OccluderInfo, PointerMover, ScrollVisibilityResult,
+    TabInfo,
 };

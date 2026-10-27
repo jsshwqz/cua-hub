@@ -166,6 +166,8 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             run_dir: opts.run_dir.clone(),
             screenshot_quality: 70,
             max_tokens: None,
+            indicate_mouse: None,
+            pointer: Some(crate::pointer::pointer_mover()),
             yes: opts.yes,
             allow_high: opts.allow_high,
             approver: opts.approver.clone(),

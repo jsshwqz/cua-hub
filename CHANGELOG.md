@@ -18,7 +18,24 @@
   同步修正 README 引擎状态口径。
 - **Fail 变更状态分类核验**：确认 `Action::Fail.is_mutating() == false` 语义与回归测试 `a_failed_run_did_not_modify_the_machine` 持续在列且通过。
 
-## 0.1.6 — 2026-10-26
+## 未发布
+
+### 浏览器 agent：输出上限可配（PR #41）
+
+`max_tokens` 原先写死 700。现在按 **单次参数 > `CUA_HUB_BROWSER_MAX_TOKENS` > 700** 取值，
+不配置时行为与之前完全一致。只限制作答长度，模型、温度与消息结构未动。
+
+### 浏览器 agent：鼠标指示（本 PR）
+
+点击和输入前，先把真实光标移到目标元素上停约 300ms，让守在屏幕前的人看得见工具要动哪里——
+此前浏览器路径走 JS 点击与 CDP 合成事件，从头到尾不碰系统光标。
+
+- 开关：`browser_task` 的 `indicate_mouse` 参数 > `CUA_HUB_BROWSER_INDICATE_MOUSE` > **默认开**
+- 只移动光标：不按键、不抢焦点、不写进 steps、不参与回读裁决与风险判定
+- `dry_run`（没有动作可指）与 headless（屏幕上没有窗口可指）自动跳过；连不上窗口几何或
+  换算不出屏幕坐标时也只记一条日志，动作照常执行
+- 单位边界：页面只会说 DIP，引擎也输出 DIP，乘回物理像素由提供光标移动能力的一侧负责
+
 
 桌面与浏览器动作都改成"回读到什么就报什么"的一版：click/type 给 changed/unchanged/unverifiable，
 type 对不上直接 FAILED；身份寻址按 target 现解析，歧义报错、绝不取第一个；滚动内化进动作，

@@ -2697,6 +2697,8 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 run_dir: None,
                 screenshot_quality: 70,
                 max_tokens: args["max_tokens"].as_u64().map(|n| n as u32),
+                indicate_mouse: args["indicate_mouse"].as_bool(),
+                pointer: Some(crate::pointer::pointer_mover()),
                 // Same defaults as `run_task`: a caller that lets a model drive a real
                 // browser has to say so, or be able to answer a confirmation.
                 yes: args["yes"].as_bool().unwrap_or(false),
@@ -3951,7 +3953,8 @@ fn tool_defs() -> Value {
                     "allow_high": { "type": "boolean", "default": false, "description": "Permit high-risk steps (arbitrary JavaScript in the page)" },
                     "headed": { "type": "boolean", "default": false, "description": "Show the browser window" },
                     "model": { "type": "string" },
-                    "max_tokens": { "type": "integer", "default": 700, "description": "Output-token cap per planning request. Omit to keep 700, or set CUA_HUB_BROWSER_MAX_TOKENS to change it for every run" }
+                    "max_tokens": { "type": "integer", "default": 700, "description": "Output-token cap per planning request. Omit to keep 700, or set CUA_HUB_BROWSER_MAX_TOKENS to change it for every run" },
+                    "indicate_mouse": { "type": "boolean", "default": true, "description": "Park the real cursor on each click/type target for ~300ms first, so a human watching can follow. Never presses anything; skipped for dry_run and headless. Omit to keep the default on, or set CUA_HUB_BROWSER_INDICATE_MOUSE=0" }
                 },
                 "required": ["task"]
             }
