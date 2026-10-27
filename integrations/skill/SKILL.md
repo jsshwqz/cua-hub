@@ -42,7 +42,12 @@ Raw input
 - `click {x, y, right?, middle?, double?}` — absolute physical pixels, last resort.
 - `move {x, y}`, `drag {x, y, x2, y2}`.
 - `scroll {x, y, dx?, dy?}` — **[RESTRICTED / exploration-only]** 仅限无界动态流或未寻址纯画布探索。点击与输入动作内部已完全内化 `scrollIntoView` 与可见性避障验证；在做题、填表、点击按钮时，严禁调用 scroll 作为前置动作，直接向目标发送 click 或 type_text 即可。
-- `type_text {text, interval_ms?}` — Unicode text into the focused window.
+- `type_text {text, interval_ms?}` — Unicode text into the focused window. The answer
+  is a read-back verdict, not a send count: `typed N chars; effect=changed|unchanged|unverifiable`.
+  Trust `effect=`, never the count — a burst of 334 characters that left the field
+  byte-identical reports `effect=unchanged`, and that is the case this exists to catch.
+  `unverifiable` means the focused control exposed no text (a web iframe editor, a
+  masked field), which is a statement about the target, not a success.
 - `key {combo}` — `Return`, `ctrl+l`, `alt+Tab`, `PageDown`, arrows, F1–F12…
 - `mouse_down/up {button?}`, `key_down/up {combo}` — hold/release pairs.
 - `clipboard_get`, `clipboard_set {text}`.

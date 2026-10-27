@@ -140,7 +140,7 @@ export OPENROUTER_API_KEY=sk-or-...
 | `control_state` | 读取启用/可见、勾选、展开状态、范围值。两平台都实现：Windows 走 UIA 的 Toggle/ExpandCollapse/Value/RangeValue 模式，Linux 走 AT-SPI 的 `GetState` 位图（`toggle` = `on`/`off`/`indeterminate`，`expanded` = `expanded`/`collapsed`/`partially_expanded`/`leaf`，口径一致）。Linux 侧 `value` 与 `range_value` 暂不填——那两个在 Text / Value 接口后面，还没接 |
 | `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽；`click` 支持 `observation_id`+`element_index`，或 `observation_id`+`screenshot_id`+`x/y`（弹层图片的坐标系与主窗口不同，必须指名） |
 | `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
-| `type_text` | 向焦点窗口输入任意 Unicode 文本（自动处理 Shift 大写/括号） |
+| `type_text` | 向焦点窗口输入任意 Unicode 文本（自动处理 Shift 大写/括号）。答复是**回读裁决**而非发送计数：`typed N chars; effect=changed (field now reads …<末24字>)` / `effect=unchanged (the focused field still reads exactly as before)` / `effect=unverifiable (no readable text at the keyboard focus)`。字符数只说明发了多少，落没落地看 `effect=`；读不到焦点文本时老实说读不到，不拿发送数冒充成功 |
 | `key` | 发送按键组合（PageUp/PageDown/方向键/系统快捷键等） |
 | `mouse_down` / `mouse_up` | 按住/释放鼠标键（Shift 多选、Ctrl 拖拽） |
 | `key_down` / `key_up` | 按住/释放按键或组合键 |
