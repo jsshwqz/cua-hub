@@ -84,7 +84,8 @@ Tasks and browser
    `wait_for_change` when you only need to know whether anything moved.
    `changed: false` means the click/typing did not land; try another route
    instead of repeating it. `perform_secondary_action` returns the control's
-   state read back — compare it with what you expected.
+   state read back — compare it with what you expected. Inside web content the
+   readback itself can lie; see **Web content and iframes**.
 5. **Never replay a failed batch**: if an action or the refresh errors, the
    outcome is unknown — earlier actions may have taken effect. Re-observe and
    choose again. A `stale_observation` error is not a reason to retry the same
@@ -138,6 +139,57 @@ step that omits them, so one observation drives the whole batch. `settle_ms`
   payload, 207 ms faster. The time saving stays modest because one observation
   before acting and one after are paid for in both; the win is round trips and
   tokens, and it grows with chain length.
+
+## Web content and iframes
+
+A page is one window but not one input target: the document and each
+`contenteditable` iframe inside it are different focus destinations, and the
+report strings from the primitives describe the **send**, never the **land**.
+Four traps measured in one session on a homework page with five rich-text
+editors (Windows, Chrome, page zoom changed mid-task):
+
+1. **`typed N chars` is not proof the page changed.** A 334-character
+   `type_text` reported `typed 334 chars` while the editor's own counter moved by
+   11, because focus had drifted from the iframe to the outer document. Trust the
+   page's own readback — a visible `已输入N个字`, a control's `value=`,
+   `selected_text` — and expect it to lag: compare two reads and act on the delta,
+   never one read to judge the call that just ran.
+2. **An unchanged `capture_window` hash does not mean nothing happened.** For an
+   occluded window the surface capture can hand back a frame that predates the
+   action; three consecutive captures returned an identical hash while
+   `document_text` had already moved. A hash answers "did my picture change", not
+   "did the page change".
+3. **Reading state can steal the focus you are working in.** `window_state` with
+   `include_text` re-reads the tree and can leave `focused_element` on the outer
+   `RootWebArea` rather than the editor, so the next separate `key` call is
+   delivered to the page and silently does nothing. `focused_element` naming the
+   `RootWebArea` is the tell: keyboard routing is then unproven. Do not interleave
+   a state read between a click and its typing, and prefer
+   `window_input {window, x, y, text}`, which focuses, clicks and types in one
+   operation.
+4. **Coordinates go stale when the user moves or rescales the window, and the
+   tool will not always say so.** A resize (observed 919 → 839 px wide, zoom
+   50% → 67%) invalidates every pixel held. Mapping a bare `x/y` through an
+   `observation_id` fails loudly with `stale_observation`; a window-relative
+   `window_input` does not — it clicks whatever now occupies that point. Re-observe
+   after any sign the window moved, and treat a click that changes no readback as a
+   miss rather than a no-op.
+
+Two consequences worth stating plainly:
+
+- **Adding is reliable; deleting is not.** Insertion worked whenever focus was
+  proven. `ctrl+a` followed by `Delete` cleared one editor and silently did nothing
+  to the next, with both calls reporting success. For destructive edits inside a
+  page, confirm the counter dropped before issuing the next step; if it will not
+  cooperate, hand that single keystroke to the human instead of guessing at an
+  insertion point you cannot see.
+- **Do not chain a coordinate click with `key` steps.** The external-input guard
+  reads the cursor movement caused by the click itself as a person taking over and
+  pauses the chain mid-batch. The guard is correct; change the usage, not the guard.
+
+`document_text` covers the page, not the contents of its editor iframes: a
+`find_control` walk that stops with `tree still truncated` was cut off, not empty —
+raise `max_nodes` before concluding a control is absent.
 
 ## Industrial software
 
