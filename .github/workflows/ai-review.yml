@@ -1,0 +1,63 @@
+name: "AI Code Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: >
+      github.event_name == 'pull_request' || 
+      (github.event.issue.pull_request != null && github.event.comment.user.type != 'Bot')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install requests
+      - env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 - << 'EOF'
+          import os, json, requests
+          
+          github_token = os.environ.get("GITHUB_TOKEN")
+          gemini_key = os.environ.get("GEMINI_API_KEY")
+          headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github.v3+json"}
+          
+          with open(os.environ.get("GITHUB_EVENT_PATH"), "r", encoding="utf-8") as f:
+              event_data = json.load(f)
+          
+          event_name = os.environ.get("GITHUB_EVENT_NAME")
+          if event_name == "pull_request":
+              pr_number = event_data["pull_request"]["number"]
+              diff_url = event_data["pull_request"]["diff_url"]
+          else:
+              pr_number = event_data["issue"]["number"]
+              diff_url = requests.get(event_data["issue"]["pull_request"]["url"], headers=headers).json().get("diff_url")
+              
+          diff_text = requests.get(diff_url, headers=headers).text[:10000]
+          
+          prompt = f"你是一位务实的代码审查专家。请指出以下代码变动中的实质性风险和缺陷，使用简体中文回复。\n\n代码变动:\n```diff\n{diff_text}\n```"
+          
+          res = requests.post(
+              f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+              json={"contents": [{"parts": [{"text": prompt}]}]}
+          )
+          
+          ai_reply = res.json()["candidates"][0]["content"]["parts"][0]["text"] if res.status_code == 200 else "审查调用失败。"
+          
+          requests.post(
+              f"https://api.github.com/repos/{os.environ.get('GITHUB_REPOSITORY')}/issues/{pr_number}/comments",
+              headers=headers,
+              json={"body": f"### 🤖 自动审查反馈\n\n{ai_reply}"}
+          )
+          EOF
