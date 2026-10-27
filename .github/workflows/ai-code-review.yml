@@ -1,0 +1,107 @@
+name: "Aion-Code PR Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: >
+      github.event_name == 'pull_request' || 
+      (github.event.issue.pull_request != null && !github.event.comment.user.site_admin && github.event.comment.user.type != 'Bot')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip requests
+
+      - name: Execute Aion-Code Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          python3 - << 'PY_SCRIPT'
+          import os, json, requests
+
+          github_token = os.environ.get("GITHUB_TOKEN")
+          gemini_key = os.environ.get("GEMINI_API_KEY")
+          event_name = os.environ.get("EVENT_NAME")
+          repo = os.environ.get("REPO_NAME")
+          headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github.v3+json"}
+
+          # 1. 自动提取项目上下文（扫描本地核心文件）
+          context_files = ["README.md", "package.json", "Cargo.toml", "requirements.txt", "docker-compose.yml", "pom.xml"]
+          context_text = ""
+          for file_name in context_files:
+              if os.path.exists(file_name):
+                  with open(file_name, "r", encoding="utf-8") as f:
+                      context_text += f"\n--- {file_name} ---\n{f.read()[:5000]}\n"
+
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          with open(event_path, "r", encoding="utf-8") as f: 
+              event_data = json.load(f)
+
+          target_pr_number = None
+          diff_text = ""
+          prompt_header = ""
+
+          # 2. 判断触发事件并获取 Diff
+          if event_name == "pull_request":
+              target_pr_number = event_data["pull_request"]["number"]
+              diff_url = event_data["pull_request"]["diff_url"]
+              diff_text = requests.get(diff_url, headers=headers).text[:12000]
+              prompt_header = "请针对以下 Pull Request 代码变动进行审查。\n"
+          elif event_name == "issue_comment":
+              target_pr_number = event_data["issue"]["number"]
+              comment_body = event_data["comment"]["body"]
+              diff_url = requests.get(event_data["issue"]["pull_request"]["url"], headers=headers).json().get("diff_url")
+              diff_text = requests.get(diff_url, headers=headers).text[:8000]
+              prompt_header = f"开发者针对该 PR 提出了以下评论：\n{comment_body}\n请结合相关代码变动给出答复。\n"
+
+          # 3. 严格注入 aion-code 核心审查原则
+          system_prompt = (
+              "你是一位资深的软件代码审查员 (aion-code)。你的核心任务是基于项目自带的文档和实际场景，提供务实、精准、无幻觉的代码审查报告。\n"
+              "核心审查原则：\n"
+              "1. 判断适用性：结合提取的业务需求和技术栈，判断问题是否适用，拒绝过度设计和无效建议。\n"
+              "2. 精确定位风险：必须明确指出对应的具体代码文件或配置，严禁泛泛而谈。\n"
+              "3. 零幻觉承诺：对于文档未体现的逻辑，必须如实回答“代码/文档未体现，无法确认”。\n"
+              "4. 严重程度排序：按风险等级倒序排列，优先指出可能导致数据泄露、服务中断等致命缺陷。\n"
+              "5. 只动口不动手：仅提供审查报告和修复思路，首轮不直接重构大段代码。\n"
+              "6. 必须使用简体中文回复。"
+          )
+
+          user_content = f"【项目上下文】\n{context_text if context_text else '无本地配置文件'}\n\n【审查要求】\n{prompt_header}\n\n【代码变动 (Diff)】\n```diff\n{diff_text}\n```"
+
+          payload = {
+              "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_content}"}]}],
+              "generationConfig": {"temperature": 0.2}
+          }
+          api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+          api_res = requests.post(api_url, json=payload)
+          
+          if api_res.status_code == 200:
+              ai_reply = api_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+          else:
+              ai_reply = f"接口异常: {api_res.status_code} - {api_res.text}"
+          
+          comment_body = f"### 🤖 aion-code 专家审查反馈\n\n{ai_reply}"
+          requests.post(f"https://api.github.com/repos/{repo}/issues/{target_pr_number}/comments", headers=headers, json={"body": comment_body})
+          PY_SCRIPT
