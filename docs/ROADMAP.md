@@ -31,6 +31,13 @@
 - [ ] UI-TARS via Ollama as a local vision backend
 - [ ] Router scoring: route by app, task shape, and engine health
 - [ ] Engine fallback on repeated failure
+- [x] Visual element parsing contract (#18 P1-1 batch B1): `cua-engine-perception`
+  — element table (id / kind / 0–1 normalized bbox / interactivity / content /
+  source), model view carrying no coordinates by construction, set-of-mark
+  rendering (boxes + numbered tags, built-in 3x5 digit font). Producers land
+  in later batches (B2 geometric merge, B3 OCR anchoring, B4 two-backend merge)
+- [ ] Element parsing producers: geometric merge rules (B2), OCR anchor (B3),
+  accessibility+vision two-backend merge (B4)
 
 ## Phase 3 — Browser and orchestration
 
