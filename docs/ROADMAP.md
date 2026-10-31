@@ -36,8 +36,11 @@
   source), model view carrying no coordinates by construction, set-of-mark
   rendering (boxes + numbered tags, built-in 3x5 digit font). Producers land
   in later batches (B2 geometric merge, B3 OCR anchoring, B4 two-backend merge)
-- [ ] Element parsing producers: geometric merge rules (B2), OCR anchor (B3),
-  accessibility+vision two-backend merge (B4)
+- [x] Geometric merge rules (B2): faithful port of OmniParser's
+  `remove_overlap_new` — containment-aware IoU keeps the smaller box, OCR text
+  inside an icon becomes its content, an icon inside an OCR box is dropped as
+  a false positive; two pinned deviations fix the original's double-absorb
+- [ ] OCR anchor (B3), accessibility+vision two-backend merge (B4)
 
 ## Phase 3 — Browser and orchestration
 
