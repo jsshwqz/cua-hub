@@ -17,7 +17,7 @@
     { "name": "arboard", "version": "3.7.0", "affects": "剪贴板" },
     { "name": "axum", "version": "0.8.9", "affects": "MCP HTTP / 控制台" },
     { "name": "reqwest", "version": "0.13.5", "affects": "模型与 CDP HTTP" },
-    { "name": "tokio", "version": "1.54.0", "affects": "异步运行时" },
+    { "name": "tokio", "version": "1.54.1", "affects": "异步运行时" },
     { "name": "image", "version": "0.25.10", "affects": "截图编码" },
     { "name": "tokio-tungstenite", "version": "0.30.0", "affects": "CDP WebSocket" }
   ]

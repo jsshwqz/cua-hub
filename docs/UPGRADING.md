@@ -53,6 +53,12 @@ cua-hub 的竞争力来自"集成"，所以必须把上游变化变成可发现�
   调用。升级需要把整个 AT-SPI 适配层改成 async（或在独立线程里跑 async runtime），
   属于结构改动而不是版本号改动。已在 `dependabot.yml` 里忽略 zbus 主版本，等 AT-SPI
   异步化完成后再放开；期间巡检 issue 仍会提示有新版本。
+- **tokio 1.54.0 → 1.54.1（已采纳，2026-10-31）**：单条 timer revert 修复
+  （[tokio#8692](https://github.com/tokio-rs/tokio/pull/8692)）。workspace 声明是宽松的
+  `version = "1"`，升级只动 `Cargo.lock`（+10/-10，与 dependabot PR #46 的 diff 逐字节一致），
+  无业务代码变更。fmt / clippy / test 门禁全绿。吸收自 PR #46——其 CI 因 GitHub 账户
+  billing 未能启动（job 未运行即失败），按本地三件套门禁替代验证后在 main 直接吸收、
+  PR 作废（#22→#24 的先例）。
 - **结论**：能过 CI 的立即采纳，过不了的记录原因并挡住自动 PR，不让"有更新"变成噪音。
 
 ## 模型/服务端的突发变化
