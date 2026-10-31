@@ -18,7 +18,12 @@
 `remove_overlap_new` 的保真移植——包含感知 IoU（标准 IoU 与两个包含比取最大）重叠时
 保留小框、图标内的 OCR 文字并入该图标 content（文字为真值）、落在文字框内的图标按
 检测假阳性丢弃；对原版的两处有据偏离（同一 OCR 文字只吸收一次、拼接无尾随空格）
-以单测钉住。OCR 锚定（B3）、双后端合并（B4）后续批次接入。
+以单测钉住。OCR 锚定（B3）已接入：`OcrBackend` trait + 双后端（Windows 用系统
+Media.Ocr 零部署，Linux 用 tesseract CLI；`CUA_HUB_OCR_BACKEND` 选
+auto/windows/tesseract/none）+ `OcrBox.confidence` 置信度契约；SOC 的三个实现毛病
+逐条修正——多命中不再隐式取最后一个（歧义显式列出候选、按置信度排序）、置信度阈值
+过滤、未命中返回普通值不抛异常；Windows 语言包缺失显式报"缺语言包"而非空结果。
+双后端合并（B4）后续批次接入。
 
 ### `type_text` 的答复改成回读裁决（不再只报发送字符数）
 

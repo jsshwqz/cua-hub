@@ -228,6 +228,7 @@ CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
 | `CUA_HUB_YES` | 设为 1 跳过**中危**确认（CLI 入口）；高危动作始终还要 `--allow-high` |
 | `CUA_HUB_MCP_TOKEN` | HTTP 模式的 Bearer token；设置后强制鉴权 |
 | `CUA_HUB_ALLOW_REMOTE` | 允许无 token 绑定非回环地址（仅限已有前置鉴权） |
+| `CUA_HUB_OCR_BACKEND` | OCR 后端选择（`cua-engine-perception`）：`auto`（默认，Windows 用系统 Media.Ocr、Linux 用 tesseract CLI）/ `windows` / `tesseract` / `none`（显式关闭）。识别语言 env `CUA_HUB_OCR_LANG`（tesseract 后端的 `-l` 值，默认 `eng`）。Linux 需装 `tesseract-ocr`；Windows 中文识别需系统语言包，缺失会显式报错而不是返回空结果 |
 
 ## CI
 

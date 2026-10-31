@@ -40,7 +40,12 @@
   `remove_overlap_new` — containment-aware IoU keeps the smaller box, OCR text
   inside an icon becomes its content, an icon inside an OCR box is dropped as
   a false positive; two pinned deviations fix the original's double-absorb
-- [ ] OCR anchor (B3), accessibility+vision two-backend merge (B4)
+- [x] OCR anchor (B3): `OcrBackend` trait with two backends (Windows Media.Ocr
+  zero-deployment, tesseract CLI on Linux; `CUA_HUB_OCR_BACKEND` switch),
+  `OcrBox.confidence`, and the three SOC fixes — ambiguity listed explicitly
+  instead of taking the last hit, confidence floor applied, not-found is an
+  ordinary value
+- [ ] Accessibility+vision two-backend merge (B4)
 
 ## Phase 3 — Browser and orchestration
 
