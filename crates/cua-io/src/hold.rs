@@ -144,7 +144,10 @@ pub fn clear_intentional(held: Held) {
 
 /// Currently registered caller-owned holds.
 pub fn intentional_holds() -> BTreeSet<Held> {
-    intentional().lock().map(|set| set.clone()).unwrap_or_default()
+    intentional()
+        .lock()
+        .map(|set| set.clone())
+        .unwrap_or_default()
 }
 
 /// Physical state of one input, as far as the platform can tell.
@@ -177,7 +180,10 @@ pub fn scan() -> BTreeSet<Held> {
 /// Pure, so the decision is covered by tests on every platform while the
 /// injection next to it stays thin enough to audit by eye.
 pub fn stuck_plan(os_down: &BTreeSet<Held>, owned: &BTreeSet<Held>) -> Vec<Held> {
-    ALL.iter().copied().filter(|h| os_down.contains(h) && !owned.contains(h)).collect()
+    ALL.iter()
+        .copied()
+        .filter(|h| os_down.contains(h) && !owned.contains(h))
+        .collect()
 }
 
 /// What a sweep did.
@@ -329,8 +335,8 @@ mod vk {
     //! The virtual-key codes for the physical inputs [`Held`] names.
     #![allow(non_snake_case)]
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VIRTUAL_KEY, VK_LBUTTON, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MBUTTON,
-        VK_RBUTTON, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+        VIRTUAL_KEY, VK_LBUTTON, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MBUTTON, VK_RBUTTON,
+        VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
     };
 
     pub const LEFT_SHIFT: VIRTUAL_KEY = VK_LSHIFT;
@@ -401,7 +407,10 @@ mod tests {
     fn generic_modifier_roles_are_the_left_hand_keys() {
         // The claim this module makes about the OS is only correct while enigo
         // and Windows resolve a generic role to the left-hand physical key.
-        assert_eq!(Held::from_enigo_key(enigo::Key::Shift), Some(Held::LeftShift));
+        assert_eq!(
+            Held::from_enigo_key(enigo::Key::Shift),
+            Some(Held::LeftShift)
+        );
         assert_eq!(
             Held::from_enigo_key(enigo::Key::Control),
             Some(Held::LeftControl)
@@ -415,7 +424,10 @@ mod tests {
     #[test]
     fn mouse_buttons_map_to_their_physical_identity() {
         assert_eq!(Held::from_mouse_button(MouseButton::Left), Held::LeftButton);
-        assert_eq!(Held::from_mouse_button(MouseButton::Right), Held::RightButton);
+        assert_eq!(
+            Held::from_mouse_button(MouseButton::Right),
+            Held::RightButton
+        );
         assert_eq!(
             Held::from_mouse_button(MouseButton::Middle),
             Held::MiddleButton
