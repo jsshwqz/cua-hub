@@ -45,7 +45,11 @@
   `OcrBox.confidence`, and the three SOC fixes — ambiguity listed explicitly
   instead of taking the last hit, confidence floor applied, not-found is an
   ordinary value
-- [ ] Accessibility+vision two-backend merge (B4)
+- [x] Accessibility+vision two-backend merge (B4): unified registry — access
+  controls first (semantic truth), OCR inside an unnamed control feeds its
+  content (smallest container wins), reading-order numbering, and
+  `filter_relevant` task-keyword trimming for large desktops; contract grows
+  `ElementKind::Control` and `Source::Access`
 
 ## Phase 3 — Browser and orchestration
 
