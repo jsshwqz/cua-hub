@@ -20,6 +20,8 @@
 use image::{Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 
+pub mod merge;
+
 /// A normalized bounding box in `0.0..=1.0` xyxy order, image-relative.
 ///
 /// Normalized on purpose (OmniParser contract): a table survives resolution
