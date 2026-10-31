@@ -47,6 +47,17 @@ auto/windows/tesseract/none）+ `OcrBox.confidence` 置信度契约；SOC 的三
 审计侧无需改动：`determine_audit_effect` 已按 `effect=` 字样解析，
 `mcp_audit.jsonl` 从此对 `type_text` 记录真实档位而非一律 `unverifiable`。
 
+### 文档：新增 Web content and iframes 一节（实测四条坑）
+
+- `integrations/skill/SKILL.md` 增补 **Web content and iframes**：把一次网页富文本
+  作业实操中实测到的四条"返回值不撒谎但不是那件事"写进规矩——`typed N chars` 只证明
+  发出不证明落地、被遮挡窗口的 `capture_window` 哈希可能回旧帧、`window_state`
+  读树会把焦点从 iframe 抢回外层 `RootWebArea`、用户改窗口尺寸/缩放后坐标失效而
+  `window_input` 不会报错。并写明两条推论：页面内**加字可靠、删字不可靠**
+  （`ctrl+a`+`Delete` 两次都报成功但只生效一次），以及不要把坐标点击与 `key`
+  步骤混进同一条 `then`（会被外部输入守卫按"真人接管"暂停，该改用法而非改守卫）。
+  `How to work` 第 4 条 Verify 加一句交叉引用，避免两处规矩打架。
+
 ### 审计与路由：MCP 原子工具统一审计落盘与 Access 引擎窄提示路由（issue #14）
 
 - **MCP 原子工具统一审计落盘**：`call_tool_single` 为每一次原子工具调用追加记录一条 JSONL
