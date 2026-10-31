@@ -4,6 +4,7 @@ pub mod apps;
 pub mod capture;
 pub mod clipboard;
 pub mod exec;
+pub mod hold;
 pub mod input;
 #[cfg(windows)]
 pub mod wgc;
