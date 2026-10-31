@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod merge;
 pub mod ocr;
+pub mod registry;
 
 /// A normalized bounding box in `0.0..=1.0` xyxy order, image-relative.
 ///
@@ -74,6 +75,9 @@ impl Bbox {
 pub enum ElementKind {
     Text,
     Icon,
+    /// An accessibility-tree control (batch B4): role and name come from
+    /// UIA/AT-SPI — the semantic ground truth when present.
+    Control,
 }
 
 /// Where an element came from — the routing layer may weight confidence by it.
@@ -86,6 +90,8 @@ pub enum Source {
     Detection,
     /// Product of the geometric merge rules (batch B2).
     Merge,
+    /// An accessibility-tree control (batch B4): the semantic ground truth.
+    Access,
 }
 
 /// One visual element: numbered, boxed, optionally labelled.

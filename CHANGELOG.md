@@ -23,7 +23,10 @@ Media.Ocr 零部署，Linux 用 tesseract CLI；`CUA_HUB_OCR_BACKEND` 选
 auto/windows/tesseract/none）+ `OcrBox.confidence` 置信度契约；SOC 的三个实现毛病
 逐条修正——多命中不再隐式取最后一个（歧义显式列出候选、按置信度排序）、置信度阈值
 过滤、未命中返回普通值不抛异常；Windows 语言包缺失显式报"缺语言包"而非空结果。
-双后端合并（B4）后续批次接入。
+统一注册表（B4）已接入：无障碍树控件与 OCR 文字合并——控件优先（语义真值）、OCR
+落入无名控件框的并入其 content（无名按钮的救星，跨控件时选最小容器）、输出按阅读
+顺序统一编号、`filter_relevant` 按 task 关键词裁剪大桌面（命中优先、余量保底）；
+契约随批演进：`ElementKind` 增 `control`、`Source` 增 `access`。
 
 ### `type_text` 的答复改成回读裁决（不再只报发送字符数）
 

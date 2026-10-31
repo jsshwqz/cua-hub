@@ -71,11 +71,11 @@ impl Default for MergeConfig {
 /// of `inner`'s area lies inside `outer`.
 const INSIDE_THRESHOLD: f32 = 0.80;
 
-fn area(b: &Bbox) -> f32 {
+pub(crate) fn area(b: &Bbox) -> f32 {
     (b.x2 - b.x1) * (b.y2 - b.y1)
 }
 
-fn intersection_area(a: &Bbox, b: &Bbox) -> f32 {
+pub(crate) fn intersection_area(a: &Bbox, b: &Bbox) -> f32 {
     let x1 = a.x1.max(b.x1);
     let y1 = a.y1.max(b.y1);
     let x2 = a.x2.min(b.x2);
@@ -96,7 +96,7 @@ fn containment_iou(a: &Bbox, b: &Bbox) -> f32 {
 }
 
 /// True when more than 80% of `inner`'s area lies inside `outer`.
-fn is_inside(inner: &Bbox, outer: &Bbox) -> bool {
+pub(crate) fn is_inside(inner: &Bbox, outer: &Bbox) -> bool {
     intersection_area(inner, outer) / area(inner) > INSIDE_THRESHOLD
 }
 
