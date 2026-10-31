@@ -111,6 +111,7 @@ pub fn cursor_position() -> Result<(i32, i32)> {
 
 /// Press or release a mouse button without moving the pointer.
 pub fn mouse_button(button: cua_core::MouseButton, down: bool) -> Result<()> {
+    let held = crate::hold::Held::from_mouse_button(button);
     let mut enigo = enigo()?;
     let direction = if down {
         Direction::Press
@@ -119,7 +120,13 @@ pub fn mouse_button(button: cua_core::MouseButton, down: bool) -> Result<()> {
     };
     enigo
         .button(map_button(button), direction)
-        .map_err(input_err)
+        .map_err(input_err)?;
+    if down {
+        crate::hold::mark_intentional(held);
+    } else {
+        crate::hold::clear_intentional(held);
+    }
+    Ok(())
 }
 
 /// Press or release a key or chord, e.g. `"shift"` or `"ctrl+shift"`.
@@ -147,18 +154,32 @@ pub fn key_state(combo: &str, down: bool) -> Result<()> {
     }
     if down {
         let mut guard = InputGuard::new(&mut *enigo);
+        let mut pressed: Vec<Option<crate::hold::Held>> = Vec::new();
         for key in keys {
             guard.press_key(key)?;
+            pressed.push(crate::hold::Held::from_enigo_key(key));
         }
         // Success: caller wants them held down, disarm guard without releasing
         guard.held.clear();
+        // First-layer bookkeeping (#15): mark only keys that were actually
+        // pressed. A failed press returned above and the guard already
+        // released whatever got through, so nothing gets marked.
+        for h in pressed.into_iter().flatten() {
+            crate::hold::mark_intentional(h);
+        }
     } else {
         // Release in reverse order so chords unwind cleanly.
         keys.reverse();
+        let held_keys: Vec<Option<crate::hold::Held>> = keys
+            .iter()
+            .map(|k| crate::hold::Held::from_enigo_key(*k))
+            .collect();
         let mut errors = Vec::new();
-        for key in keys {
-            if let Err(e) = enigo.key(key, direction) {
+        for (key, held) in keys.iter().zip(held_keys.iter()) {
+            if let Err(e) = enigo.key(*key, direction) {
                 errors.push(e.to_string());
+            } else if let Some(h) = held {
+                crate::hold::clear_intentional(*h);
             }
         }
         if !errors.is_empty() {
@@ -168,6 +189,9 @@ pub fn key_state(combo: &str, down: bool) -> Result<()> {
                 errors.join("; ")
             )));
         }
+        // A key whose release failed keeps its intentional mark: the caller
+        // gets the error and retries, and the sweep must not treat it as a
+        // leaked hold until the caller gives up on it.
     }
     Ok(())
 }
