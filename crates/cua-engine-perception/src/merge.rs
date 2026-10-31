@@ -42,10 +42,15 @@ pub struct IconBox {
 }
 
 /// What the OCR side hands over: a text box with its transcription.
+///
+/// `confidence` is the backend's own score in `0.0..=1.0` — callers filter
+/// with it before feeding [`remove_overlap`] (the SOC fix: never ignore the
+/// score). Backends that cannot produce one report 1.0 rather than guessing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OcrBox {
     pub bbox: Bbox,
     pub content: String,
+    pub confidence: f32,
 }
 
 /// Thresholds for [`remove_overlap`].
@@ -196,6 +201,7 @@ mod tests {
         OcrBox {
             bbox: Bbox::new(x1, y1, x2, y2).unwrap(),
             content: text.to_string(),
+            confidence: 1.0,
         }
     }
 

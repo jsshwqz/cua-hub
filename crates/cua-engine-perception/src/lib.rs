@@ -21,6 +21,7 @@ use image::{Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 
 pub mod merge;
+pub mod ocr;
 
 /// A normalized bounding box in `0.0..=1.0` xyxy order, image-relative.
 ///

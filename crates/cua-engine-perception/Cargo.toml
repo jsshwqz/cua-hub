@@ -11,3 +11,19 @@ image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+] }
+windows-future = "0.3.2"
+
+[dev-dependencies]
+cua-io = { path = "../cua-io" }
+
+[[example]]
+name = "ocr_smoke"
