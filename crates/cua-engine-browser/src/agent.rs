@@ -1715,7 +1715,7 @@ mod retry_tests {
             "outcome: {outcome}"
         );
         let steps = std::fs::read_to_string(run_dir.join("steps.jsonl")).expect("steps.jsonl");
-        assert!(steps.contains("\"Fail\""), "terminal Fail record: {steps}");
+        assert!(steps.contains("\"fail\""), "terminal Fail record: {steps}");
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 }
