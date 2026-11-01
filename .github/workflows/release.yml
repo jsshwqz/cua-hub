@@ -9,9 +9,9 @@
 name: Release cua-hub
 
 on:
-workflow_dispatch:
-push:
-tags: ["v*"]
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 permissions:
 contents: write
