@@ -76,6 +76,10 @@ pub struct RunOptions {
     pub run_dir: Option<PathBuf>,
     pub settle_ms: u64,
     pub ui_tree: bool,
+    /// Attach the unified element registry (perception access+OCR merge) to
+    /// each vision step. Registry numbers are for reading only — actions
+    /// still address controls via window_state element indexes or targets.
+    pub ui_elements: bool,
     /// Show the browser window instead of headless mode.
     pub browser_headed: bool,
     /// Optional async approval hook used instead of `allow_high` when a
@@ -98,6 +102,7 @@ impl Default for RunOptions {
             run_dir: None,
             settle_ms: 600,
             ui_tree: false,
+            ui_elements: false,
             browser_headed: false,
             approver: None,
         }
@@ -222,6 +227,15 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             match cua_engine_access::snapshot(60, 1) {
                 Ok(snap) => observation.ui_tree = Some(snap.to_text()),
                 Err(e) => tracing::warn!(error = %e, "ui tree snapshot failed"),
+            }
+        }
+        if opts.ui_elements && vision_engine {
+            // Reuse the frame this step already captured — OCR and the tree
+            // walk read the same pixels the model is about to see.
+            match build_elements_text(&observation) {
+                Ok(text) if !text.is_empty() => observation.ui_elements = Some(text),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "ui elements build failed"),
             }
         }
 
@@ -443,6 +457,88 @@ fn button_name(b: cua_core::MouseButton) -> &'static str {
     }
 }
 
+/// Confidence floor applied to OCR lines before the registry merge (the B3
+/// fix for SOC's "ignore the score" defect). Windows Media.Ocr reports 1.0
+/// (no score in the API); the floor therefore bites on tesseract.
+const OCR_CONFIDENCE_FLOOR: f32 = 0.5;
+
+/// Builds the unified element registry text for one observation: the
+/// accessibility snapshot mapped to normalized access elements, OCR lines
+/// decoded from the same frame, merged (batch B4) and rendered without
+/// coordinates. Empty string means "nothing worth attaching" — callers skip.
+fn build_elements_text(observation: &cua_core::Observation) -> anyhow::Result<String> {
+    use cua_engine_perception::ocr::{make_backend, prepare_ocr_boxes, OcrBackendKind};
+    use cua_engine_perception::registry::{merge_access_and_ocr, AccessElement};
+    use cua_engine_perception::Bbox;
+
+    let snap = cua_engine_access::snapshot(60, 1)?;
+    let (screen_w, screen_h) = (observation.width as f32, observation.height as f32);
+    let access: Vec<AccessElement> = snap
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            let (x, y, w, h) = n.rect;
+            if w <= 0 || h <= 0 || screen_w <= 0.0 || screen_h <= 0.0 {
+                return None;
+            }
+            let bbox = Bbox::new(
+                (x as f32 / screen_w).clamp(0.0, 1.0),
+                (y as f32 / screen_h).clamp(0.0, 1.0),
+                ((x + w) as f32 / screen_w).clamp(0.0, 1.0),
+                ((y + h) as f32 / screen_h).clamp(0.0, 1.0),
+            )
+            .ok()?;
+            Some(AccessElement {
+                bbox,
+                role: n.control_type.clone(),
+                name: (!n.name.is_empty()).then(|| n.name.clone()),
+                interactive: is_interactive_role(&n.control_type),
+            })
+        })
+        .collect();
+
+    let mut ocr_boxes = Vec::new();
+    if !observation.image.is_empty() {
+        let frame = image::load_from_memory(&observation.image)
+            .map_err(|e| anyhow::anyhow!("decode observation image: {e}"))?
+            .to_rgb8();
+        if let Some(backend) = make_backend(OcrBackendKind::from_env())? {
+            let lines = backend.detect(&frame)?;
+            ocr_boxes = prepare_ocr_boxes(lines, OCR_CONFIDENCE_FLOOR);
+        }
+    }
+
+    let table = merge_access_and_ocr(&access, &ocr_boxes)?;
+    Ok(table.to_model_text())
+}
+
+/// Roles treated as actionable when mapping the tree to access elements.
+fn is_interactive_role(control_type: &str) -> bool {
+    matches!(
+        control_type,
+        "Button"
+            | "MenuItem"
+            | "Edit"
+            | "CheckBox"
+            | "RadioButton"
+            | "ComboBox"
+            | "ListItem"
+            | "TabItem"
+            | "Hyperlink"
+            | "TreeItem"
+            | "SplitButton"
+            | "ToggleButton"
+            | "Spinner"
+            | "Slider"
+            | "List"
+            | "Tab"
+            | "Tree"
+            | "Menu"
+            | "MenuBar"
+            | "ComboBoxItem"
+    )
+}
+
 pub fn default_run_dir() -> PathBuf {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     PathBuf::from(".runs").join(stamp.to_string())
@@ -530,5 +626,72 @@ mod tests {
         assert!(confirm(&command("cargo build"), false, false, None)
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod elements_tests {
+    use super::*;
+
+    #[test]
+    fn interactive_roles_cover_actionable_controls_only() {
+        for role in ["Button", "Edit", "MenuItem", "CheckBox", "Hyperlink"] {
+            assert!(is_interactive_role(role), "{role} should be interactive");
+        }
+        for role in ["Text", "Image", "Pane", "Window", "Document", ""] {
+            assert!(
+                !is_interactive_role(role),
+                "{role} should not be interactive"
+            );
+        }
+    }
+
+    /// Real-machine evidence (Windows session): the registry text builds from
+    /// a live snapshot + OCR with no model involved. Ignored by default — run
+    /// explicitly: `cargo test -p cua-cli -- --ignored elements_registry_smoke`
+    #[test]
+    #[ignore = "real-machine: needs a desktop session with OCR language packs"]
+    fn elements_registry_smoke() {
+        let obs = cua_core::Observation {
+            image: std::fs::read("registry-smoke-frame.png").unwrap_or_default(),
+            media_type: "image/png".into(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            ui_tree: None,
+            ui_elements: None,
+        };
+        // No frame file handy: width/height zero would skip normalization —
+        // capture one live instead through the io crate's primary capture.
+        let _ = obs;
+        let mut obs = cua_core::Observation::empty();
+        let captured = cua_io::capture::capture_primary().expect("primary capture");
+        obs.image = {
+            use image::ImageEncoder;
+            let rgb = image::DynamicImage::ImageRgba8(captured.image).to_rgb8();
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .expect("encode");
+            png
+        };
+        obs.width = captured.width;
+        obs.height = captured.height;
+        let text = build_elements_text(&obs).expect("registry build");
+        println!("--- element registry ({} chars) ---", text.len());
+        println!("{text}");
+        assert!(
+            !text.is_empty(),
+            "a real desktop yields a non-empty registry"
+        );
+        assert!(
+            !text.contains("bbox"),
+            "no coordinates leak into the text form"
+        );
     }
 }

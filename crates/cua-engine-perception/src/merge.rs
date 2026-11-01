@@ -168,6 +168,7 @@ pub fn remove_overlap(
             bbox: o.bbox,
             interactivity: false,
             content: Some(o.content.clone()),
+            role: None,
             source: Source::Ocr,
         });
     }
@@ -178,6 +179,7 @@ pub fn remove_overlap(
             bbox: icons[i].bbox,
             interactivity: true,
             content,
+            role: None,
             source,
         });
     }

@@ -115,6 +115,10 @@ enum Command {
         /// Include a shallow accessibility tree alongside each screenshot.
         #[arg(long)]
         ui_tree: bool,
+        /// Include the unified element registry (access+OCR, reading-only
+        /// numbers) alongside each screenshot.
+        #[arg(long)]
+        ui_elements: bool,
         /// Show the browser window for browser-routed tasks.
         #[arg(long)]
         browser_headed: bool,
@@ -349,6 +353,7 @@ fn main() -> Result<()> {
             run_dir,
             settle_ms,
             ui_tree,
+            ui_elements,
             browser_headed,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -365,6 +370,7 @@ fn main() -> Result<()> {
                 run_dir,
                 settle_ms,
                 ui_tree,
+                ui_elements,
                 browser_headed,
                 approver: None,
             }))?;

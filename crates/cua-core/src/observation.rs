@@ -13,6 +13,12 @@ pub struct Observation {
     pub cursor: Option<(i32, i32)>,
     /// Optional accessibility summary (filled in by the access engine later).
     pub ui_tree: Option<String>,
+    /// Optional unified element registry text (batch: tool wiring) — numbered,
+    /// coordinate-free lines from perception's access+OCR merge. Distinct from
+    /// `ui_tree`: the numbers here are for **reading only**; actions still
+    /// address controls via `window_state`'s element indexes.
+    #[serde(default)]
+    pub ui_elements: Option<String>,
 }
 
 impl Observation {
@@ -24,6 +30,7 @@ impl Observation {
             height,
             cursor: None,
             ui_tree: None,
+            ui_elements: None,
         }
     }
 
@@ -36,6 +43,7 @@ impl Observation {
             height: 0,
             cursor: None,
             ui_tree: None,
+            ui_elements: None,
         }
     }
 
