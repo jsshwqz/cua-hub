@@ -118,7 +118,7 @@ export OPENROUTER_API_KEY=sk-or-...
 
 | 工具 | 作用 |
 |------|------|
-| `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径 |
+| `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径。`ui_elements`（布尔，默认 false）给 vision 每步附带**统一元素注册表**（无障碍树控件 + 当帧 OCR 合并，阅读序编号、无坐标）：编号**只用于读**，动作仍按 `window_state` 的 element_index 或 target 寻址；OCR 后端由 `CUA_HUB_OCR_BACKEND` 决定 |
 | `start_task` / `task_status` / `task_cancel` | 后台任务：立即返回 job_id，可查进度、可取消 |
 | `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false`。click/type 的答复是**回读裁决**：`clicked <sel> [effect=changed] (checked Some(false)->Some(true))`、`typed N chars into <sel> [verified: value reads as sent]`；富文本走 `Input.insertText`（光标落末尾、不覆盖已有内容）并按三条标准回读；读不一致报 `FAILED:`，**这条路径不再出现 `OK`**。另有 `max_tokens`（整数，默认 700）限制每步规划请求的输出 token 上限，不传就用环境变量 `CUA_HUB_BROWSER_MAX_TOKENS`，都没有就是 700。`indicate_mouse`（布尔，默认 true）在每次点击/输入前把真实光标移到目标上停约 300ms 给旁观者看，只动光标不按键，`dry_run` 与 headless 自动跳过，失败只记日志不影响动作 |
 | `orchestrate` | 跨引擎计划与执行，步骤间传值 |

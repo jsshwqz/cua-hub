@@ -6,6 +6,15 @@
 
 ## Unreleased — 已合入分支，尚未发版
 
+### 注册表接进 agent loop：`run_task` / `run --ui-elements`（#18 P1-1 接线）
+
+`ui_elements` 开关（默认 **false**，现有行为零变化）给 vision 每步附带**统一元素注册表**：
+无障碍树控件（depth-1 快照映射为归一化元素，role 随行）+ 当帧 OCR（复用同一张截图，
+后端走 `CUA_HUB_OCR_BACKEND`）经 B4 合并成阅读序编号的无坐标文本，注入模型提示。
+**编号只用于读**——动作仍按 `window_state` 的 element_index 或 target 寻址，块头明示，
+两套编号不混用。`Observation` 增 `ui_elements` 字段、`Element` 增 `role`（serde 向后兼容）。
+真机证据：实屏注册表 2720 字符 15 元素（控件 + OCR 中文识别混排），零坐标泄漏。
+
 ### 视觉元素解析契约层：新 crate `cua-engine-perception`（#18 P1-1 批次 B1）
 
 元素表契约——元素带稳定编号、0–1 归一化 bbox、`kind`（text/icon）、`interactivity`、

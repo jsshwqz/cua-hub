@@ -338,6 +338,7 @@ async fn execute_step(
                 run_dir: Some(step_dir.to_path_buf()),
                 settle_ms: 600,
                 ui_tree: false,
+                ui_elements: false,
                 browser_headed: opts.headed,
                 approver: opts.approver.clone(),
             })

@@ -86,6 +86,7 @@ pub fn merge_access_and_ocr(
             bbox: a.bbox,
             interactivity: a.interactive,
             content: enhanced[i].clone().or_else(|| a.name.clone()),
+            role: Some(a.role.clone()),
             source: Source::Access,
         });
     }
@@ -99,6 +100,7 @@ pub fn merge_access_and_ocr(
             bbox: o.bbox,
             interactivity: false,
             content: Some(o.content.clone()),
+            role: None,
             source: Source::Ocr,
         });
     }

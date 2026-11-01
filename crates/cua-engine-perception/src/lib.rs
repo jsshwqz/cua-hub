@@ -105,6 +105,10 @@ pub struct Element {
     pub interactivity: bool,
     /// OCR text or icon caption, when available.
     pub content: Option<String>,
+    /// The control's role ("Button", "Edit", …) — `Some` only for
+    /// accessibility-backed elements (batch: tool wiring).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub source: Source,
 }
 
@@ -176,6 +180,33 @@ impl ElementTable {
                 content: e.content.clone(),
             })
             .collect()
+    }
+
+    /// The prompt-facing text form: one numbered line per element, **no
+    /// coordinates** — the same no-coordinates guarantee as [`Self::model_view`],
+    /// in the shape an agent-loop prompt block wants. Controls carry their
+    /// role ("control Button \"OK\""); text and icons degrade gracefully when
+    /// they have no content.
+    pub fn to_model_text(&self) -> String {
+        self.elements
+            .iter()
+            .map(|e| {
+                let kind = match e.kind {
+                    ElementKind::Control => "control",
+                    ElementKind::Text => "text",
+                    ElementKind::Icon => "icon",
+                };
+                let role = match (&e.role, e.kind) {
+                    (Some(r), ElementKind::Control) => format!(" {r}"),
+                    _ => String::new(),
+                };
+                match e.content.as_deref() {
+                    Some(c) => format!("[{}] {kind}{role} \"{c}\"", e.id),
+                    None => format!("[{}] {kind}{role}", e.id),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -305,8 +336,51 @@ mod tests {
             bbox,
             interactivity: true,
             content: Some(format!("element {id}")),
+            role: None,
             source: Source::Detection,
         }
+    }
+
+    #[test]
+    fn to_model_text_omits_coordinates_and_carries_roles() {
+        let table = ElementTable::new(vec![
+            Element {
+                id: 3,
+                kind: ElementKind::Control,
+                bbox: Bbox::new(0.1, 0.1, 0.5, 0.5).unwrap(),
+                interactivity: true,
+                content: Some("OK".into()),
+                role: Some("Button".into()),
+                source: Source::Access,
+            },
+            Element {
+                id: 5,
+                kind: ElementKind::Text,
+                bbox: Bbox::new(0.0, 0.6, 0.4, 0.7).unwrap(),
+                interactivity: false,
+                content: Some("Open File".into()),
+                role: None,
+                source: Source::Ocr,
+            },
+            Element {
+                id: 7,
+                kind: ElementKind::Icon,
+                bbox: Bbox::new(0.8, 0.8, 0.9, 0.9).unwrap(),
+                interactivity: true,
+                content: None,
+                role: None,
+                source: Source::Detection,
+            },
+        ])
+        .unwrap();
+        let text = table.to_model_text();
+        assert_eq!(
+            text,
+            "[3] control Button \"OK\"\n[5] text \"Open File\"\n[7] icon"
+        );
+        // The no-coordinates guarantee holds in the text form too.
+        assert!(!text.contains("0.1"), "leaked a coordinate: {text}");
+        assert!(!text.contains("bbox"), "leaked a bbox field: {text}");
     }
 
     #[test]

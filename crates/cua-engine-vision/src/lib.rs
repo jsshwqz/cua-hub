@@ -139,6 +139,9 @@ impl AnthropicProvider {
             if let Some(block) = tree_block(obs) {
                 content.push(block);
             }
+            if let Some(block) = elements_block(obs) {
+                content.push(block);
+            }
             content.push(image_block(obs));
             self.messages
                 .push(json!({ "role": "user", "content": content }));
@@ -280,6 +283,9 @@ impl AnthropicProvider {
                 if let Some(block) = tree_block(obs) {
                     content.push(block);
                 }
+                if let Some(block) = elements_block(obs) {
+                    content.push(block);
+                }
                 content.push(image_block(obs));
                 attach_screen = false;
             }
@@ -300,6 +306,9 @@ impl AnthropicProvider {
             let mut content = vec![json!({ "type": "text", "text": reason })];
             if attach_screen {
                 if let Some(block) = tree_block(obs) {
+                    content.push(block);
+                }
+                if let Some(block) = elements_block(obs) {
                     content.push(block);
                 }
                 content.push(image_block(obs));
@@ -427,6 +436,20 @@ fn tree_block(obs: &Observation) -> Option<Value> {
             json!({
                 "type": "text",
                 "text": format!("Accessibility tree (partial, indentation = depth):\n{t}")
+            })
+        })
+}
+
+fn elements_block(obs: &Observation) -> Option<Value> {
+    obs.ui_elements
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| {
+            json!({
+                "type": "text",
+                "text": format!(
+                    "Element registry (reading order; the numbers are for reading only — act via window_state element_index or targets, not these):\n{t}"
+                )
             })
         })
 }

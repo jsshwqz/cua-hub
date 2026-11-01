@@ -130,6 +130,7 @@ pub(crate) fn run_options_from_args(args: &Value) -> std::result::Result<RunOpti
         run_dir: None,
         settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
         ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
+        ui_elements: args["ui_elements"].as_bool().unwrap_or(false),
         browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
         approver: approver_from_elicitor(),
     })
@@ -3934,6 +3935,7 @@ fn tool_defs() -> Value {
                     "yes": { "type": "boolean", "default": false, "description": "Run medium-risk actions without asking. Off by default: an unrecognised command needs a decision." },
                     "allow_high": { "type": "boolean", "default": false },
                     "ui_tree": { "type": "boolean", "default": false },
+                    "ui_elements": { "type": "boolean", "default": false },
                     "settle_ms": { "type": "integer", "default": 600 }
                 },
                 "required": ["task"]
@@ -3971,6 +3973,7 @@ fn tool_defs() -> Value {
                     "yes": { "type": "boolean", "default": false, "description": "Run medium-risk actions without asking. Never allows a destructive one: that needs allow_high or a client that can answer." },
                     "allow_high": { "type": "boolean", "default": false, "description": "Allow destructive commands; off by default" },
                     "ui_tree": { "type": "boolean", "default": false, "description": "Attach the accessibility tree to each vision step" },
+                    "ui_elements": { "type": "boolean", "default": false, "description": "Attach the unified element registry (access+OCR, reading-only numbers) to each vision step" },
                     "settle_ms": { "type": "integer", "default": 600 }
                 },
                 "required": ["task"]
