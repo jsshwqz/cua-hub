@@ -38,12 +38,26 @@ pub struct AccessElement {
     pub name: Option<String>,
     /// Whether the control is actionable per the tree.
     pub interactive: bool,
+    /// The control's `element_index` from the window_state index registry
+    /// (`elements.rs::observe_group`). Batch: numbering unification — the
+    /// registry element for this control carries this exact id, so the
+    /// model reads and acts with one number. `None` means the caller could
+    /// not anchor the control to the index registry; its element gets id 0
+    /// (unaddressable rendering).
+    pub address: Option<u32>,
 }
 
 /// Merges accessibility controls and OCR text boxes into one registry.
 ///
 /// `access` and `ocr` may each be empty; the merge degrades to the other
 /// side. Output order is reading order (see module docs).
+///
+/// **Numbering semantics (batch: unification).** Controls take their id from
+/// [`AccessElement::address`] — the window_state `element_index` — so one
+/// number serves both reading and acting. Purely visual elements (OCR boxes
+/// absorbed by no control) get id 0: they are not controls, have no
+/// element_index, and `to_model_text` renders them without a number rather
+/// than inventing one the model could mistake for an address.
 pub fn merge_access_and_ocr(
     access: &[AccessElement],
     ocr: &[OcrBox],
@@ -81,7 +95,9 @@ pub fn merge_access_and_ocr(
     let mut elements: Vec<Element> = Vec::new();
     for (i, a) in access.iter().enumerate() {
         elements.push(Element {
-            id: 0,
+            // Unification: the id IS the window_state element_index when the
+            // caller anchored it; 0 means unaddressable (no anchor given).
+            id: a.address.unwrap_or(0),
             kind: ElementKind::Control,
             bbox: a.bbox,
             interactivity: a.interactive,
@@ -106,6 +122,9 @@ pub fn merge_access_and_ocr(
     }
 
     // Reading order: top-to-bottom, then left-to-right (stable for ties).
+    // The ORDER is for reading; the IDS are for addressing (element_index) —
+    // deliberately decoupled, so a sort never renumbers an addressable
+    // control.
     elements.sort_by(|a, b| {
         a.bbox
             .y1
@@ -118,9 +137,6 @@ pub fn merge_access_and_ocr(
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
     });
-    for (n, e) in elements.iter_mut().enumerate() {
-        e.id = (n + 1) as u32;
-    }
     ElementTable::new(elements)
 }
 
@@ -128,6 +144,11 @@ pub fn merge_access_and_ocr(
 /// score higher; hits come first (score desc, then reading order), the rest
 /// fills up to `limit` so the table never goes empty on a keyword miss.
 /// An empty/blank task returns the first `limit` elements unchanged.
+///
+/// Ids are **preserved**, not renumbered (batch: unification) — every id on
+/// a control is a live `element_index`, and re-sequencing would sever the
+/// link the model is relying on. Gaps after a trim are the normal shape,
+/// exactly like the retired indexes in the window_state registry.
 pub fn filter_relevant(table: &ElementTable, task: &str, limit: usize) -> ElementTable {
     let keywords: Vec<String> = task
         .split_whitespace()
@@ -147,7 +168,7 @@ pub fn filter_relevant(table: &ElementTable, task: &str, limit: usize) -> Elemen
         .take(limit)
         .map(|(_, e)| e.clone())
         .collect();
-    renumber(kept)
+    ElementTable::new(kept).expect("filter keeps ids unique")
 }
 
 fn relevance_score(e: &Element, keywords: &[String]) -> usize {
@@ -160,14 +181,6 @@ fn relevance_score(e: &Element, keywords: &[String]) -> usize {
         .iter()
         .filter(|k| content.contains(k.as_str()))
         .count()
-}
-
-fn renumber(elements: Vec<Element>) -> ElementTable {
-    let mut elements = elements;
-    for (n, e) in elements.iter_mut().enumerate() {
-        e.id = (n + 1) as u32;
-    }
-    ElementTable::new(elements).expect("renumber keeps ids unique")
 }
 
 #[cfg(test)]
@@ -188,6 +201,7 @@ mod tests {
             role: role.to_string(),
             name: name.map(|s| s.to_string()),
             interactive: true,
+            address: None,
         }
     }
 
@@ -201,15 +215,17 @@ mod tests {
 
     #[test]
     fn access_controls_enter_the_registry_as_control_elements() {
-        let table = merge_access_and_ocr(&[control(0.0, 0.0, 0.3, 0.2, "Button", Some("OK"))], &[])
-            .unwrap();
+        let mut anchor = control(0.0, 0.0, 0.3, 0.2, "Button", Some("OK"));
+        anchor.address = Some(12);
+        let table = merge_access_and_ocr(&[anchor], &[]).unwrap();
         assert_eq!(table.len(), 1);
         let e = &table.elements()[0];
         assert_eq!(e.kind, ElementKind::Control);
         assert_eq!(e.source, Source::Access);
         assert_eq!(e.content.as_deref(), Some("OK"));
         assert!(e.interactivity);
-        assert_eq!(e.id, 1);
+        // Unification: the id IS the element_index the caller anchored.
+        assert_eq!(e.id, 12);
     }
 
     #[test]
@@ -283,19 +299,21 @@ mod tests {
 
     #[test]
     fn output_is_in_reading_order_with_sequential_ids() {
-        let table = merge_access_and_ocr(
-            &[
-                control(0.5, 0.6, 0.9, 0.8, "Button", Some("B")),
-                control(0.0, 0.0, 0.3, 0.2, "Edit", Some("A")),
-            ],
-            &[ocr_box(0.0, 0.5, 0.4, 0.6, "middle text")],
-        )
-        .unwrap();
-        let order: Vec<u32> = table.elements().iter().map(|e| e.id).collect();
-        // A (top-left), middle text, B (bottom-right).
-        assert_eq!(order, vec![1, 2, 3]);
+        let mut a = control(0.0, 0.0, 0.3, 0.2, "Edit", Some("A"));
+        a.address = Some(40);
+        let mut b = control(0.5, 0.6, 0.9, 0.8, "Button", Some("B"));
+        b.address = Some(17);
+        let table =
+            merge_access_and_ocr(&[b, a], &[ocr_box(0.0, 0.5, 0.4, 0.6, "middle text")]).unwrap();
+        // Reading order: A (top-left), middle text, B (bottom-right)…
         assert_eq!(table.elements()[0].content.as_deref(), Some("A"));
+        assert_eq!(table.elements()[1].content.as_deref(), Some("middle text"));
         assert_eq!(table.elements()[2].content.as_deref(), Some("B"));
+        // …but the IDS are element_index, not reading positions: addresses
+        // travel with their controls, the unanchored OCR line renders
+        // unnumbered (id 0).
+        let ids: Vec<u32> = table.elements().iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![40, 0, 17]);
     }
 
     #[test]
@@ -312,16 +330,14 @@ mod tests {
 
     #[test]
     fn filter_relevant_puts_keyword_hits_first_and_fills_to_the_limit() {
-        let table = merge_access_and_ocr(
-            &[
-                control(0.0, 0.0, 0.2, 0.1, "Edit", Some("username field")),
-                control(0.0, 0.2, 0.2, 0.3, "Button", Some("OK")),
-                control(0.0, 0.4, 0.2, 0.5, "Edit", Some("password")),
-                control(0.0, 0.6, 0.2, 0.7, "Button", Some("Cancel")),
-            ],
-            &[],
-        )
-        .unwrap();
+        let mut username = control(0.0, 0.0, 0.2, 0.1, "Edit", Some("username field"));
+        username.address = Some(40);
+        let ok = control(0.0, 0.2, 0.2, 0.3, "Button", Some("OK"));
+        let mut password = control(0.0, 0.4, 0.2, 0.5, "Edit", Some("password"));
+        password.address = Some(41);
+        let mut cancel = control(0.0, 0.6, 0.2, 0.7, "Button", Some("Cancel"));
+        cancel.address = Some(42);
+        let table = merge_access_and_ocr(&[username, ok, password, cancel], &[]).unwrap();
         let trimmed = filter_relevant(&table, "password", 2);
         assert_eq!(trimmed.len(), 2);
         assert_eq!(trimmed.elements()[0].content.as_deref(), Some("password"));
@@ -330,8 +346,10 @@ mod tests {
             trimmed.elements()[1].content.as_deref(),
             Some("username field")
         );
+        // Unification: the trim preserves element_index ids — gaps are the
+        // normal shape, exactly like retired indexes in window_state.
         let ids: Vec<u32> = trimmed.elements().iter().map(|e| e.id).collect();
-        assert_eq!(ids, vec![1, 2], "renumbered after the trim");
+        assert_eq!(ids, vec![41, 40]);
     }
 
     #[test]

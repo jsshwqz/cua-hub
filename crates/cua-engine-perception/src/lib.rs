@@ -143,10 +143,14 @@ pub struct ElementTable {
 impl ElementTable {
     /// Builds a table, refusing duplicate ids (the SoM numbering must be
     /// unambiguous — a model replying "3" must resolve to exactly one box).
+    ///
+    /// `id == 0` is the "unaddressable visual element" sentinel (batch:
+    /// unification) and may repeat freely — it is not an address, so several
+    /// `- text` lines cannot collide the way two `[12]` controls would.
     pub fn new(elements: Vec<Element>) -> Result<Self, PerceptionError> {
         let mut seen = std::collections::HashSet::new();
         for e in &elements {
-            if !seen.insert(e.id) {
+            if e.id != 0 && !seen.insert(e.id) {
                 return Err(PerceptionError::DuplicateId(e.id));
             }
         }
@@ -182,11 +186,18 @@ impl ElementTable {
             .collect()
     }
 
-    /// The prompt-facing text form: one numbered line per element, **no
-    /// coordinates** — the same no-coordinates guarantee as [`Self::model_view`],
-    /// in the shape an agent-loop prompt block wants. Controls carry their
-    /// role ("control Button \"OK\""); text and icons degrade gracefully when
-    /// they have no content.
+    /// The prompt-facing text form, **no coordinates** — the same
+    /// no-coordinates guarantee as [`Self::model_view`], in the shape an
+    /// agent-loop prompt block wants. Controls carry their role ("control
+    /// Button \"OK\""); text and icons degrade gracefully when they have no
+    /// content.
+    ///
+    /// Numbering semantics (batch: unification): an element with
+    /// `id > 0` carries the window_state `element_index` — one number for
+    /// both reading and acting. `id == 0` marks a purely visual element
+    /// (no control, no address): rendered as a `-` line **without a
+    /// number**, so nothing in the prompt looks like an address it could
+    /// invoke with.
     pub fn to_model_text(&self) -> String {
         self.elements
             .iter()
@@ -200,9 +211,14 @@ impl ElementTable {
                     (Some(r), ElementKind::Control) => format!(" {r}"),
                     _ => String::new(),
                 };
+                let label = if e.id == 0 {
+                    format!("- {kind}{role}")
+                } else {
+                    format!("[{}] {kind}{role}", e.id)
+                };
                 match e.content.as_deref() {
-                    Some(c) => format!("[{}] {kind}{role} \"{c}\"", e.id),
-                    None => format!("[{}] {kind}{role}", e.id),
+                    Some(c) => format!("{label} \"{c}\""),
+                    None => label,
                 }
             })
             .collect::<Vec<_>>()
@@ -381,6 +397,60 @@ mod tests {
         // The no-coordinates guarantee holds in the text form too.
         assert!(!text.contains("0.1"), "leaked a coordinate: {text}");
         assert!(!text.contains("bbox"), "leaked a bbox field: {text}");
+    }
+
+    #[test]
+    fn an_unaddressed_element_renders_without_a_number() {
+        // Batch: unification. id 0 = unaddressable visual element — it must
+        // not render as `[0]`, which would look like an invocable address.
+        let table = ElementTable::new(vec![
+            Element {
+                id: 12,
+                kind: ElementKind::Control,
+                bbox: Bbox::new(0.0, 0.0, 0.3, 0.2).unwrap(),
+                interactivity: true,
+                content: Some("OK".into()),
+                role: Some("Button".into()),
+                source: Source::Access,
+            },
+            Element {
+                id: 0,
+                kind: ElementKind::Text,
+                bbox: Bbox::new(0.0, 0.5, 0.4, 0.6).unwrap(),
+                interactivity: false,
+                content: Some("free text".into()),
+                role: None,
+                source: Source::Ocr,
+            },
+        ])
+        .unwrap();
+        let text = table.to_model_text();
+        assert_eq!(text, "[12] control Button \"OK\"\n- text \"free text\"");
+        assert!(!text.contains("[0]"), "id 0 must not render as an address");
+    }
+
+    #[test]
+    fn unaddressed_elements_may_share_id_zero() {
+        // The sentinel is not an address: several `-` lines coexist.
+        let a = Element {
+            id: 0,
+            kind: ElementKind::Text,
+            bbox: Bbox::new(0.0, 0.0, 0.1, 0.1).unwrap(),
+            interactivity: false,
+            content: Some("one".into()),
+            role: None,
+            source: Source::Ocr,
+        };
+        let b = Element {
+            id: 0,
+            kind: ElementKind::Text,
+            bbox: Bbox::new(0.0, 0.2, 0.1, 0.3).unwrap(),
+            interactivity: false,
+            content: Some("two".into()),
+            role: None,
+            source: Source::Ocr,
+        };
+        assert!(ElementTable::new(vec![a, b]).is_ok(), "id 0 repeats freely");
     }
 
     #[test]

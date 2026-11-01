@@ -6,6 +6,10 @@
 
 ## Unreleased — 已合入分支，尚未发版
 
+### 编号归一：ui_elements 注册表的编号就是 window_state 的 element_index
+
+`ui_elements` 注册表的编号语义归一（此前两套编号并存：window_state 的稳定 element_index vs 注册表每步重排的阅读号）：runner 改用**每窗口** `snapshot_window` + `observe_group(window_id)`——与 `window_state` 完全同源同 scope，同一控件两处看到的编号必然相同。呈现按窗口分段（`# window` 段头），段内编号读动一致；不可寻址的 OCR 文本渲染为无编号 `- ` 行（id 0 = "不可寻址视觉元素"哨兵，可重复），不冒充可 invoke 的地址；`filter_relevant` 裁剪**保留原 element_index**（空洞是正常形态，与 window_state 退役编号同型）；`run_dir` 产物新增 `elements-step-NN.txt` 供对账审计。`AccessElement` 增 `address` 字段。#37 身份寻址的签名/退役/保号机制零改动——runner 只是消费其公开分配函数。
+
 ### 浏览器 agent 的模型错误重试与审计保全
 
 模型回错一次不再整轮中止：非法 JSON、空回复、动作解析失败三类内容错误与传输错误共用每步 3 次的有界重试（退避 700ms×2^attempt），内容重试自动附加修复提示让模型改答；重试耗尽本轮以 `Failed` 终态收场——steps.jsonl 有终态 Fail 记录、outcome.json 正常落盘（此前 outcome.json 缺失、审计链断）。每次重试记 warn（第几次、错误类、截断回复原文）。推理回退、4xx 不重试等既有语义不变。

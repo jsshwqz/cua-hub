@@ -233,7 +233,17 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             // Reuse the frame this step already captured — OCR and the tree
             // walk read the same pixels the model is about to see.
             match build_elements_text(&observation) {
-                Ok(text) if !text.is_empty() => observation.ui_elements = Some(text),
+                Ok(text) if !text.is_empty() => {
+                    observation.ui_elements = Some(text.clone());
+                    // Artifact for audit: the unification review's cross-check
+                    // (window_state vs registry, same process) reads this file.
+                    if let Some(run_dir) = &opts.run_dir {
+                        let path = run_dir.join(format!("elements-step-{index:02}.txt"));
+                        if let Err(e) = std::fs::write(&path, &text) {
+                            tracing::warn!(error = %e, path = %path.display(), "elements artifact write failed");
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "ui elements build failed"),
             }
@@ -462,42 +472,26 @@ fn button_name(b: cua_core::MouseButton) -> &'static str {
 /// (no score in the API); the floor therefore bites on tesseract.
 const OCR_CONFIDENCE_FLOOR: f32 = 0.5;
 
-/// Builds the unified element registry text for one observation: the
-/// accessibility snapshot mapped to normalized access elements, OCR lines
-/// decoded from the same frame, merged (batch B4) and rendered without
-/// coordinates. Empty string means "nothing worth attaching" — callers skip.
+/// Builds the unified element registry text for one observation, **per
+/// window**: each visible window gets its own `snapshot_window` + its own
+/// `observe_group(window_id)` call — the exact engine and scope key
+/// `window_state` uses, so a control's number here IS its element_index —
+/// merged with the OCR lines that fall inside that window's rectangle
+/// (batch B4), rendered without coordinates, and segmented with a
+/// `# window` header like the tree text. Cross-window id collisions are
+/// structurally impossible: every window merges into its own table.
+///
+/// OCR boxes with no containing window are dropped (they have no
+/// addressable home); the count is logged once at debug.
 fn build_elements_text(observation: &cua_core::Observation) -> anyhow::Result<String> {
     use cua_engine_perception::ocr::{make_backend, prepare_ocr_boxes, OcrBackendKind};
     use cua_engine_perception::registry::{merge_access_and_ocr, AccessElement};
     use cua_engine_perception::Bbox;
 
-    let snap = cua_engine_access::snapshot(60, 1)?;
     let (screen_w, screen_h) = (observation.width as f32, observation.height as f32);
-    let access: Vec<AccessElement> = snap
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            let (x, y, w, h) = n.rect;
-            if w <= 0 || h <= 0 || screen_w <= 0.0 || screen_h <= 0.0 {
-                return None;
-            }
-            let bbox = Bbox::new(
-                (x as f32 / screen_w).clamp(0.0, 1.0),
-                (y as f32 / screen_h).clamp(0.0, 1.0),
-                ((x + w) as f32 / screen_w).clamp(0.0, 1.0),
-                ((y + h) as f32 / screen_h).clamp(0.0, 1.0),
-            )
-            .ok()?;
-            Some(AccessElement {
-                bbox,
-                role: n.control_type.clone(),
-                name: (!n.name.is_empty()).then(|| n.name.clone()),
-                interactive: is_interactive_role(&n.control_type),
-            })
-        })
-        .collect();
+    let windows = cua_io::list_windows(None, false).unwrap_or_default();
 
-    let mut ocr_boxes = Vec::new();
+    let mut ocr_boxes: Vec<cua_engine_perception::merge::OcrBox> = Vec::new();
     if !observation.image.is_empty() {
         let frame = image::load_from_memory(&observation.image)
             .map_err(|e| anyhow::anyhow!("decode observation image: {e}"))?
@@ -507,9 +501,112 @@ fn build_elements_text(observation: &cua_core::Observation) -> anyhow::Result<St
             ocr_boxes = prepare_ocr_boxes(lines, OCR_CONFIDENCE_FLOOR);
         }
     }
+    // Window rectangles in normalized screen space, for OCR attribution.
+    let window_rect = |w: &cua_io::WindowInfo| -> Option<(f32, f32, f32, f32)> {
+        if screen_w <= 0.0 || screen_h <= 0.0 || w.width == 0 || w.height == 0 {
+            return None;
+        }
+        let b = Bbox::new(
+            (w.x as f32 / screen_w).clamp(0.0, 1.0),
+            (w.y as f32 / screen_h).clamp(0.0, 1.0),
+            ((w.x + w.width as i32) as f32 / screen_w).clamp(0.0, 1.0),
+            ((w.y + w.height as i32) as f32 / screen_h).clamp(0.0, 1.0),
+        )
+        .ok()?;
+        Some((b.x1, b.y1, b.x2, b.y2))
+    };
 
-    let table = merge_access_and_ocr(&access, &ocr_boxes)?;
-    Ok(table.to_model_text())
+    let mut segments: Vec<String> = Vec::new();
+    let homeless = ocr_boxes
+        .iter()
+        .filter(|o| {
+            let cx = (o.bbox.x1 + o.bbox.x2) / 2.0;
+            let cy = (o.bbox.y1 + o.bbox.y2) / 2.0;
+            !windows.iter().any(|w| {
+                window_rect(w)
+                    .map(|(x1, y1, x2, y2)| cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2)
+                    .unwrap_or(false)
+            })
+        })
+        .count();
+    for w in &windows {
+        let (wx1, wy1, wx2, wy2) = match window_rect(w) {
+            Some(r) => r,
+            None => continue,
+        };
+        let w_ocr: Vec<cua_engine_perception::merge::OcrBox> = ocr_boxes
+            .iter()
+            .filter(|o| {
+                let cx = (o.bbox.x1 + o.bbox.x2) / 2.0;
+                let cy = (o.bbox.y1 + o.bbox.y2) / 2.0;
+                cx >= wx1 && cx <= wx2 && cy >= wy1 && cy <= wy2
+            })
+            .cloned()
+            .collect();
+
+        // Same engine, same scope key as window_state: observe_group keys by
+        // `window_id|signature` inside scope `window_id`, so a control seen
+        // here and by window_state gets the SAME element_index.
+        let mut snap =
+            match cua_engine_access::snapshot_window(w.id, &w.app, &w.title, w.pid, 60, 1) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(window = w.id, error = %e, "per-window snapshot failed");
+                    continue;
+                }
+            };
+        let _view = crate::elements::observe_group(
+            w.id,
+            vec![crate::elements::TreePart {
+                window_id: w.id,
+                title: w.title.clone(),
+                related: false,
+                snapshot: &mut snap,
+            }],
+            false,
+        );
+        let access: Vec<AccessElement> = snap
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                let (x, y, w, h) = n.rect;
+                if w <= 0 || h <= 0 {
+                    return None;
+                }
+                // UIA/AT-SPI bounding rectangles are SCREEN physical pixels
+                // (CurrentBoundingRectangle) — normalize directly; no window
+                // offset, or the box would land twice as far away.
+                let bbox = Bbox::new(
+                    (x as f32 / screen_w).clamp(0.0, 1.0),
+                    (y as f32 / screen_h).clamp(0.0, 1.0),
+                    ((x + w) as f32 / screen_w).clamp(0.0, 1.0),
+                    ((y + h) as f32 / screen_h).clamp(0.0, 1.0),
+                )
+                .ok()?;
+                Some(AccessElement {
+                    bbox,
+                    role: n.control_type.clone(),
+                    name: (!n.name.is_empty()).then(|| n.name.clone()),
+                    interactive: is_interactive_role(&n.control_type),
+                    address: Some(n.index as u32),
+                })
+            })
+            .collect();
+
+        let table = merge_access_and_ocr(&access, &w_ocr)?;
+        let text = table.to_model_text();
+        if text.is_empty() {
+            continue;
+        }
+        segments.push(format!("# window {} \"{}\"\n{text}", w.id, w.title));
+    }
+    if homeless > 0 {
+        tracing::debug!(
+            dropped = homeless,
+            "OCR boxes with no containing window dropped"
+        );
+    }
+    Ok(segments.join("\n"))
 }
 
 /// Roles treated as actionable when mapping the tree to access elements.
@@ -692,6 +789,16 @@ mod elements_tests {
         assert!(
             !text.contains("bbox"),
             "no coordinates leak into the text form"
+        );
+        // Unification shape: per-window segments, and the ids inside a
+        // segment are that window's element_index from the shared registry.
+        assert!(
+            text.contains("# window"),
+            "per-window segments expected: {text}"
+        );
+        assert!(
+            !text.contains("[0]"),
+            "unaddressed elements must render unnumbered: {text}"
         );
     }
 }
