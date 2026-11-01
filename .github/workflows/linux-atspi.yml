@@ -79,7 +79,7 @@ jobs:
         # must not turn a healthy accessibility run red -- that red reads exactly
         # like "the backend broke" to whoever is reviewing the PR.
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-atspi-evidence
           path: atspi-evidence/
