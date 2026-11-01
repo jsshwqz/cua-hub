@@ -1,9 +1,7 @@
-# cua-hub 自动发版流水线（Windows + Linux）
+# cua-hub 自动发版流水线（Windows + Linux + macOS）
 #
-# 改编自本仓库 muse 线已实测可用的 release-windows.yml
-# （muse-v0.1.1 / muse-v0.1.2 均由该模板自动构建发布，附件可用性已核）。
 # 触发：推送 v* 标签（如 v0.1.5）后，GitHub 自动构建、打包，
-# 并把成品挂到一个Release 上；维护者写好发布说明后点发布即可。
+# 并把成品挂到一个【草稿】Release 上；维护者写好发布说明后点发布即可。
 # workflow_dispatch 手动触发只产出 artifact、不建 Release。
 
 name: Release cua-hub
@@ -14,129 +12,144 @@ on:
     tags: ["v*"]
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-build-windows:
-runs-on: windows-latest
-steps:
-- uses: actions/checkout@v7
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build cua-hub (release)
+        run: cargo build --release -p cua-cli --target x86_64-pc-windows-msvc
+      - name: Package zip
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $ver = "${{ github.ref_name }}" -replace '^v', ''
+          } else {
+            $ver = "dev"
+          }
+          echo "PKG_NAME=cua-hub-windows-x64-$ver.zip" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/cua-hub.exe dist/
+          Copy-Item README.md dist/
+          Copy-Item CHANGELOG.md dist/
+          Copy-Item integrations/skill/SKILL.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "cua-hub-windows-x64-$ver.zip"
+      - name: Upload artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cua-hub-windows-x64
+          path: ${{ env.PKG_NAME }}
+      - name: Attach to draft GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          prerelease: false
+          files: ${{ env.PKG_NAME }}
 
-- name: Install Rust
-uses: dtolnay/rust-toolchain@stable
-with:
-targets: x86_64-pc-windows-msvc
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libpipewire-0.3-dev libclang-dev libegl-dev libgbm-dev libdrm-dev tesseract-ocr
+      - name: Build cua-hub (release)
+        run: cargo build --release -p cua-cli --target x86_64-unknown-linux-gnu
+      - name: Package tarball
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then ver="${{ github.ref_name }}"; ver="${ver#v}"; else ver="dev"; fi
+          echo "PKG_NAME=cua-hub-linux-x64-$ver.tar.gz" >> $GITHUB_ENV
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/cua-hub dist/
+          cp README.md dist/ && cp CHANGELOG.md dist/ && cp integrations/skill/SKILL.md dist/
+          tar -czf "cua-hub-linux-x64-$ver.tar.gz" -C dist .
+      - name: Upload artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cua-hub-linux-x64
+          path: ${{ env.PKG_NAME }}
+      - name: Attach to draft GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          prerelease: false
+          files: ${{ env.PKG_NAME }}
 
-# 主线 CI（ci.yml）已证明 windows-latest 上构建本仓库无需额外系统依赖，
-# 故此处不装任何 choco 包。
+  build-macos-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - name: Build cua-hub (release)
+        run: cargo build --release -p cua-cli --target x86_64-apple-darwin
+      - name: Package tarball
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then ver="${{ github.ref_name }}"; ver="${ver#v}"; else ver="dev"; fi
+          echo "PKG_NAME=cua-hub-macos-x64-$ver.tar.gz" >> $GITHUB_ENV
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/cua-hub dist/
+          cp README.md dist/ && cp CHANGELOG.md dist/ && cp integrations/skill/SKILL.md dist/
+          tar -czf "cua-hub-macos-x64-$ver.tar.gz" -C dist .
+      - name: Upload artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cua-hub-macos-x64
+          path: ${{ env.PKG_NAME }}
+      - name: Attach to draft GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          prerelease: false
+          files: ${{ env.PKG_NAME }}
 
-- name: Build cua-hub (release)
-# 链接方式与手工发版保持一致：不加 crt-static。已发布的 0.1.4~0.1.6
-# 包内 exe 都是动态 CRT（导入表里有 VCRUNTIME140.dll），流水线要的是
-# 复刻做法，不是顺手改进；要转静态另立一单，补配方和 CHANGELOG。
-# 二进制 crate 为 cua-cli，其 [[bin]] 产物名为 cua-hub
-# （见 crates/cua-cli/Cargo.toml）。
-run: cargo build --release -p cua-cli --target x86_64-pc-windows-msvc
-
-- name: Package zip
-shell: pwsh
-run: |
-# 资产命名与手工发布的 0.1.4 保持一致：cua-hub-windows-x64-<版本>.zip
-if ("${{ github.ref_type}}" -eq "tag") {
-$ver = "${{ github.ref_name}}" -replace '^v', ''
-} else {
-$ver = "dev"
-}
-echo "PKG_NAME=cua-hub-windows-x64-$ver.zip" >> $env:GITHUB_ENV
-New-Item -ItemType Directory -Force dist | Out-Null
-Copy-Item target/x86_64-pc-windows-msvc/release/cua-hub.exe dist/
-Copy-Item README.md dist/
-Copy-Item CHANGELOG.md dist/
-# 手工四件套里的第四件是 SKILL.md（源在 integrations/skill/），
-# install-qoder.ps1 往 ~/.qoder/skills/cua-hub 同步的就是它，不能少。
-Copy-Item integrations/skill/SKILL.md dist/
-Compress-Archive -Path dist/* -DestinationPath "cua-hub-windows-x64-$ver.zip"
-
-# tag 构建的交付物是 Release 上那份 zip，再传一遍只是把同一个包在账号级
-# 产物配额里存两份。手动 workflow_dispatch 不建 Release，artifact 是它
-# 唯一的产物，必须保留。
-- name: Upload artifact
-if: github.ref_type!= 'tag'
-uses: actions/upload-artifact@v7
-with:
-name: cua-hub-windows-x64
-path: ${{ env.PKG_NAME}}
-
-- name: Attach to draft GitHub Release (tag builds only)
-if: startsWith(github.ref, 'refs/tags/')
-uses: softprops/action-gh-release@v3
-with:
-draft: true
-prerelease: false
-files: ${{ env.PKG_NAME}}
-body: |
-（自动构建草稿：发布说明待维护者补写后发布。）
-
-本包由 GitHub Actions 在 windows-latest 上自动构建，
-产物 cua-hub.exe，用法见包内 README。
-
-build-linux:
-runs-on: ubuntu-24.04
-steps:
-- uses: actions/checkout@v7
-
-- name: Install Rust
-uses: dtolnay/rust-toolchain@stable
-with:
-targets: x86_64-unknown-linux-gnu
-
-- name: Install system dependencies
-run: |
-sudo apt-get update
-sudo apt-get install -y \
-libwayland-dev \
-libpipewire-0.3-dev \
-libclang-dev \
-libegl-dev \
-libgbm-dev \
-libdrm-dev \
-tesseract-ocr
-
-- name: Build cua-hub (release)
-run: cargo build --release -p cua-cli --target x86_64-unknown-linux-gnu
-
-- name: Package tarball
-run: |
-if [ "${{ github.ref_type}}" = "tag"]; then
-ver="${{ github.ref_name}}"
-ver="${ver#v}"
-else
-ver="dev"
-fi
-echo "PKG_NAME=cua-hub-linux-x64-$ver.tar.gz" >> $GITHUB_ENV
-mkdir -p dist
-cp target/x86_64-unknown-linux-gnu/release/cua-hub dist/
-cp README.md dist/
-cp CHANGELOG.md dist/
-cp integrations/skill/SKILL.md dist/
-tar -czf "cua-hub-linux-x64-$ver.tar.gz" -C dist.
-
-- name: Upload artifact
-if: github.ref_type!= 'tag'
-uses: actions/upload-artifact@v7
-with:
-name: cua-hub-linux-x64
-path: ${{ env.PKG_NAME}}
-
-- name: Attach to draft GitHub Release (tag builds only)
-if: startsWith(github.ref, 'refs/tags/')
-uses: softprops/action-gh-release@v3
-with:
-draft: true
-prerelease: false
-files: ${{ env.PKG_NAME}}
-body: |
-（自动构建草稿：发布说明待维护者补写后发布。）
-
-本包由 GitHub Actions 在 ubuntu-24.04 上自动构建，
-产物 cua-hub（Linux x86_64），用法见包内 README。
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build cua-hub (release)
+        run: cargo build --release -p cua-cli --target aarch64-apple-darwin
+      - name: Package tarball
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then ver="${{ github.ref_name }}"; ver="${ver#v}"; else ver="dev"; fi
+          echo "PKG_NAME=cua-hub-macos-arm64-$ver.tar.gz" >> $GITHUB_ENV
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/cua-hub dist/
+          cp README.md dist/ && cp CHANGELOG.md dist/ && cp integrations/skill/SKILL.md dist/
+          tar -czf "cua-hub-macos-arm64-$ver.tar.gz" -C dist .
+      - name: Upload artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cua-hub-macos-arm64
+          path: ${{ env.PKG_NAME }}
+      - name: Attach to draft GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          prerelease: false
+          files: ${{ env.PKG_NAME }}
