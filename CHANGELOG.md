@@ -4,7 +4,12 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
-## Unreleased — 已合入分支，尚未发版
+## 0.1.7 — 2026-11-02
+
+视觉元素解析从短板到能力链的一版：统一元素注册表（无障碍树 + OCR 合并、按窗口分段、
+编号读动一致）接进 agent loop；浏览器 agent 的模型错误重试与审计保全；编号归一
+（element_index 与注册表编号合成一套）。另含 type_text 回读裁决、MCP 原子工具审计
+落盘、iframe 四坑 skill 文档、GitHub Actions 依赖升级。
 
 ### 编号归一：ui_elements 注册表的编号就是 window_state 的 element_index
 
@@ -89,8 +94,6 @@ auto/windows/tesseract/none）+ `OcrBox.confidence` 置信度契约；SOC 的三
   `[Vision]`；常规桌面任务（如"打开记事本输入 hello"）保持走 Vision，Code/Browser 提示词与显式 forced 规则优先；
   同步修正 README 引擎状态口径。
 - **Fail 变更状态分类核验**：确认 `Action::Fail.is_mutating() == false` 语义与回归测试 `a_failed_run_did_not_modify_the_machine` 持续在列且通过。
-
-## 未发布
 
 ### 浏览器 agent：输出上限可配（PR #41）
 
