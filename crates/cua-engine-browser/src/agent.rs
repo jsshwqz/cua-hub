@@ -519,9 +519,26 @@ pub async fn run_task(opts: BrowserRunOptions) -> Result<BrowserReport> {
             break;
         }
 
-        let (action, source) = ask(&http, &config, &opts.task, &summary, &history, &shot)
-            .await
-            .with_context(|| format!("model failed at browser step {index}"))?;
+        // A model failure (retries exhausted) is a Failed outcome, not a
+        // crashed run: steps.jsonl gets its Fail record and outcome.json is
+        // written through the normal exit — same shape as the screenshot
+        // failure path above. Losing the audit trail to a model hiccup was
+        // the whole defect.
+        let (action, source) =
+            match ask(&http, &config, &opts.task, &summary, &history, &shot).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let note = format!("model failed at browser step {index}: {e:#}");
+                    eprintln!("[{index:02}] {note}");
+                    let fail_action = BrowserAction::Fail {
+                        reason: note.clone(),
+                    };
+                    record(&mut log, index, &fail_action, &note)?;
+                    executed_steps += 1;
+                    outcome = BrowserOutcome::Failed(note);
+                    break;
+                }
+            };
         let base_risk = action.risk(Some(&summary.url));
         let risk = if source == ActionSource::Reasoning {
             base_risk.escalate()
@@ -774,6 +791,100 @@ fn chat_body(config: &OpenAiConfig, user_text: &str, image_b64: &str) -> Value {
     })
 }
 
+/// Per-step model attempts (transport and content errors share this budget).
+const MODEL_RETRY_ATTEMPTS: u32 = 3;
+
+/// Appended to the prompt when the previous reply was a content error — the
+/// model, not the network, was the problem, so re-sending the identical body
+/// would plausibly produce the identical reply.
+const REPAIR_NOTE: &str = "NOTE: Your previous reply was not a valid JSON action. Reply with exactly one JSON object and no prose.";
+
+/// How one ask attempt failed.
+enum AskFailure {
+    /// The reply arrived but was unusable (invalid JSON envelope, empty
+    /// content, unparseable action). A re-prompt with the repair note can
+    /// plausibly fix it.
+    Content { class: &'static str, err: String },
+    /// The network or server failed (send error, 5xx, 429). Worth retrying
+    /// with the original body.
+    Transport { err: String },
+    /// Not worth retrying (e.g. HTTP 4xx): the request itself is wrong.
+    Fatal(String),
+}
+
+/// One request/reply round against the model endpoint. Classifies the
+/// failure, if any, so the retry loop can decide between repair-note
+/// retries, plain retries, and giving up.
+async fn ask_once(
+    http: &reqwest::Client,
+    url: &str,
+    config: &OpenAiConfig,
+    body: &Value,
+) -> Result<(BrowserAction, ActionSource), AskFailure> {
+    let result = http
+        .post(url)
+        .bearer_auth(&config.api_key)
+        .json(body)
+        .send()
+        .await;
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => return Err(AskFailure::Transport { err: e.to_string() }),
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let err = format!(
+            "HTTP {status}: {}",
+            text.chars().take(300).collect::<String>()
+        );
+        return if status.is_server_error() || status.as_u16() == 429 {
+            Err(AskFailure::Transport { err })
+        } else {
+            Err(AskFailure::Fatal(err))
+        };
+    }
+    let value: Value = serde_json::from_str(&text).map_err(|e| AskFailure::Content {
+        class: "invalid JSON",
+        err: format!(
+            "invalid JSON: {e}: {}",
+            text.chars().take(300).collect::<String>()
+        ),
+    })?;
+    let message = &value["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or_default();
+    if content.trim().is_empty() {
+        if let Some(reasoning) = message["reasoning"].as_str() {
+            if reasoning.contains("\"action\"") {
+                // Kept, not refused -- but it is a chain of thought, not
+                // something the model decided to say. The caller raises
+                // the tier and logs where the step really came from. A
+                // fallback that fails to parse is a content error like any
+                // other and joins the retry loop.
+                return parse_browser_action(reasoning)
+                    .map(|action| (action, ActionSource::Reasoning))
+                    .map_err(|e| AskFailure::Content {
+                        class: "reasoning parse",
+                        err: format!("reasoning fallback parse failed: {e}"),
+                    });
+            }
+        }
+        return Err(AskFailure::Content {
+            class: "empty content",
+            err: format!(
+                "empty model content: {}",
+                text.chars().take(300).collect::<String>()
+            ),
+        });
+    }
+    parse_browser_action(content)
+        .map(|action| (action, ActionSource::Content))
+        .map_err(|e| AskFailure::Content {
+            class: "action parse",
+            err: e.to_string(),
+        })
+}
+
 async fn ask(
     http: &reqwest::Client,
     config: &OpenAiConfig,
@@ -808,58 +919,37 @@ async fn ask(
         trail
     );
 
-    let body = chat_body(config, &user_text, &b64);
-
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let mut last_err = String::new();
-    for attempt in 0..3u32 {
-        let result = http
-            .post(&url)
-            .bearer_auth(&config.api_key)
-            .json(&body)
-            .send()
-            .await;
-        match result {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    let value: Value = serde_json::from_str(&text)
-                        .map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
-                    let message = &value["choices"][0]["message"];
-                    let content = message["content"].as_str().unwrap_or_default();
-                    if content.trim().is_empty() {
-                        if let Some(reasoning) = message["reasoning"].as_str() {
-                            if reasoning.contains("\"action\"") {
-                                // Kept, not refused -- but it is a chain of thought, not
-                                // something the model decided to say. The caller raises
-                                // the tier and logs where the step really came from.
-                                return parse_browser_action(reasoning)
-                                    .map(|action| (action, ActionSource::Reasoning));
-                            }
-                        }
-                        return Err(anyhow::anyhow!(
-                            "empty model content: {}",
-                            text.chars().take(300).collect::<String>()
-                        ));
-                    }
-                    return parse_browser_action(content)
-                        .map(|action| (action, ActionSource::Content));
-                }
-                last_err = format!(
-                    "HTTP {status}: {}",
-                    text.chars().take(300).collect::<String>()
+    let mut content_error = false;
+    for attempt in 0..MODEL_RETRY_ATTEMPTS {
+        // Transport retries keep the original body; content retries append
+        // the repair note — the previous reply, not the network, was wrong.
+        let body = if attempt > 0 && content_error {
+            chat_body(config, &format!("{user_text}\n\n{REPAIR_NOTE}"), &b64)
+        } else {
+            chat_body(config, &user_text, &b64)
+        };
+        match ask_once(http, &url, config, &body).await {
+            Ok(pair) => return Ok(pair),
+            Err(AskFailure::Fatal(err)) => bail!("{err}"),
+            Err(AskFailure::Content { class, err }) => {
+                content_error = true;
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    class,
+                    reply = %err,
+                    "model reply unusable; retrying with repair note"
                 );
-                if !(status.is_server_error() || status.as_u16() == 429) || attempt == 2 {
-                    bail!("{last_err}");
-                }
+                last_err = format!("[{class}] {err}");
             }
-            Err(e) => {
-                last_err = e.to_string();
-                if attempt == 2 {
-                    bail!("{last_err}");
-                }
+            Err(AskFailure::Transport { err }) => {
+                content_error = false;
+                last_err = err;
             }
+        }
+        if attempt + 1 == MODEL_RETRY_ATTEMPTS {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(700 * 2u64.pow(attempt))).await;
     }
@@ -1435,5 +1525,197 @@ mod tests {
             outcome_shot.summary(1),
             "failed: screenshot failed: browser closed"
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Loopback model endpoint: replies with the (status, body) pairs in
+    /// order — the last pair repeats forever. Counts requests and records
+    /// their bodies so tests can assert on the repair note.
+    fn loopback_model(
+        responses: Vec<(u16, String)>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (c, b) = (count.clone(), bodies.clone());
+        std::thread::spawn(move || {
+            let responses = responses;
+            for (served, stream) in listener.incoming().flatten().enumerate() {
+                let mut stream = stream;
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        _ => {}
+                    }
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head_text = String::from_utf8_lossy(&head).to_string();
+                let len: usize = head_text
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 {
+                    stream.read_exact(&mut body).ok();
+                }
+                c.fetch_add(1, Ordering::SeqCst);
+                b.lock()
+                    .expect("lock")
+                    .push(String::from_utf8_lossy(&body).to_string());
+                let (status, text) = responses
+                    .get(served.min(responses.len() - 1))
+                    .cloned()
+                    .unwrap_or((500, "{\"error\":\"exhausted\"}".into()));
+                let http = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                );
+                stream.write_all(http.as_bytes()).ok();
+            }
+        });
+        (format!("http://{addr}/v1"), count, bodies)
+    }
+
+    fn config(base: String) -> OpenAiConfig {
+        OpenAiConfig {
+            api_key: "test".into(),
+            base_url: base,
+            model: "test-model".into(),
+            max_tokens: 100,
+        }
+    }
+
+    fn page() -> PageSummary {
+        PageSummary {
+            url: "https://example.com".into(),
+            title: "Example".into(),
+            text: String::new(),
+            ax: String::new(),
+        }
+    }
+
+    fn legal_reply() -> String {
+        r#"{"choices":[{"message":{"content":"{\"action\":\"done\",\"summary\":\"ok\"}"}}]}"#.into()
+    }
+
+    /// ① First reply is not JSON, second is a legal action: exactly two
+    /// requests, the second carries the repair note, the action lands.
+    #[tokio::test]
+    async fn content_error_is_retried_with_repair_note_then_succeeds() {
+        let (base, count, bodies) = loopback_model(vec![
+            (200, "oops, not a json envelope".into()),
+            (200, legal_reply()),
+        ]);
+        let http = reqwest::Client::new();
+        let shot = vec![0u8; 16];
+        let (action, source) = ask(&http, &config(base), "t", &page(), &[], &shot)
+            .await
+            .expect("second attempt must succeed");
+        assert_eq!(count.load(Ordering::SeqCst), 2, "exactly one retry");
+        assert!(matches!(source, ActionSource::Content));
+        assert!(matches!(action, BrowserAction::Done { .. }));
+        let sent = bodies.lock().expect("lock");
+        assert_eq!(sent.len(), 2);
+        assert!(
+            !sent[0].contains("NOTE:"),
+            "the first body is the original prompt"
+        );
+        assert!(
+            sent[1].contains("NOTE: Your previous reply was not a valid JSON action"),
+            "the retry body must carry the repair note"
+        );
+    }
+
+    /// ② A persistently invalid reply exhausts the budget: exactly three
+    /// requests, then an error that names the content class.
+    #[tokio::test]
+    async fn persistent_content_error_exhausts_three_attempts() {
+        let (base, count, _) = loopback_model(vec![(200, "still not json".into())]);
+        let http = reqwest::Client::new();
+        let shot = vec![0u8; 16];
+        let err = ask(&http, &config(base), "t", &page(), &[], &shot)
+            .await
+            .expect_err("budget exhaustion must be an error");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(err.to_string().contains("[invalid JSON]"), "err: {err}");
+    }
+
+    /// ③ A 5xx is still a transport retry with the original body (no repair
+    /// note injected when the network, not the reply, was the problem).
+    #[tokio::test]
+    async fn transport_error_retries_the_original_body() {
+        let (base, count, bodies) = loopback_model(vec![
+            (500, "{\"error\":\"boom\"}".into()),
+            (200, legal_reply()),
+        ]);
+        let http = reqwest::Client::new();
+        let shot = vec![0u8; 16];
+        let (action, _) = ask(&http, &config(base), "t", &page(), &[], &shot)
+            .await
+            .expect("retry after 5xx must succeed");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(matches!(action, BrowserAction::Done { .. }));
+        let sent = bodies.lock().expect("lock");
+        assert!(
+            !sent[1].contains("NOTE:"),
+            "transport retry keeps the original body"
+        );
+    }
+
+    /// ④ Run-level: a persistently failing model ends the run as a Failed
+    /// outcome with outcome.json and a Fail step record — not a crashed task.
+    #[tokio::test]
+    #[ignore = "real-machine: needs a real Chromium over CDP; run on innoforge for E2E evidence"]
+    async fn persistent_model_failure_writes_failed_outcome_and_audit_trail() {
+        let (base, count, _) = loopback_model(vec![(200, "still not json".into())]);
+        let run_dir = std::env::temp_dir().join(format!("retry-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        // Point the config source of truth at the loopback endpoint.
+        std::env::set_var("CUA_HUB_OPENAI_BASE_URL", &base);
+        std::env::set_var("OPENAI_API_KEY", "test");
+        std::env::set_var("CUA_HUB_MODEL", "test-model");
+        let report = run_task(BrowserRunOptions {
+            task: "open example.com".into(),
+            max_steps: 2,
+            dry_run: false,
+            model: Some("test-model".into()),
+            headed: false,
+            start_url: None,
+            run_dir: Some(run_dir.clone()),
+            screenshot_quality: 50,
+            max_tokens: Some(100),
+            ..Default::default()
+        })
+        .await
+        .expect("run_task must not error on model failure");
+        assert!(matches!(report.outcome, BrowserOutcome::Failed(_)));
+        assert!(count.load(Ordering::SeqCst) >= 3);
+        let outcome = std::fs::read_to_string(run_dir.join("outcome.json")).expect("outcome.json");
+        assert!(
+            outcome.contains("model failed at browser step"),
+            "outcome: {outcome}"
+        );
+        let steps = std::fs::read_to_string(run_dir.join("steps.jsonl")).expect("steps.jsonl");
+        assert!(steps.contains("\"Fail\""), "terminal Fail record: {steps}");
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }

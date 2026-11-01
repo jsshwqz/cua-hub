@@ -6,6 +6,10 @@
 
 ## Unreleased — 已合入分支，尚未发版
 
+### 浏览器 agent 的模型错误重试与审计保全
+
+模型回错一次不再整轮中止：非法 JSON、空回复、动作解析失败三类内容错误与传输错误共用每步 3 次的有界重试（退避 700ms×2^attempt），内容重试自动附加修复提示让模型改答；重试耗尽本轮以 `Failed` 终态收场——steps.jsonl 有终态 Fail 记录、outcome.json 正常落盘（此前 outcome.json 缺失、审计链断）。每次重试记 warn（第几次、错误类、截断回复原文）。推理回退、4xx 不重试等既有语义不变。
+
 ### 注册表接进 agent loop：`run_task` / `run --ui-elements`（#18 P1-1 接线）
 
 `ui_elements` 开关（默认 **false**，现有行为零变化）给 vision 每步附带**统一元素注册表**：
