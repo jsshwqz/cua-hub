@@ -749,6 +749,12 @@ enum SnapshotAttempt {
     CoordinateOnly {
         retried: bool,
         reason: String,
+        /// Batch #54: a 0-node snapshot can still carry a ledger (the frozen
+        /// window's root answered nothing else). Dropping it here made
+        /// window_state's degraded form the ONE place a caller could see
+        /// "tree unavailable" without learning what went unread — the exact
+        /// inconsistency the innoforge real-machine audit flagged.
+        unreadable: Vec<cua_engine_access::Unreadable>,
     },
 }
 
@@ -757,6 +763,7 @@ where
     F: FnMut() -> cua_core::Result<cua_engine_access::UiSnapshot>,
     R: FnMut(),
 {
+    let mut first_unreadable = Vec::new();
     let first_reason = match fetch() {
         Ok(snap) if !snap.nodes.is_empty() => {
             return SnapshotAttempt::Available {
@@ -764,7 +771,10 @@ where
                 retried: false,
             };
         }
-        Ok(_) => "accessibility snapshot returned 0 nodes".to_string(),
+        Ok(snap) => {
+            first_unreadable = snap.unreadable;
+            "accessibility snapshot returned 0 nodes".to_string()
+        }
         Err(e) => e.to_string(),
     };
 
@@ -775,18 +785,30 @@ where
             snapshot: snap,
             retried: true,
         },
-        Ok(_) => SnapshotAttempt::CoordinateOnly {
+        Ok(snap) => SnapshotAttempt::CoordinateOnly {
             retried: true,
             reason: format!("{first_reason}; retry also returned 0 nodes"),
+            // The retry's ledger is the live one; fall back to the first
+            // attempt's when the retry came back ledger-less.
+            unreadable: if snap.unreadable.is_empty() {
+                first_unreadable
+            } else {
+                snap.unreadable
+            },
         },
         Err(e) => SnapshotAttempt::CoordinateOnly {
             retried: true,
             reason: format!("{first_reason}; retry failed: {e}"),
+            unreadable: Vec::new(),
         },
     }
 }
 
-fn coordinate_only_accessibility(retried: bool, reason: &str) -> Value {
+fn coordinate_only_accessibility(
+    retried: bool,
+    reason: &str,
+    unreadable: &[cua_engine_access::Unreadable],
+) -> Value {
     let notice = if retried {
         format!(
             "accessibility tree unavailable after 1 retry (rebuilt client and refocused window: {reason}); degraded to coordinate-only mode"
@@ -794,14 +816,34 @@ fn coordinate_only_accessibility(retried: bool, reason: &str) -> Value {
     } else {
         format!("accessibility tree disabled ({reason}); operating in coordinate-only mode")
     };
-    json!({
+    let mut out = json!({
         "mode": "coordinate-only",
         "available": false,
         "retried": retried,
         "node_count": 0,
         "reason": reason,
         "notice": notice,
-    })
+    });
+    // Same ledger contract as accessibility_tree (PR #28): seeing this list
+    // means "here is exactly what went unread", never "the tree is complete".
+    if !unreadable.is_empty() {
+        if let Some(map) = out.as_object_mut() {
+            map.insert(
+                "unreadable".into(),
+                json!(unreadable
+                    .iter()
+                    .map(|u| {
+                        json!({
+                            "bus": u.bus,
+                            "path": u.path,
+                            "reason": u.reason,
+                        })
+                    })
+                    .collect::<Vec<_>>()),
+            );
+        }
+    }
+    out
 }
 
 fn related_title_summaries(related: &[cua_io::WindowInfo]) -> Vec<Value> {
@@ -3150,12 +3192,14 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                         }
                         acc
                     }
-                    SnapshotAttempt::CoordinateOnly { retried, reason } => {
-                        coordinate_only_accessibility(retried, &reason)
-                    }
+                    SnapshotAttempt::CoordinateOnly {
+                        retried,
+                        reason,
+                        unreadable,
+                    } => coordinate_only_accessibility(retried, &reason, &unreadable),
                 }
             } else {
-                coordinate_only_accessibility(false, "include_text=false")
+                coordinate_only_accessibility(false, "include_text=false", &[])
             };
             if let Some(map) = accessibility.as_object_mut() {
                 if !map.contains_key("related") && !related_titles.is_empty() {
@@ -5171,9 +5215,13 @@ mod tests {
         assert_eq!(fail_attempts, 2);
         assert_eq!(fail_recovered, 1);
         match degraded {
-            SnapshotAttempt::CoordinateOnly { retried, reason } => {
+            SnapshotAttempt::CoordinateOnly {
+                retried,
+                reason,
+                unreadable,
+            } => {
                 assert!(retried);
-                let payload = coordinate_only_accessibility(retried, &reason);
+                let payload = coordinate_only_accessibility(retried, &reason, &unreadable);
                 assert!(
                     !payload.is_null(),
                     "accessibility must never be silent null"
@@ -5185,9 +5233,60 @@ mod tests {
                     .as_str()
                     .unwrap_or_default()
                     .contains("coordinate-only"));
+                // An Err-path degradation carries no ledger (there was no
+                // snapshot to keep one from).
+                assert!(payload.get("unreadable").is_none());
             }
             other => panic!("expected coordinate-only fallback, got {other:?}"),
         }
+    }
+
+    /// Batch #54: a 0-node snapshot from a frozen window still carries a
+    /// ledger — the degradation must keep it, exactly like accessibility_tree
+    /// does, so window_state never says "tree unavailable" while hiding what
+    /// went unread.
+    #[test]
+    fn degraded_coordinate_only_keeps_the_unreadable_ledger() {
+        let ledger = vec![cua_engine_access::Unreadable {
+            bus: ":1.3".into(),
+            path: "/org/a11y/atspi/accessible/root".into(),
+            reason: "no reply within 1200ms".into(),
+        }];
+        let mut attempts = 0usize;
+        let degraded = snapshot_with_retry(
+            || {
+                attempts += 1;
+                Ok(cua_engine_access::UiSnapshot {
+                    nodes: Vec::new(),
+                    truncated: false,
+                    unreadable: ledger.clone(),
+                })
+            },
+            || {},
+        );
+        match degraded {
+            SnapshotAttempt::CoordinateOnly {
+                retried,
+                reason,
+                unreadable,
+            } => {
+                assert!(retried);
+                assert!(
+                    reason.contains("retry also returned 0 nodes"),
+                    "reason: {reason}"
+                );
+                assert_eq!(unreadable.len(), 1, "ledger must survive degradation");
+                assert_eq!(unreadable[0].path, "/org/a11y/atspi/accessible/root");
+                let payload = coordinate_only_accessibility(retried, &reason, &unreadable);
+                assert_eq!(payload["unreadable"][0]["bus"], ":1.3");
+                assert_eq!(
+                    payload["unreadable"][0]["path"],
+                    "/org/a11y/atspi/accessible/root"
+                );
+            }
+            other => panic!("expected coordinate-only degradation, got {other:?}"),
+        }
+        assert_eq!(attempts, 2, "both attempts saw the frozen window");
     }
 
     #[test]
