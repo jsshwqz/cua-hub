@@ -252,3 +252,24 @@
   CI 每场景配一对：预算 1 必须报"没走到"、默认预算必须成功——红绿因此只归因于预算本身。
   已知同类未修：`find_control` 的 400/8 仍是写死的，它返回 `None` 时同样分不清这两种情况。
 - [ ] 连续感知层（帧流 / 变化检测 / ROI / 本地 CV-OCR / 稳定 ID 场景图）——用户明确"暂不做"
+
+## Phase 5 — 架构闭环与全链路归一（2026-11-02，已发布 v0.1.7）
+
+- [x] 视觉元素解析能力链（P1-1 B1-B4）：
+  - 契约规范（`cua-engine-perception`）：`ElementTable`、无坐标 `model_view()` 结构性保证、点阵 SoM 渲染。
+  - 包含感知 IoU 几何合并：重叠保留小框、文字并入图标、假阳性丢弃。
+  - 多后端 OCR 支持：Windows 原生 `Windows.Media.Ocr`（零依赖毫秒级）+ Linux `tesseract` CLI 纯函数解析。
+  - 双源统一注册表：无障碍控件优先、无名按钮 OCR 增强、阅读序编号、相关性关键词智能裁剪。
+- [x] 智能体循环工具面接线：
+  - `run_task` / `start_task` / `orchestrate` / CLI `run` 新增 `--ui-elements` 原生支持。
+  - 运行时当帧图像零成本复用 OCR、无坐标纯文本提示词注入。
+- [x] 读动编号彻底归一（PR #60）：
+  - `ui_elements` 呈现编号与 `window_state` 的 `element_index` 严格统一，彻底消灭二元映射错位。
+  - 按窗口隔离分段（`# window`），纯视觉未吸收元素以 `- text` 无编号哨兵行渲染。
+- [x] 浏览器引擎高可用与模型错误重试（PR #55）：
+  - 遇到非 JSON、空回复或动作解析失败时进行有界带退避重试，自动附带修复提示。
+  - 重试耗尽以 `Failed` 终态收尾，保全 `steps.jsonl` 与 `outcome.json` 审计链条。
+- [x] 审计与一致性补全：
+  - `window_state` 装死窗口降级模式保留 `unreadable` 审计账本（#54）。
+  - 全套 GitHub Actions CI 自动依赖更新与转公开后的自动化构建验证恢复。
+

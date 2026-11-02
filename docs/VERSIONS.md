@@ -1,14 +1,36 @@
-# 仓库内的版本对照
+# 仓库内的版本对照与演进历史
 
-当前仓库有三个并行版本（分支），定位不同：
+本文档记录仓库内历史分支的定位对照，以及 `main` 主干从 `0.1.3` 到 `0.1.7` 的核心版本演进里程碑。
 
-| 版本 | 位置 | 定位 | 主要特征 |
-|------|------|------|----------|
-| **cua-hub** | `main` | 主力实现（持续维护） | 五引擎（Vision/Code/Access/Browser/Code-Exec）、跨引擎编排、失败重试/重规划、MCP 38 工具（stdio + HTTP）、回放、Windows/Linux CI |
-| **cua-mcp** | `muse-vm-phase0-1` | 独立谱系的运行时实现 | 常驻剪贴板、鼠标/按键按住与释放、screen_info、坐标越界校验、DryRun/Supervised/Autonomous 围栏、cua-web 与 cua-bench 骨架、Windows release 流水线 |
-| **CUA-Forge** | `gemini-cua-forge` 的 `cua-forge/` | Gemini 生成的单文件迷你实现 | xcap + enigo，HTTP `:3030` 与自定义 stdio（非标准 MCP）；仅 move/click/type |
+---
 
-## 取长补短记录
+## 1. 历史并行分支对照
+
+当前仓库主要分支与原型定位：
+
+| 版本 | 分支 / 路径 | 定位 | 主要特征 |
+| :--- | :--- | :--- | :--- |
+| **cua-hub** | `main` | **主力生产实现（持续演进）** | 五大引擎全栈编排、失败重试与动态重规划、MCP 38 原语工具集（stdio + HTTP）、确定性回放、Windows / Ubuntu 双平台 CI 自动化构建。 |
+| **cua-mcp** | `muse-vm-phase0-1` | 独立谱系原型运行时 | 探索了常驻剪贴板、键鼠保持与释放、`screen_info`、坐标越界校验等原语，技术成果已被 `main` 完全吸收。 |
+| **CUA-Forge** | `cua-forge/` | 探索性轻量单文件原型 | 基于 xcap + enigo 的微型原型，仅提供基础 move/click/type 原语，用于快速验证极简无头场景。 |
+
+---
+
+## 2. 主干里程碑演进 (Release History)
+
+`cua-hub` 主干遵循语义化版本控制，各里程碑技术演进如下：
+
+| 版本 | 发布日期 | 核心技术里程碑与重大特性 |
+| :--- | :--- | :--- |
+| **v0.1.7** | 2026-11-02 | **读动编号归一与视觉解析收官**：<br>· 新增 `cua-engine-perception` 感知引擎：SoM 标注、包含感知 IoU 几何去重、双后端 OCR 支持。<br>· 读动编号彻底归一：感知注册表编号与 `window_state` `element_index` 严格同源对齐。<br>· 浏览器引擎模型错误有界重试与 `Failed` 终态审计保全。<br>· `window_state` 装死窗口降级保留 `unreadable` 审计账本（#54）。 |
+| **v0.1.6** | 2026-10-25 | **精准身份寻址与动作回读裁决**：<br>· `target` 严格身份寻址（支持正则与 AutomationId，歧义强制阻断）。<br>· 动作效果回读裁决机制（`changed` / `unchanged` / `unverifiable`）。<br>· 物理按键保持泄漏双重防御（意图登记 + OS 状态扫描对账）。<br>· 浏览器 CDP 增强：内联滚动自动化、同源 iframe 深度穿透与光标移动指示。 |
+| **v0.1.5** | 2026-10-23 | **确认链防绕过与协议防腐**：<br>· 严格三级风险网闸与二次确认链，消除白名单逃逸漏洞（#8）。<br>· 修复 Anthropic 会话解析失败导致的毒化中断（#9）。<br>· 浏览器进程拉起安全守卫（LaunchGuard 避免幽灵进程泄漏，#10）。 |
+| **v0.1.4** | 2026-10-23 | **观测提速与 Linux AT-SPI 原生支持**：<br>· Linux AT-SPI D-Bus 直接通信，支持按进程 PID 查找窗口与控件。<br>· 桌面级 UIA 缓存请求优化（遍历耗时从 36s 优化至 0.7s）。<br>· `steps.jsonl` 记录坐标缩放比率，支持跨 DPI 确定性重放。 |
+| **v0.1.3** | 2026-10-23 | **观测契约确立与 MCP 全功能开放**：<br>· 确立 `window_state` 作为主观测原语，支持增量 diff 与弹层窗口捕获。<br>· 吸收 `cua-mcp` 的常驻剪贴板、鼠标长按/释放、`screen_info` 与物理越界保护。 |
+
+---
+
+## 3. 历史并入与演进记录
 
 2026-10-21 从 `muse-vm-phase0-1` 并入 `main`：
 
@@ -17,14 +39,14 @@
 - `screen_info`（主屏尺寸、原点、DPI、光标位置）
 - 坐标越界校验：指向类动作在执行前拒绝屏幕外坐标
 
-未并入：
+未并入项：
+- `gemini-cua-forge` 的非标准 stdio 协议（与 MCP 规范不兼容）
+- `muse` 的 `cua-web` / `cua-bench` 骨架代码
+- `muse` 的三档粗粒度模式（`main` 采用了更精确细致的参数形态分级与 `--allow-high` 网闸机制）
 
-- `gemini-cua-forge` 的非标准 stdio 协议（与 MCP 不兼容，没有集成价值）
-- `muse` 的 `cua-web` / `cua-bench`（仅骨架，尚未实现）
-- `muse` 的三档运行模式（`main` 使用更细的风险分级 + `--allow-high`，语义等价且更严格）
+---
 
-## 选择建议
+## 4. 选型指南
 
-- 需要完整能力、跨平台与持续维护：用 `main`
-- 只想要一个更小的 MCP 运行时、且偏好其围栏模型：参考 `muse-vm-phase0-1`
-- 学习最小实现：看 `gemini-cua-forge`，不建议直接部署
+- **生产与深度集成**：统一使用 `main` 分支（即最新发布的 Release 版本），具备完整的 5 引擎协同、完善的 MCP 工具集与严格的安全保证。
+- **极简原型研究**：参考 `cua-forge/`，了解最小化屏幕捕获与动作注入的基本形态。

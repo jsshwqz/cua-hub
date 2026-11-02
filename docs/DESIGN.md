@@ -373,6 +373,100 @@ instead of a stray click. These four pieces (clipboard, hold/release,
 screen_info, bounds checks) were ported from the `muse-vm-phase0-1` branch; see
 `docs/VERSIONS.md`.
 
+## Dual-layer key hold protection (`hold.rs`)
+
+A critical hazard in automated desktop control is modifier key leakage (e.g.,
+an agent presses Shift/Ctrl to select text or drag, then the runner panics,
+crashes, or cancels before releasing). If a modifier remains physically held,
+subsequent clicks become multi-selects and typing turns into hotkey triggers,
+ruining the machine's state.
+
+`cua-io` implements a two-layer protection mechanism:
+
+1. **Layer 1: Intent Registry** (`mark_intentional` / `clear_intentional`).
+   The input injection chain in `input.rs` registers every intended press and
+   clears the mark only when the release successfully completes. The process
+   maintains an in-memory ground truth of which keys it legitimately holds.
+2. **Layer 2: OS Physical Sweep** (`hold.rs::stuck_plan` / `release_stuck`).
+   On Windows, `GetAsyncKeyState` queries the actual physical hardware state of
+   all virtual keys. The difference set `(Physical Down) - (Intentional Down)`
+   represents orphaned / leaked keys. `release_stuck` automatically generates
+   and executes synthetic key-up events to restore keyboard hygiene without
+   disrupting keys legitimately held by a human operator. On Linux, if OS-level
+   querying is unsupported, it returns `Down::Unknown` rather than fabricating
+   false assurance.
+
+## Visual perception & grounding (`cua-engine-perception`)
+
+To bridge the gap between pixel coordinates and semantic accessibility trees,
+the perception crate introduces an OmniParser/UFO-inspired pipeline:
+
+```
+Screenshot ──┬─► OCR Backend (Media.Ocr / Tesseract) ──► OcrBox (confidence floor) ┐
+             │                                                                   ├─► merge_access_and_ocr
+             └─► UIA / AT-SPI Tree (snapshot_window) ──► AccessElement (address) ┘        │
+                                                                                          ▼
+                                                                             Unified ElementTable
+                                                                           (Sorted by Reading Order)
+                                                                                          │
+                                                  ┌───────────────────────────────────────┴───────────────────────────────────────┐
+                                                  ▼                                                                               ▼
+                                         render_som() (Annotated PNG)                                                   to_model_text() (Zero-Coordinate Prompt)
+```
+
+1. **Structural Zero-Coordinate Contract**:
+   `ElementTable::model_view` and `to_model_text` contain **no coordinates by construction**.
+   The model only sees stable element numbers and semantic content. Coordinates are looked up
+   internally by the engine upon action dispatch. Coordinates never touch the model's output context.
+2. **Containment-Aware Geometric Merge (`merge.rs`)**:
+   Ported from OmniParser's `remove_overlap_new`:
+   - Containment IoU is `max(standard IoU, intersection/area1, intersection/area2)`.
+   - Overlapping icon boxes keep the smaller box; larger duplicates are pruned.
+   - Text boxes inside icon boxes (≥80% containment) are absorbed: text becomes the icon's
+     `content` with `source = Merge`, eliminating standalone redundant boxes.
+   - Icons mostly inside text boxes are discarded as detector false-positives.
+3. **Pluggable Multi-Backend OCR (`ocr/`)**:
+   - Windows: native `Windows.Media.Ocr` (zero dependencies, offline, millisecond latency).
+   - Linux: `tesseract` CLI speaking TSV on stdin/stdout (pure parser function, robust error isolation).
+   - SOC defect fixes: ambiguous hits return candidate lists ordered by confidence instead of blindly
+     taking the last hit; low-confidence detections are pruned before downstream consumption;
+     missing text returns an empty value rather than unwinding via an exception.
+
+## Unified numbering architecture (读动编号归一)
+
+In earlier iterations, the accessibility engine provided `element_index` scoped to windows,
+while the perception engine independently assigned `1..=n` indices in visual reading order.
+This duality imposed translation overhead and led to cross-system indexing bugs.
+
+In `v0.1.7`, the numbering systems are formally unified:
+
+* **Single Source of Truth**: The runner's `ui_elements` pipeline now takes **per-window snapshots**
+  via `cua_engine_access::snapshot_window` and indexes them through `elements.rs::observe_group(window_id)`.
+  This is the exact same engine and scope key `window_state` uses.
+* **Deterministic Identity**: A UI control seen in the prompt's element registry carries the **exact same
+  number** as its `element_index` in `window_state`. An agent can observe a control in the registry
+  and directly invoke it using that ID.
+* **Per-Window Scope Segmentation**: The rendered prompt is segmented by window (`# window <id> "<title>"`),
+  eliminating cross-window ID collisions by construction.
+* **Unaddressable Visual Sentinels (`id = 0`)**: Purely visual elements (unabsorbed OCR text) receive
+  `id = 0` and render as `- text "..."` lines without brackets. They convey visual information without
+  tempting the model to invoke an invalid index.
+* **Index Preservation Across Trimming**: `filter_relevant` prunes dense registries based on task keywords
+  while strictly preserving original element IDs, eliminating renumbering drift.
+
+## Action verification & effect verdicts
+
+To prevent silent failures (e.g., an automated click registers in the OS but fails to activate a dynamic
+UI widget), `cua-hub` employs active effect verification:
+
+* `changed`: Target state verified to have altered (e.g., Checkbox toggled, input text updated, menu expanded).
+* `unchanged`: The command executed successfully, but target state or screen fingerprint remained identical.
+  Signals the agent to adopt an alternative selector or fallback approach.
+* `unverifiable`: Controls lacking readable state patterns (e.g., plain buttons without state bits) report
+  unverifiable, instructing the model to corroborate via visual observation rather than assuming success.
+* `type_text` validates whether the focused control actually contains the intended characters rather
+  than simply counting synthetic key strokes dispatched.
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

@@ -1,295 +1,260 @@
 # cua-hub
 
-Rust 多引擎 Computer Use Agent 编排平台。
+<p align="center">
+  <strong>面向智能体（Agent）的多引擎计算机操控系统（Computer Use Operating System）</strong>
+</p>
 
-> 不做新的 Agent 模型，做 Agent 的"操作系统"。
+<p align="center">
+  <a href="https://github.com/jsshwqz/cua-hub/releases/latest"><img src="https://img.shields.io/badge/release-v0.1.7-blue.svg" alt="Latest Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
+  <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-passing-brightgreen.svg" alt="CI Status"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg" alt="Platform Support">
+  <img src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg" alt="Rust Version">
+  <img src="https://img.shields.io/badge/protocol-MCP%20Enabled-purple.svg" alt="Model Context Protocol">
+</p>
 
-同一个任务入口，底层可切换视觉模型（Claude / GPT / 本地 UI-TARS）、
-无障碍树、浏览器、脚本执行等不同引擎，按场景自动路由。
+---
 
-## 状态
+## 核心理念
 
-Phase 2 进行中，Windows 真机验证：
+> **不做新的 Agent 基础模型，做面向 Agent 的计算机操控“操作系统”。**
 
-- **视觉引擎**：截图 → 模型决策 → 点击/按键 → 复核截图（含 125% DPI 坐标换算）
-- **代码引擎**：模型生成单条 PowerShell/sh 命令并读取输出（只读任务比视觉快两个数量级）
-- **无障碍树**：Windows UIA 与 Linux AT-SPI2 快照 + 按名查找（Linux 在 WSL/GTK3 真机验证）
-- **混合上下文**：`--ui-tree` 把浅层无障碍树与截图一起喂给视觉模型
-- **浏览器引擎**：隔离 profile 拉起 Chrome/Edge，CDP 驱动导航/点击/输入/滚动/等待/多标签；同源 iframe 内可定位；附带无障碍树作为模型上下文
-- **跨引擎编排**：一句话拆成 browser→code→vision 计划，前一步结果用 `{{name}}` 注入后一步
-- **失败恢复**：同引擎带错误重试（自动加预算），仍失败则重新规划并换引擎，两条路径均已真机验证
-- **动作校验**：桌面动作后比对屏幕指纹，没变化会在步骤记录里提示模型换方法
-- **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
+大模型缺乏稳定的计算机交互原语：纯视觉常有幻觉坐标、无障碍树常遇无名控件、网页自动化容易被 iframe 遮蔽、命令执行容易遭遇未授权越权。
 
-## 平台支持
+`cua-hub` 提供统一的编排层与底层操作系统抽象：同一个自然语言或自动化入口，由系统在**视觉（Vision）**、**无障碍树（Access）**、**浏览器（Browser）**、**确定性脚本（Code）**与**结构化感知（Perception）**之间智能调度与互补协同。对外提供标准 **Model Context Protocol (MCP)** 服务与统一命令行界面。
 
-| 平台 | 架构 | 状态 |
-|------|------|------|
-| Windows | x64 | ✅ 真机验证 |
-| Linux | x64 | ✅ 真机验证（Ubuntu 24.04） |
-| macOS | x64（Intel） | ⚠️ CI 构建，尚未真机验证 |
-| macOS | ARM64（Apple Silicon） | ⚠️ CI 构建，尚未真机验证 |
+---
 
-Release 页面提供各平台预构建包。macOS 包由 GitHub Actions 自动构建，
-欢迎 macOS 用户反馈实测结果。
+## 系统架构
 
-## 引擎
-
-| 引擎 | 触发方式 | 适合 |
-|------|----------|------|
-| Vision | 默认 / `--engine vision` | 未知 GUI、跨应用操作 |
-| Code | 任务含"命令/脚本/磁盘空间/进程列表…"或 `--engine code` | 确定性数据获取、批处理 |
-| Browser | 任务含 URL / "浏览器/网页"，或 `cua-hub browser` | 网页读取、点击、表单、滚动、多标签、同源 iframe |
-| Access | 任务含"无障碍/accessibility/uia/at-spi/控件" | 精确控件操作 |
-
-## 快速开始
-
-```bash
-cargo build --release
-./target/release/cua-hub doctor
-
-# Anthropic 原生 computer use
-export ANTHROPIC_API_KEY=sk-ant-...
-./target/release/cua-hub run "打开记事本输入 hello world" --yes
-
-# 任意 OpenAI 兼容网关（OpenRouter / OpenAI / Ollama / vLLM）
-export OPENROUTER_API_KEY=sk-or-...
-./target/release/cua-hub run "打开开始菜单" --yes \
-  --model "minimax/minimax-m3.1-flash:free"
-
-# 命令类任务自动走代码引擎
-./target/release/cua-hub run "查看 C 盘剩余空间" --yes \
-  --model "minimax/minimax-m3.1-flash:free"
-
-# 含 URL 的任务自动走浏览器引擎（headless，隔离 profile）
-./target/release/cua-hub run "打开 https://example.com 并告诉我页面标题" \
-  --model "minimax/minimax-m3.1-flash:free"
-
-# 也可以显式进入浏览器模式并指定起始页
-./target/release/cua-hub browser "点击 More information 并告诉我新标题" \
-  --start-url https://example.com --headed
-
-# 跨引擎：浏览器取数据，代码/桌面使用数据
-./target/release/cua-hub orchestrate \
-  "打开 https://example.com 读取页面标题，然后用命令打印出这个标题" \
-  --model "minimax/minimax-m3.1-flash:free"
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            接入层 (Presentation Layer)                      │
+│      CLI (`cua-hub`)    │    Web Console (`:8787`)    │    MCP Server (Stdio/HTTP)  │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+┌──────────────────────────────────────▼──────────────────────────────────────┐
+│                       跨引擎调度与策略网闸 (`cua-router`)                    │
+│   · 意图规则路由 (Task Shape Scoring)        · 跨引擎变量流水线 (Orchestrator)     │
+│   · 故障降级与重规划 (Retry & Re-plan)       · 三级风险确认门禁 (Risk Gate)        │
+└──────┬───────────────────┬──────────────────────┬────────────────────┬──────┘
+       │                   │                      │                    │
+┌──────▼──────┐     ┌──────▼──────┐        ┌──────▼──────┐      ┌──────▼──────┐
+│ 视觉驱动引擎 │     │  浏览器引擎  │        │ 系统代码引擎 │      │  无障碍引擎  │
+│ cua-engine- │     │ cua-engine- │        │ cua-engine- │      │ cua-engine- │
+│   vision    │     │   browser   │        │    code     │      │   access    │
+│ (Anthropic/ │     │ (CDP协议/   │        │ (PowerShell/│      │ (Win UIA /  │
+│  OpenAI/    │     │ 隔离环境/   │        │  Bash快速   │      │ Linux AT-SPI│
+│  本地 VLM)  │     │ 回读裁决)   │        │  脚本执行)  │      │ 深度快照)   │
+└──────┬──────┘     └──────┬──────┘        └──────┬──────┘      └──────┬──────┘
+       │                   │                      │                    │
+┌──────┴───────────────────┴──────────────────────┴────────────────────┴──────┐
+│                      视觉解析与结构化感知 (`cua-engine-perception`)          │
+│   · Set-of-Mark 标记渲染     · 包含感知 IoU 几何去重     · 跨引擎读动编号归一体系 │
+│   · 多后端 OCR (Media.Ocr / Tesseract)        · 树与视觉双源统一注册表        │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+┌──────────────────────────────────────▼──────────────────────────────────────┐
+│                        基础运行与平台底层 (`cua-core` / `cua-io`)             │
+│   · 统一 Action/Observation 模型              · 窗口全景/被遮挡捕获 (WGC/PrintWin)   │
+│   · 进程级互斥输入注入 (Enigo)                · 物理卡键对账与防泄漏扫场 (Hold/Sweep)│
+│   · 屏幕物理坐标与 DPI 自动折算               · 常驻剪贴板上下文管理 (Arboard)       │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 命令
+---
 
-| 命令 | 说明 |
-|------|------|
-| `cua-hub doctor` | 检查屏幕/输入/模型配置 |
-| `cua-hub capture out.png` | 截取主屏 |
-| `cua-hub click X Y` | 按物理坐标点击（调试/脚本用） |
-| `cua-hub key "ctrl+esc"` | 发送按键组合 |
-| `cua-hub tree --depth 2` | 打印无障碍树（Windows UIA / Linux AT-SPI） |
-| `cua-hub find "开始"` | 按无障碍名称查找控件并输出矩形 |
-| `cua-hub invoke "开始"` | 按名称找到控件并点击其中心 |
-| `cua-hub run "<task>"` | 执行任务（默认视觉引擎） |
-| `cua-hub run "<task>" --dry-run` | 只规划一步，不操作机器 |
-| `cua-hub run "<task>" --provider openai` | 强制使用 OpenAI 兼容网关 |
-| `cua-hub run "<task>" --ui-tree` | 截图之外附带浅层无障碍树 |
-| `cua-hub browser "<task>" --start-url <url>` | 浏览器任务（默认 headless）。确认门与桌面引擎同一套：`--yes` 放行中危、`--allow-high` 才放行 `eval`；`--dry-run` 只规划并打印档位 |
-| `cua-hub orchestrate "<task>"` | 跨引擎计划 + 执行（`--dry-run` 只看计划；`--retries/--max-replans` 控制恢复） |
-| `cua-hub runs` | 列出 `.runs` 下的历史运行（任务、结果、步数） |
-| `cua-hub replay <run_dir>` | 按 `steps.jsonl` 逐步重放（`--dry-run` 预览） |
-| `cua-hub console` | 本地 Web 控制台：实时画面、启动/取消任务（默认 `127.0.0.1:8787`） |
-| `cua-hub serve` | 以 MCP stdio server 运行，供其他 Agent 调用 |
+## 核心引擎矩阵
 
-## Web 控制台
+| 引擎 | 触发与路由条件 | 技术底座 | 优势与核心价值 |
+| :--- | :--- | :--- | :--- |
+| **Vision 视觉引擎** | 默认路由 / `--engine vision` | Anthropic Computer Use / OpenAI 兼容网关 / 本地 VLM | 适应未知 GUI 界面、跨应用异构桌面交互；自动完成 125%/150% 等系统 DPI 物理坐标转换。 |
+| **Browser 浏览器引擎** | 任务含 URL、网页关键词，或 `browser` 命令 | Chromium DevTools Protocol (CDP) 直连 | 独立隔离环境运行；支持内联滚动、同源 iframe 深度穿透、元素自动可见性对齐与回读校验。 |
+| **Code 脚本引擎** | 任务含命令、脚本、诊断、系统状态等关键词 | 原生 PowerShell / Bash 沙箱执行 | 比视觉截屏快两个数量级；适合高确定性数据检索、批量运维与文件处理。 |
+| **Access 无障碍引擎** | 任务含无障碍、控件名、AutomationId 等关键词 | Windows UIA / Linux AT-SPI2 协议桥 | 毫秒级语义定位；提供 `target` 精确身份寻址，拒绝模糊推测；支持次级动作调用。 |
+| **Perception 感知引擎** | `ui_elements: true` 时自动协同 | 内置点阵 SoM 渲染 + 系统 OCR + IoU 空间合并 | 结合屏幕像素与无障碍树，将非语义图像转化为结构化编号注册表，大模型只决策编号、永不直触绝对坐标。 |
+
+---
+
+## 平台支持矩阵
+
+| 操作系统 | 架构 | 验证状态 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **Windows** | x86_64 | ✅ 生产真机验证 | 支持 Win10 / Win11，支持 Per-Monitor V2 DPI 缩放与 Windows.Graphics.Capture |
+| **Linux** | x86_64 | ✅ 生产真机验证 | 深度适配 Ubuntu 24.04 / Debian 13，原生 AT-SPI2 D-Bus 通信 |
+| **macOS** | x86_64 (Intel) | ⚠️ CI 交叉编译构建 | 社区实验性支持，欢迎反馈实测结果 |
+| **macOS** | aarch64 (Apple Silicon) | ⚠️ CI 交叉编译构建 | 社区实验性支持，欢迎反馈实测结果 |
+
+*注：GitHub Releases 页面提供全平台预编译二进制包。*
+
+---
+
+## 快速上手
+
+### 1. 构建与环境自检
+
+```bash
+# 检出源码并构建优化二进制
+cargo build --release
+
+# 运行系统诊断：屏幕适配、DPI、键鼠注入权限与模型网关连通性
+./target/release/cua-hub doctor
+```
+
+### 2. 命令行任务执行
+
+```bash
+# 方式 A：Anthropic 原生 Computer Use 协议
+export ANTHROPIC_API_KEY=sk-ant-api03-...
+./target/release/cua-hub run "打开记事本并输入系统状态汇总" --yes
+
+# 方式 B：任意 OpenAI 兼容模型（OpenRouter / vLLM / Ollama）
+export OPENROUTER_API_KEY=sk-or-v1-...
+./target/release/cua-hub run "整理桌面临时文件" --yes \
+  --model "minimax/minimax-m3.1-flash:free"
+
+# 方式 C：浏览器专属引擎执行（支持有头与无头模式）
+./target/release/cua-hub browser "打开控制台并提取数据指标" \
+  --start-url "https://news.ycombinator.com" --headed
+
+# 方式 D：跨引擎流水线编排（浏览器提取 -> 脚本写入 -> 桌面交互）
+./target/release/cua-hub orchestrate \
+  "从目标网页抓取最新发布信息，生成为本地文件并弹窗提醒"
+```
+
+### 3. 运行本地 Web 交互控制台
 
 ```bash
 ./target/release/cua-hub console --bind 127.0.0.1:8787
-# 打开 http://127.0.0.1:8787/
 ```
 
-- 每 800ms 刷新主屏 JPEG，右下角显示分辨率、DPI、光标位置
-- 可直接输入任务并启动（可选 vision / code / browser 引擎）
-- 后台任务列表：状态、步数、摘要，可取消
-- 同一进程还挂载了 `/mcp`，Agent 通过它启动的任务会实时出现在面板里
-- 设置 `CUA_HUB_MCP_TOKEN` 后，页面与接口都需要 `?token=` 或 Bearer；非回环绑定必须设置 token
+- 浏览器访问 `http://127.0.0.1:8787` 查看实时桌面推流（带分辨率、DPI、光标位置）。
+- 在线任务分发、步进监控、动作审计日志与实时急停熔断。
+- 相同进程直接开放 `/mcp` 接口，支持混合多任务协同。
 
-## MCP 接入
+---
 
-任何支持 MCP 的客户端（Claude Desktop、Cursor、Qoder 等）都可以这样挂载：
+## MCP 协议全面集成
+
+支持作为标准 MCP 服务挂载至 **Claude Desktop**、**Cursor**、**Qoder** 等各类 AI 宿主：
 
 ```json
 {
   "mcpServers": {
     "cua-hub": {
-      "command": "C:\\\\path\\\\to\\\\cua-hub.exe",
+      "command": "C:\\path\\to\\cua-hub.exe",
       "args": ["serve"],
-      "env": { "OPENROUTER_API_KEY": "sk-or-..." }
+      "env": {
+        "OPENROUTER_API_KEY": "sk-or-..."
+      }
     }
   }
 }
 ```
 
-暴露 38 个工具：
+系统对外暴露 **38 个全功能原子工具与编排原语**，按交互层次划分如下：
 
-| 工具 | 作用 |
-|------|------|
-| `run_task` | 自然语言任务（视觉/代码/浏览器引擎），同步阻塞返回摘要与产物路径。`ui_elements`（布尔，默认 false）给 vision 每步附带**统一元素注册表**（按窗口分段：`# window` 段内控件的编号**就是** `window_state` 体系的 element_index——读动一套编号；不可寻址的 OCR 文本渲染为无编号 `- ` 行）：动作按 `window_state` 的 element_index 或 target 寻址；OCR 后端由 `CUA_HUB_OCR_BACKEND` 决定 |
-| `start_task` / `task_status` / `task_cancel` | 后台任务：立即返回 job_id，可查进度、可取消 |
-| `browser_task` | 在隔离 Chromium 里执行网页任务（CDP）。每一步都过确认门：`eval` 一律高危（要 `allow_high`），跨站 `navigate`、指向提交控件的 `click`、任何 `press Enter` 是中危（要 `yes`），其余低危直接跑；`dry_run` 会打印每步档位。默认 `yes:false`、`allow_high:false`。click/type 的答复是**回读裁决**：`clicked <sel> [effect=changed] (checked Some(false)->Some(true))`、`typed N chars into <sel> [verified: value reads as sent]`；富文本走 `Input.insertText`（光标落末尾、不覆盖已有内容）并按三条标准回读；读不一致报 `FAILED:`，**这条路径不再出现 `OK`**。另有 `max_tokens`（整数，默认 700）限制每步规划请求的输出 token 上限，不传就用环境变量 `CUA_HUB_BROWSER_MAX_TOKENS`，都没有就是 700。`indicate_mouse`（布尔，默认 true）在每次点击/输入前把真实光标移到目标上停约 300ms 给旁观者看，只动光标不按键，`dry_run` 与 headless 自动跳过，失败只记日志不影响动作 |
-| `orchestrate` | 跨引擎计划与执行，步骤间传值 |
-| `list_runs` / `replay_run` | 查看历史运行 / 重放某次运行 |
-| `capture_screen` | 返回主屏 JPEG + 尺寸 |
-| `list_windows` | 列出可捕获的顶层窗口（标题、应用、坐标、焦点、最小化） |
-| `list_apps` | 按进程分组的应用清单（含各自窗口与可启动的 exe 路径）；`include_all` 追加开始菜单里未运行的程序 |
-| `launch_app` | 启动应用并等待其窗口出现；已在运行的直接返回现有窗口；`ready=false` 表示超时内没等到窗口 |
-| `window_state` | 观测原语：一次返回窗口截图（含菜单/对话框等独立弹层，每张图带自己的 `screenshot_id`/原点）与窗口内 UIA 元素树 + `element_index` + 焦点元素，并给出 `observation_id` 作为作用域令牌。焦点元素只在 Windows 侧读得到；其他平台该字段为 null 并附 `focused_element_note` 说明"这里读不到"，不要当成"没有控件持有焦点"。元素编号在同一窗口内保持稳定，因此第二次起默认返回 unified diff（`mode=diff`），`unchanged` 表示映射仍有效，`baseline_reset` 表示旧编号全部作废。树里同时给出控件当前值、可用动作与选中/焦点标记；`accessibility` 还带 `selected_text`、`document_text`、`selected_elements`（支持 Text 模式的控件）。有应用没应答时 `accessibility` 里会多一个 `unreadable`，写明是哪个对象路径读不到——看到这个键就别把"树里没有"当成"控件不存在" |
-| `capture_window` | 抓取窗口自身表面（被遮挡也完整），返回 `origin`/`image_scale`/`source`/`hash`，坐标换算由服务端完成；PrintWindow 渲染成全黑的硬件合成分布式表面会自动改用 Windows.Graphics.Capture（`source=GraphicsCapture`），也可用 `CUA_HUB_CAPTURE_BACKEND=wgc` 强制 |
-| `wait_for_change` | 阻塞等待窗口或其弹层真的发生变化，用来验证动作是否生效 |
-| `perform_secondary_action` | 调用控件除点击之外的无障碍动作：Expand/Collapse/Raise/Scroll Up·Down·Left·Right/Toggle/Select/Focus/Invoke；只接受该控件在树里 `actions=` 列出的名字，猜错返回 `unsupported_action` 与真实清单，执行后回读状态供验证 |
-| `focus_window` | 按 id、必须唯一匹配的标题/应用选择器，或 `{app,id}` 把窗口带到前台；0 个或多个匹配时返回候选，不猜 |
-| `window_input` | 原子操作：聚焦窗口 → 可选窗口相对坐标点击 → 输入文本 → 可选回车；窗口目标必须唯一，失败返回候选。`x`/`y` 必须落在该窗口自己的矩形内，越界返回 `offset_outside_window`（这个工具不会点到窗口外），只给一个轴也拒绝。窗口激活只在 Windows 实现，Linux 上这条工具回 `unsupported` + `retry:false`（不拿可重试的错误糊过去） |
-| `accessibility_tree` | 带编号的桌面级 UIA 树（窗口/按钮/输入框 + 矩形）；日常观测请用 `window_state`。Linux 上如果某些应用没应答，树尾会列出 `! parts of this tree were not read:`（最多点名 6 个子树，其余给条数）——少节点不再无声 |
-| `find_control` / `invoke_control` | 按 `target` 身份地址定位（`name` 简写仍可用）；invoke 优先走 Invoke 模式，失败再点中心。一个 target 命中多个控件时**报错并列出候选**，绝不替调用方挑一个。`invoke_control` 可选 `max_nodes`/`max_depth`，失败要按原话读：`did not reach` = 搜索被节点预算截断（提高 `max_nodes` 再来），`did not get an answer` = 那个应用没回话（Linux 单次调用最多等 1200ms），两者都**不**表示控件没有该模式；只有走到控件后的 `None` 才是"没有该模式"。三种都不该顺手降级成坐标点击。成功的答案还带**效果裁决** `effect=changed`/`unchanged`/`unverifiable`（回读控件自己的状态得出；普通按钮没有可读状态位，所以是 `unverifiable` 而不是"没变"——要看画面或树自己确认） |
-| `invoke_element` | 按 `accessibility_tree` 的编号调用控件（模式同 invoke_control） |
-| `set_control_text` / `set_element_value` | 用 Value/EditableText 模式按名称/编号直接设值（不模拟键盘）。`set_control_text` 同样接受可选 `max_nodes`/`max_depth`，读失败口径同 `invoke_control`：`did not reach` = 预算不够，`did not get an answer` = 那个应用没回话，两者都不是"控件不支持"。效果裁决按"字段里是不是我要的那段文字"判：Windows 读得回来所以能报 `changed`/`unchanged`；Linux 还没接 Text 接口，诚实报 `unverifiable`，不拿"模式回了 true"冒充"写进去了" |
-| `control_state` | 读取启用/可见、勾选、展开状态、范围值。两平台都实现：Windows 走 UIA 的 Toggle/ExpandCollapse/Value/RangeValue 模式，Linux 走 AT-SPI 的 `GetState` 位图（`toggle` = `on`/`off`/`indeterminate`，`expanded` = `expanded`/`collapsed`/`partially_expanded`/`leaf`，口径一致）。Linux 侧 `value` 与 `range_value` 暂不填——那两个在 Text / Value 接口后面，还没接 |
-| `click` / `move` / `drag` | 左/右/中键点击（可双击）、移动指针、左键拖拽；`click` 支持 `observation_id`+`element_index`，或 `observation_id`+`screenshot_id`+`x/y`（弹层图片的坐标系与主窗口不同，必须指名） |
-| `scroll` | 在指定坐标滚轮（dx/dy，支持横向） |
-| `type_text` | 向焦点窗口输入任意 Unicode 文本（自动处理 Shift 大写/括号）。答复是**回读裁决**而非发送计数：`typed N chars; effect=changed (field now reads …<末24字>)` / `effect=unchanged (the focused field still reads exactly as before)` / `effect=unverifiable (no readable text at the keyboard focus)`。字符数只说明发了多少，落没落地看 `effect=`；读不到焦点文本时老实说读不到，不拿发送数冒充成功 |
-| `key` | 发送按键组合（PageUp/PageDown/方向键/系统快捷键等） |
-| `mouse_down` / `mouse_up` | 按住/释放鼠标键（Shift 多选、Ctrl 拖拽） |
-| `key_down` / `key_up` | 按住/释放按键或组合键 |
-| `clipboard_get` / `clipboard_set` | 剪贴板文本读写（常驻实例） |
-| `screen_info` | 主屏尺寸、原点、DPI、光标位置 |
+### 1. 智能规划与跨引擎编排
+- `run_task`：阻塞式自然语言任务执行，可启用 `ui_elements` 携带结构化注册表。
+- `start_task` / `task_status` / `task_cancel`：非阻塞后台长任务管理，支持进度轮询与即时终止。
+- `browser_task`：隔离 Chromium 网页专属任务执行，具备回读裁决、自动滚动定位与光标指示。
+- `orchestrate`：跨引擎多阶段流水线计划生成与分步执行，支持步骤间变量级联传递。
+- `list_runs` / `replay_run`：任务运行审计流查询与基于 `steps.jsonl` 的确定性回放。
 
-控件寻址用 `target`：`{"name": "...", "role": "Button", "nth": 0, "container": "..."}`。
-`name` 是不区分大小写的子串，也可写 `re:` 正则或 `id:<AutomationId>` 形式（用于名称动态或
-为空的控件，例如 Win32 编辑框 `id:15`、计算器按键 `id:num1Button`、结果显示
-`id:CalculatorResults`）；`role` 是控件类型，`container` 只匹配位于同名容器内的控件，
-`nth` 是多个命中里的第几个（0 起）。**一个 target 命中多个控件时一律报错并列出候选，
-绝不由引擎挑第一个**；要选就由调用方用 role/container/nth 说明白。旧的字符串 `name`
-参数是 `{"target":{"name":...}}` 的简写，仍然可用；同时给 `target` 和 `name` 会被拒绝
-（双重地址）。
+### 2. 屏幕捕获与环境感知
+- `capture_screen`：高保真截取主屏幕（返回 JPEG 字节流与物理尺寸）。
+- `capture_window`：捕获指定窗口独立表面（被遮蔽亦完整，自动适配硬件加速与 WGC 捕获）。
+- `wait_for_change`：基于平均哈希差分的窗口像素阻断等待，用以可靠验证动态动作着陆。
+- `screen_info`：获取当前显示器尺寸、原点、DPI 缩放倍率及实时光标坐标。
 
-解析和动手对着同一个节点：Linux 上身份是 `(bus name, object path)`，Windows 上用
-RawViewWalker 走到哪个元素就对哪个元素动手，解析之后不再按名二次查找。代价是 Windows
-动作从"按名 FindFirst"变成每次走一遍树：本机约 2300 个可见节点的桌面上一次 `find_control`
-约 15s（同等节点的 control-view 快照也要 14s，慢在树的大小，不在 walker）。
+### 3. 窗口管理与无障碍观测
+- `list_windows`：枚举系统全部顶层窗口的句柄、进程 PID、标题、几何区域与焦点状态。
+- `list_apps`：按进程分组汇总应用程序及其拥有的窗口，支持枚举已安装未启动的应用。
+- `launch_app`：拉起目标应用程序并持续观测直至其物理主窗口就位。
+- `focus_window`：精确将目标窗口置于前台，遇到模糊匹配时强制报错并列出候选。
+- `window_state`：**核心观测原语**。单次返回窗口高分辨率画面、完整 UIA/AT-SPI 控件树、稳定 `element_index`、焦点元素及当前选中文本。后续调用默认返回统一差分（`mode=diff`）。
+- `accessibility_tree`：获取桌面全局范围的有界无障碍树快照。
 
-远程/容器内调用可以走 HTTP（streamable POST）：
+### 4. 精准控件定位与属性交互
+- `find_control`：依据精确 `target` 身份地址计算控件屏幕区域，多目标冲突时坚决列出候选并中断。
+- `invoke_control` / `invoke_element`：调用控件默认行为模式（优先走无障碍模式，失败平滑回退中心物理点击），并提供执行后效果裁决。
+- `set_control_text` / `set_element_value`：通过 Value/EditableText 语义直接赋值文本（免模拟键盘），自动回读字段验证真实着陆。
+- `control_state`：即时查询控件的开关状态（Toggle）、展开状态（Expand）、范围进度及启用标记。
+- `perform_secondary_action`：调用控件声明的高阶次级动作（如 Expand、Collapse、Scroll、Select 等）。
 
-```bash
-./target/release/cua-hub serve --http 127.0.0.1:8765
+### 5. 底层输入注入与剪贴板
+- `window_input`：高可靠原子指令：置顶窗口 -> 窗口内相对坐标点击 -> 文本键盘注入 -> 可选回车；强制校验窗口物理边界，杜绝越界误触。
+- `click` / `move` / `drag` / `scroll`：物理层级指针定位、点击、拖拽与横纵滚轮驱动。
+- `type_text`：焦点窗口通用 Unicode 文本注入，附带输入前后文本比对裁决（`effect=changed/unchanged/unverifiable`）。
+- `key` / `key_down` / `key_up`：按键及复合修饰键（如 Ctrl/Alt/Shift/Win）的按下、保持与释放。
+- `mouse_down` / `mouse_up`：鼠标单键长按与释放，支持框选与高级拖拽手势。
+- `clipboard_get` / `clipboard_set`：系统剪贴板文本读写，Linux 下保持常驻防丢失。
 
-curl -s http://127.0.0.1:8765/health
-curl -s -X POST http://127.0.0.1:8765/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-```
+---
 
-HTTP 模式默认只允许绑定回环地址。设置 `CUA_HUB_MCP_TOKEN` 后，所有 `/mcp`
-请求必须带 `Authorization: Bearer <token>`：
+## 核心技术契约与可靠性保证
 
-```bash
-CUA_HUB_MCP_TOKEN=my-secret ./target/release/cua-hub serve --http 127.0.0.1:8765
-```
+为消除常见自动化 Agent 的脆弱性与误操作，`cua-hub` 在底层内置了五大硬性保障机制：
 
-确需绑定非回环地址时，必须设置 token；`CUA_HUB_ALLOW_REMOTE=1` 仅用于你自己
-已经在前面加了鉴权代理的场景。
+### 1. 读动编号归一体系 (Unified Numbering System)
+感知注册表展现的控件序号直接绑定底层 `window_state` 的 `element_index`。避免传统架构中“提示词里看到序号 3，动手时却点了序号 5”的映射漂移问题。
 
-本地协议冒烟测试：`node scripts/mcp_smoke.mjs`。
+### 2. 严格目标身份寻址 (Target Identity Addressing)
+通过 `{"name": "...", "role": "Button", "container": "...", "nth": 0}` 精准定位。
+- 绝不随机盲猜：若目标命中多个同名控件，系统强制报错并列出所有候选，要求大模型补充容器或层级修饰。
+- 寻址与执行锁定同一底层对象句柄，绝不在解析后二次按名模糊查找。
 
-**高危动作确认（stdio）**：支持 MCP elicitation 的客户端会收到
-`elicitation/create` 请求，对删除/格式化/关机类动作逐次批准或拒绝；
-客户端不支持或 60 秒未响应，按拒绝处理。HTTP 模式没有反向通道，高危动作
-仍直接阻断，需要显式 `allow_high: true`。验证脚本：
-`node scripts/mcp_elicit_test.mjs`。
+### 3. 动作效果回读裁决 (Action Effect Verification)
+点击、输入与模式调用后，自动回读目标控件状态或比对屏幕局部哈希：
+- `changed`：确认目标状态（如 Checkbox 翻转、文本更新）真实落地。
+- `unchanged`：命令虽然成功发送，但被控界面未产生响应，及时警告并中断重试。
+- `unverifiable`：不可读状态控件，如实提示模型通过画面观测核实，不伪造虚假成功。
 
-## 每次运行的产物
+### 4. 物理按键状态泄漏双重防御 (Dual-Layer Key Hold Protection)
+防止 Agent 在任务异常中断时留下按键卡死（如 Shift/Ctrl 长期按住导致后续全盘错乱）：
+- **第一层（意图登记）**：注入链严格跟踪每一笔保持请求。
+- **第二层（OS 物理扫描对账）**：通过底层系统 API（如 `GetAsyncKeyState`）轮询物理按键真实状态，脱节时自动触发清理程序批量释放非受控按键。
 
-`.runs/<时间戳>/` 下包含 `steps.jsonl`（每步动作与结果）、`step-NN.png`
-（每步截图）和 `outcome.json`，便于复盘与重放。
+### 5. 三级风险网闸与二次确认 (Three-Tier Risk Confirmation Gate)
+命令根据其语义和参数形态自动定级，避免“未在黑名单即默认放行”的设计缺陷：
+- **只读级（Read-Only）**：`ls`、`cat`、`Get-Content` 等，静默放行。
+- **常规级（Medium Risk，系统默认）**：涉及文件变动、脚本执行、联网请求等，需显式携带 `--yes` 或客户端授权。
+- **高危级（High Risk）**：系统破坏性命令（如 `rm -rf`、`format`、注册表改动、关机），必须显式携带 `--allow-high` 或通过 MCP Elicitation 双向反问批准；`--yes` 无法逾越此级别。
 
-## 确认与风险分级
+---
 
-命令按形状分成三档，**中间那档是默认**——不是"名单里没有就放行"：
+## 环境变量参考
 
-| 级别 | 判定 | 默认行为 |
-|------|------|----------|
-| 只读 | `ls` `cat` `git status` `Get-Content` 这类只读状态的命令 | 直接执行，不打扰 |
-| 未列名 | 其余一切：会写文件、联网、构建、跑脚本 | 需要 `yes=true`，或由能应答的客户端确认（stdio 走 MCP elicitation） |
-| 高危 | 递归或强制删除、`rd /s /q`、`Remove-Item -Recurse`/`-Force`、下载直接管进 shell、`-EncodedCommand`、`reg delete HKLM…`、磁盘与关机类 | 需要 `allow_high=true` 或人工批准；`yes` 买不到这一档 |
+| 环境变量 | 默认值 | 作用说明 |
+| :--- | :--- | :--- |
+| `ANTHROPIC_API_KEY` | - | Anthropic 视觉引擎专属密钥 |
+| `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | - | OpenAI / OpenRouter 网关兼容密钥 |
+| `CUA_HUB_OPENAI_BASE_URL` | `https://api.openai.com/v1` | 自定义 OpenAI 兼容网关地址（优先读取 `OPENROUTER_BASE_URL`） |
+| `CUA_HUB_MODEL` | `gpt-4o-mini` | 视觉与编排引擎默认选用模型标识 |
+| `CUA_HUB_BROWSER_MAX_TOKENS` | `700` | 浏览器引擎单步规划输出 Token 上限 |
+| `CUA_HUB_BROWSER_INDICATE_MOUSE` | `true` | 网页动作执行前系统光标跟随指示（ headed 模式生效，停留约 300ms） |
+| `CUA_HUB_OCR_BACKEND` | `auto` | OCR 引擎选择：`auto` (Win 用系统组件 / Linux 用 Tesseract) / `windows` / `tesseract` / `none` |
+| `CUA_HUB_OCR_LANG` | `eng` | Tesseract 引擎识别语言包（多语言可用 `+` 连接，如 `eng+chi_sim`） |
+| `CUA_HUB_MCP_TOKEN` | - | HTTP 模式接入强制 Bearer 鉴权 Token |
+| `CUA_HUB_ALLOW_REMOTE` | `0` | 是否允许无 Token 监听非回环网络（仅用于前置反向代理鉴权场景） |
+| `CUA_HUB_YES` | `0` | 设置为 `1` 全局放行常规中危操作二次确认 |
 
-- 判定读的是**参数**而不是字面名单：`rm  -rf  /`、`Remove-Item -Force -Recurse C:\`、
-  `rd /s /q D:\data` 与拼写完整的同一条命令同级；`sudo` / `cmd /c` / `sh -c "…"` 这类包装会被剥开再判。
-- 也不误伤散文：`printf "format %s"` 与 `please format the document` 都不算高危，
-  因为只会误伤的"提到就拦"会把人训练成无脑放行。
-- **入口默认**：MCP 的 `run_task` / `start_task` / `orchestrate` 默认 `yes=false`
-  （0.1.4 起，此前是 `true`；`orchestrate` 此前在 MCP 与 CLI 两条路上都硬编码跳过确认）。
-  CLI 用 `--yes` 或 `CUA_HUB_YES=1` 显式放开中危，高危始终需要 `--allow-high`。
-  默认必须是"问"，因为这些命令是大模型写的。
+---
 
-## 环境变量
+## 文档中心 (Documentation Hub)
 
-| 变量 | 说明 |
-|------|------|
-| `ANTHROPIC_API_KEY` | Anthropic 视觉引擎密钥 |
-| `ANTHROPIC_BASE_URL` | 可选，自定义 Anthropic 网关 |
-| `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | OpenAI 兼容引擎密钥 |
-| `CUA_HUB_OPENAI_BASE_URL` | 默认取 `OPENROUTER_BASE_URL`，否则 `https://api.openai.com/v1` |
-| `CUA_HUB_MODEL` | Anthropic 默认 `claude-sonnet-4-5`；OpenAI 默认取 `OPENROUTER_MODEL` 或 `gpt-4o-mini` |
-| `CUA_HUB_BROWSER_MAX_TOKENS` | 浏览器 agent 每步规划请求的**输出 token 上限**；不设则用内置默认 **700**。单次调用还可用 `browser_task` 的 `max_tokens` 参数覆盖它（参数 > 环境变量 > 700）。只限制模型能答多长，不改模型、温度与消息结构 |
-| `CUA_HUB_BROWSER_INDICATE_MOUSE` | 浏览器 agent 的**鼠标指示**：点击/输入前先把真实光标移到目标上停约 300ms，让旁观的人看得见要动哪里。默认 **开**（`1`/`0`/`true`/`false`/`on`/`off`）；单次调用可用 `browser_task` 的 `indicate_mouse` 参数覆盖（参数 > 环境变量 > 默认开）。只移动光标，不按键、不抢焦点、不参与回读裁决；`dry_run` 与无窗口的 headless 浏览器自动跳过，指示失败也只记日志、绝不阻塞动作 |
-| `CUA_HUB_YES` | 设为 1 跳过**中危**确认（CLI 入口）；高危动作始终还要 `--allow-high` |
-| `CUA_HUB_MCP_TOKEN` | HTTP 模式的 Bearer token；设置后强制鉴权 |
-| `CUA_HUB_ALLOW_REMOTE` | 允许无 token 绑定非回环地址（仅限已有前置鉴权） |
-| `CUA_HUB_OCR_BACKEND` | OCR 后端选择（`cua-engine-perception`）：`auto`（默认，Windows 用系统 Media.Ocr、Linux 用 tesseract CLI）/ `windows` / `tesseract` / `none`（显式关闭）。识别语言 env `CUA_HUB_OCR_LANG`（tesseract 后端的 `-l` 值，默认 `eng`）。Linux 需装 `tesseract-ocr`；Windows 中文识别需系统语言包，缺失会显式报错而不是返回空结果 |
+关于系统底层机制与具体工程实践，请查阅完整技术白皮书：
 
-## CI
+- [系统核心架构设计 (`docs/DESIGN.md`)](docs/DESIGN.md)：坐标体系换算、多引擎数据流、无障碍总线与底层协议设计。
+- [技术演进路线图 (`docs/ROADMAP.md`)](docs/ROADMAP.md)：已完成特性、进行中模块及中远期规划。
+- [上游生态同步指南 (`docs/UPGRADING.md`)](docs/UPGRADING.md)：依赖库、前沿竞品与生态协议更新跟踪准则。
+- [工业软件集成手册 (`docs/INDUSTRIAL.md`)](docs/INDUSTRIAL.md)：面向 FreeCAD 等复杂工程软件的规则包与接入模板。
+- [多版本架构演进对照 (`docs/VERSIONS.md`)](docs/VERSIONS.md)：历史原型、分支演化与能力整合全景。
+- [版本变更日志 (`CHANGELOG.md`)](CHANGELOG.md)：详细发布历史与版本特性记录。
+- [最新工程交接备忘 (`docs/HANDOFF-2026-11-02.md`)](docs/HANDOFF-2026-11-02.md)：开发状态、测试基准与环境配置踩坑要诀。
 
-已启用：[`.github/workflows/ci.yml`](.github/workflows/ci.yml) 在
-**Windows** 和 **Ubuntu 24.04** 上跑 fmt / clippy / test / release build，
-两条线均通过。`ci/github-actions-ci.yml` 是同一份配置的模板备份。
+---
 
-Ubuntu 22.04 不可用：xcap 依赖的 libspa 0.10 需要较新的 pipewire 头文件；
-另外需要 `libgbm-dev` / `libdrm-dev` 才能完成链接。
+## 开源许可证
 
-## 作为 Skill / MCP 安装
-
-一键安装（构建 release、复制 Skill 到 Qoder/Claude、注册 MCP）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-qoder.ps1
-```
-
-安装内容：
-
-- `dist\cua-hub.exe`（约 7MB）
-- `~/.qoder/skills/cua-hub/SKILL.md` 与 `~/.claude/skills/cua-hub/SKILL.md`
-- `~/.qoder/settings.json` 的 `mcpServers` 增加 `cua-hub` 条目（Qoder 桌面端读取此文件，
-  原文件自动备份）；`~/.qoder/mcp.json` 同步一份给 Qoder CLI
-
-重启 Qoder 或新开一个会话后，Agent 可直接调用 `capture_screen`、
-`accessibility_tree`、`set_control_text`、`browser_task` 等工具（工具清单在会话启动/刷新时
-注册；若当前对话暂时看不到，新开一个即可）。模型密钥放在用户环境变量
-（`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`），子进程会继承。
-
-细节见 [integrations/README.md](integrations/README.md)。
-
-## 架构
-
-```
-cua-cli  ->  cua-router  ->  cua-engine-vision (Anthropic / OpenAI-compatible)
-   |                              |
-   +--> cua-io (xcap capture, enigo input)
-   +--> cua-core (Action / Observation / Engine traits)
-```
-
-坐标链：模型截图像素 → 物理像素（`Frame.scale`）→ 输入逻辑像素
-（`Frame.input_scale`，已处理 Windows 125% DPI 缩放）。
-
-细节见 [docs/DESIGN.md](docs/DESIGN.md)，路线图见 [docs/ROADMAP.md](docs/ROADMAP.md)，
-仓库内各版本对照见 [docs/VERSIONS.md](docs/VERSIONS.md)，上游升级流程见
-[docs/UPGRADING.md](docs/UPGRADING.md)，工业软件适配见
-[docs/INDUSTRIAL.md](docs/INDUSTRIAL.md)。
-
-## 许可证
-
-MIT
+本项目基于 [MIT License](LICENSE) 开源。
