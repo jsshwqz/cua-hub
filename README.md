@@ -21,6 +21,18 @@ Phase 2 进行中，Windows 真机验证：
 - **动作校验**：桌面动作后比对屏幕指纹，没变化会在步骤记录里提示模型换方法
 - **MCP Server**：`cua-hub serve` 通过 stdio 把整台机器暴露给其他 Agent（协议冒烟测试通过）
 
+## 平台支持
+
+| 平台 | 架构 | 状态 |
+|------|------|------|
+| Windows | x64 | ✅ 真机验证 |
+| Linux | x64 | ✅ 真机验证（Ubuntu 24.04） |
+| macOS | x64（Intel） | ⚠️ CI 构建，尚未真机验证 |
+| macOS | ARM64（Apple Silicon） | ⚠️ CI 构建，尚未真机验证 |
+
+Release 页面提供各平台预构建包。macOS 包由 GitHub Actions 自动构建，
+欢迎 macOS 用户反馈实测结果。
+
 ## 引擎
 
 | 引擎 | 触发方式 | 适合 |
