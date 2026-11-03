@@ -119,6 +119,11 @@ enum Command {
         /// numbers) alongside each screenshot.
         #[arg(long)]
         ui_elements: bool,
+        /// Show the floating desktop running-state indicator while the task
+        /// executes. Click-through, never steals focus, and hidden from
+        /// screen captures so vision models cannot observe it.
+        #[arg(long)]
+        overlay: bool,
         /// Show the browser window for browser-routed tasks.
         #[arg(long)]
         browser_headed: bool,
@@ -354,6 +359,7 @@ fn main() -> Result<()> {
             settle_ms,
             ui_tree,
             ui_elements,
+            overlay,
             browser_headed,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -371,6 +377,7 @@ fn main() -> Result<()> {
                 settle_ms,
                 ui_tree,
                 ui_elements,
+                overlay,
                 browser_headed,
                 approver: None,
             }))?;

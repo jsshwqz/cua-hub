@@ -80,6 +80,10 @@ pub struct RunOptions {
     /// each vision step. Registry numbers are for reading only — actions
     /// still address controls via window_state element indexes or targets.
     pub ui_elements: bool,
+    /// Show the floating desktop overlay indicator during execution.
+    /// The indicator is click-through, never steals focus, and is excluded
+    /// from screen captures so vision models cannot observe it.
+    pub overlay: bool,
     /// Show the browser window instead of headless mode.
     pub browser_headed: bool,
     /// Optional async approval hook used instead of `allow_high` when a
@@ -103,6 +107,7 @@ impl Default for RunOptions {
             settle_ms: 600,
             ui_tree: false,
             ui_elements: false,
+            overlay: false,
             browser_headed: false,
             approver: None,
         }
@@ -207,8 +212,20 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
     let mut log_file = std::fs::File::create(&log_path)?;
     let mut history: Vec<StepRecord> = Vec::new();
     let mut outcome = Outcome::StepLimit;
+    // Desktop running-state indicator: dropped at scope exit so a completed,
+    // failed, or panicked run always tears the window down cleanly.
+    let overlay = cua_io::OverlayGuard::start(
+        opts.overlay && !opts.dry_run,
+        &opts.task,
+        opts.max_steps as usize,
+    );
 
     for index in 0..opts.max_steps {
+        overlay.update(
+            index as usize,
+            opts.max_steps as usize,
+            "感知屏幕 / 请求模型",
+        );
         let frame = if vision_engine {
             let frame = cua_io::observe(opts.max_edge, 80)?;
             let shot_path = run_dir.join(format!("step-{index:02}.png"));
@@ -260,6 +277,7 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             action.risk().as_str(),
             describe(&action)
         );
+        overlay.update(index as usize, opts.max_steps as usize, &describe(&action));
 
         match action {
             Action::Done { summary } => {
