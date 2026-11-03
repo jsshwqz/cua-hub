@@ -467,6 +467,31 @@ UI widget), `cua-hub` employs active effect verification:
 * `type_text` validates whether the focused control actually contains the intended characters rather
   than simply counting synthetic key strokes dispatched.
 
+## Overlay running-state indicator (`cua-io::overlay`)
+
+A long task can silently take over the desktop, so the runner can mount a small
+capsule at the top-centre of the screen showing the goal, the current step
+(`Step N/M`) and the action under way. Three properties are load-bearing:
+
+* **Click-through.** The window carries `WS_EX_TRANSPARENT`, so mouse input
+  passes straight to whatever is underneath. A user can click, drag or
+  marquee-select through the capsule without interference.
+* **Never steals focus.** `WS_EX_TOOLWINDOW` keeps it off the taskbar, out of
+  Alt+Tab and from taking the foreground window or keyboard focus.
+* **Invisible to vision models.** `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`
+  makes the window hardware-excluded from screen capture, so the same
+  `cua_io::observe` frames the model sees contain no capsule at all.
+
+The window is a native Win32 layered window driven by a dedicated UI thread that
+polls commands with `PeekMessageW` (never `GetMessageW`, so the runner can feed
+it step updates without blocking) and renders with double-buffered GDI plus a
+breathing status dot. `OverlayGuard` is the RAII handle: constructed with
+`start`, `.update(step, max, status)` per step, and torn down on `Drop` so a
+completed, failed, or panicked run always leaves the screen clean. Non-Windows
+targets compile it to a no-op. `OverlayGuard::start` respects `CUA_HUB_OVERLAY`
+as a master kill-switch and the `--overlay` flag / `overlay` MCP argument as the
+per-run opt-in.
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

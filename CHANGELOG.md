@@ -4,6 +4,24 @@
 不为了体现功能量级而跳版本。发版（tag / GitHub release）需要维护者明确点头，
 合入 main 不等于发版。
 
+## 未发布
+
+### 桌面运行状态悬浮指示器（overlay indicator）
+
+任务运行时在屏幕顶部居中显示一枚深色胶囊指示器，实时显示「CUA-HUB 正在操控 · Step N/M」
+与当前动作描述，绿色呼吸灯表示活跃。三项硬保证：**点击完全穿透**（`WS_EX_TRANSPARENT`，
+用户点击其覆盖区域不受任何阻碍）；**不抢焦点**（`WS_EX_TOOLWINDOW`，不占任务栏、不进
+Alt+Tab、绝不抢占前台键盘焦点）；**对大模型截屏全免疫**（`SetWindowDisplayAffinity(
+WDA_EXCLUDEFROMCAPTURE)`，在 `cua_io::observe` 等主屏截取画面中完全隐形，杜绝 VLM 把
+悬浮窗自身识别为操作目标的视觉污染）。
+
+实现为 `cua-io::overlay` 原生 Win32 分层透明窗口（零新增依赖，复用现有 `windows` crate），
+在独立 UI 线程以 `PeekMessageW` 轮询循环驱动 GDI 双缓冲绘制与呼吸动画；`OverlayGuard`
+RAII 管理生命周期，任务完成、失败或 panic 退出时 `Drop` 自动销毁窗口、干净恢复现场。
+非 Windows 平台编译为无副作用 no-op。接入点：`cua-hub run --overlay` CLI 开关，
+`run_task` / `start_task` MCP 工具的 `overlay` 布尔参数；`CUA_HUB_OVERLAY` 环境变量
+可强制关闭。`overlay_capture_proof` example 提供基线/悬浮双帧 A/B 截屏对账。
+
 ## 0.1.7 — 2026-11-02
 
 视觉元素解析从短板到能力链的一版：统一元素注册表（无障碍树 + OCR 合并、按窗口分段、
