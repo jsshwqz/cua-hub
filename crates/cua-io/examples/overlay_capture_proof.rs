@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&base_path, &base.png)?;
 
     // Mount the capsule exactly as the runner does.
-    let overlay = cua_io::OverlayGuard::start(true, "截屏隐形验证", 8);
+    let overlay = cua_io::OverlayGuard::start(true, "截屏隐形验证", 8, None);
     if !overlay.is_active() {
         eprintln!("overlay did not mount (non-desktop or disabled by CUA_HUB_OVERLAY)");
         return Ok(());

@@ -132,6 +132,7 @@ pub(crate) fn run_options_from_args(args: &Value) -> std::result::Result<RunOpti
         ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
         ui_elements: args["ui_elements"].as_bool().unwrap_or(false),
         overlay: args["overlay"].as_bool().unwrap_or(false),
+        takeover: args["takeover"].as_bool().unwrap_or(false),
         browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
         approver: approver_from_elicitor(),
     })
@@ -3982,6 +3983,7 @@ fn tool_defs() -> Value {
                     "ui_tree": { "type": "boolean", "default": false },
                     "ui_elements": { "type": "boolean", "default": false },
                     "overlay": { "type": "boolean", "default": false, "description": "Show the floating desktop running-state indicator (click-through, hidden from screen captures)" },
+                    "takeover": { "type": "boolean", "default": false, "description": "Let a human seize the keyboard/mouse mid-run: real physical input pauses the agent; Ctrl+Alt+H toggles pause, Ctrl+Alt+X stops; auto-resumes once the human is idle" },
                     "settle_ms": { "type": "integer", "default": 600 }
                 },
                 "required": ["task"]
@@ -4021,6 +4023,7 @@ fn tool_defs() -> Value {
                     "ui_tree": { "type": "boolean", "default": false, "description": "Attach the accessibility tree to each vision step" },
                     "ui_elements": { "type": "boolean", "default": false, "description": "Attach the unified element registry (access+OCR, reading-only numbers) to each vision step" },
                     "overlay": { "type": "boolean", "default": false, "description": "Show the floating desktop running-state indicator (click-through, hidden from screen captures)" },
+                    "takeover": { "type": "boolean", "default": false, "description": "Let a human seize the keyboard/mouse mid-run: real physical input pauses the agent; Ctrl+Alt+H toggles pause, Ctrl+Alt+X stops; auto-resumes once the human is idle" },
                     "settle_ms": { "type": "integer", "default": 600 }
                 },
                 "required": ["task"]

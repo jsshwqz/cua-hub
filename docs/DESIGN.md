@@ -492,6 +492,37 @@ targets compile it to a no-op. `OverlayGuard::start` respects `CUA_HUB_OVERLAY`
 as a master kill-switch and the `--overlay` flag / `overlay` MCP argument as the
 per-run opt-in.
 
+## Human takeover (`cua-io::takeover`)
+
+While the agent drives the desktop it owns the keyboard and mouse. Human takeover
+lets an operator seize control at any moment — without a manual switch they have
+to remember to flip. Three paths feed one shared state machine:
+
+* **Automatic seizure (default on).** Low-level hooks (`WH_KEYBOARD_LL` /
+  `WH_MOUSE_LL`) inspect every input event. cua-hub injects its own input
+  through `SendInput`, which the OS tags `LLKHF_INJECTED`; genuine physical
+  input never carries that tag. The first real keystroke or mouse click flips
+  the shared state to `PAUSED`, and the runner blocks at its per-step gate.
+* **Manual hotkeys.** `Ctrl+Alt+H` toggles pause/resume, `Ctrl+Alt+X` stops the
+  task outright — an explicit override of the automatic path.
+* **Idle auto-resume.** Once the human stops touching the machine for ~2.5s the
+  agent picks back up on its own.
+
+`TakeoverState` is the shared machine (`RUNNING` / `PAUSED` / `STOPPED`, atomics)
+read by the runner (step gate), the overlay (recolor), and written by the hook
+callbacks and the hotkey pump. The callbacks do almost no work — read a flag,
+bump a timestamp, touch one atomic — because Windows silently unhooks a
+low-level hook whose callback blocks longer than `LowLevelHooksTimeout`. The
+injected-vs-genuine distinction is the load-bearing insight: it is what lets the
+agent's own actions pass through unimpeded while a human's real input pauses it.
+`TakeoverGuard` is the RAII handle; dropping it raises a `SHUTDOWN` flag so the
+pump unhooks and the global hotkeys do not linger. Non-Windows targets compile
+it to a no-op. `TakeoverGuard::start` respects `CUA_HUB_TAKEOVER` as a master
+kill-switch and the `--takeover` flag / `takeover` MCP argument as the per-run
+opt-in. When takeover is active the overlay capsule recolors green (agent
+driving) / amber (human paused) / red (stopped), so the state is visible at a
+glance without ever reaching the model's screenshots.
+
 ## Safety
 
 * Every action carries a `Risk` label. `Type` text matching a destructive

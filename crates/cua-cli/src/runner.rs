@@ -84,6 +84,11 @@ pub struct RunOptions {
     /// The indicator is click-through, never steals focus, and is excluded
     /// from screen captures so vision models cannot observe it.
     pub overlay: bool,
+    /// Let a human seize the keyboard/mouse mid-run. Real physical input
+    /// pauses the agent (low-level hooks distinguish it from cua-hub's own
+    /// injected input); Ctrl+Alt+H toggles pause, Ctrl+Alt+X stops; the agent
+    /// resumes once the human is idle.
+    pub takeover: bool,
     /// Show the browser window instead of headless mode.
     pub browser_headed: bool,
     /// Optional async approval hook used instead of `allow_high` when a
@@ -108,6 +113,7 @@ impl Default for RunOptions {
             ui_tree: false,
             ui_elements: false,
             overlay: false,
+            takeover: false,
             browser_headed: false,
             approver: None,
         }
@@ -212,15 +218,27 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
     let mut log_file = std::fs::File::create(&log_path)?;
     let mut history: Vec<StepRecord> = Vec::new();
     let mut outcome = Outcome::StepLimit;
+    // Human-takeover guard: low-level hooks watch for genuine (non-injected)
+    // keyboard/mouse input and pause the agent the moment a human seizes the
+    // machine. Dropped at scope exit alongside the overlay.
+    let takeover = cua_io::takeover::TakeoverGuard::start(opts.takeover && !opts.dry_run);
     // Desktop running-state indicator: dropped at scope exit so a completed,
-    // failed, or panicked run always tears the window down cleanly.
+    // failed, or panicked run always tears the window down cleanly. Shares the
+    // takeover state so the capsule recolors as the human takes over.
     let overlay = cua_io::OverlayGuard::start(
         opts.overlay && !opts.dry_run,
         &opts.task,
         opts.max_steps as usize,
+        Some(takeover.state()),
     );
 
     for index in 0..opts.max_steps {
+        // A paused human holds the agent here before it touches anything; a
+        // Ctrl+Alt+X stop winds the run down instead of taking the next step.
+        if !takeover.wait_gate() {
+            outcome = Outcome::Failed("stopped by human takeover (Ctrl+Alt+X)".into());
+            break;
+        }
         overlay.update(
             index as usize,
             opts.max_steps as usize,

@@ -124,6 +124,12 @@ enum Command {
         /// screen captures so vision models cannot observe it.
         #[arg(long)]
         overlay: bool,
+        /// Let a human seize the keyboard/mouse mid-run. Real physical input
+        /// pauses the agent (distinguished from cua-hub's own injected input);
+        /// Ctrl+Alt+H toggles pause, Ctrl+Alt+X stops; the agent resumes once
+        /// the human is idle.
+        #[arg(long)]
+        takeover: bool,
         /// Show the browser window for browser-routed tasks.
         #[arg(long)]
         browser_headed: bool,
@@ -360,6 +366,7 @@ fn main() -> Result<()> {
             ui_tree,
             ui_elements,
             overlay,
+            takeover,
             browser_headed,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -378,6 +385,7 @@ fn main() -> Result<()> {
                 ui_tree,
                 ui_elements,
                 overlay,
+                takeover,
                 browser_headed,
                 approver: None,
             }))?;
