@@ -7,6 +7,7 @@ pub mod exec;
 pub mod hold;
 pub mod input;
 pub mod overlay;
+pub mod takeover;
 #[cfg(windows)]
 pub mod wgc;
 

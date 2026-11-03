@@ -14,6 +14,8 @@
 //! 4. **Graceful degradation**: On Linux or environments without a graphical
 //!    desktop, the guard degrades to a no-op implementation with identical API.
 
+use std::sync::Arc;
+
 #[cfg(windows)]
 mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +53,53 @@ mod imp {
         status: String,
         breath: u8,
         breath_dir: bool,
+        /// Shared human-takeover state machine, polled each paint tick so the
+        /// capsule recolors (green=running / amber=paused / red=stopped) the
+        /// moment the operator seizes control. `None` when takeover is off.
+        takeover: Option<Arc<super::super::takeover::TakeoverState>>,
+    }
+
+    /// Visual mode derived from the takeover state each paint tick.
+    #[derive(Clone, Copy, PartialEq)]
+    enum RunMode {
+        /// Agent in control — green, breathing dot.
+        Running,
+        /// Human has seized the keyboard/mouse — amber, agent is parked.
+        Paused,
+        /// Task stopped outright — red, runner is winding down.
+        Stopped,
+    }
+
+    impl RunMode {
+        fn from_status(status: u8) -> Self {
+            match status {
+                super::super::takeover::PAUSED => RunMode::Paused,
+                super::super::takeover::STOPPED => RunMode::Stopped,
+                _ => RunMode::Running,
+            }
+        }
+
+        /// Accent color (BGR) for the border, dot and status text.
+        fn accent(&self) -> COLORREF {
+            match self {
+                // emerald  RGB(0,220,150)   -> BGR 0x0096DC00
+                RunMode::Running => COLORREF(0x0096DC00),
+                // amber    RGB(255,176,0)   -> BGR 0x0000B0FF
+                RunMode::Paused => COLORREF(0x0000B0FF),
+                // red      RGB(255,80,80)   -> BGR 0x005050FF
+                RunMode::Stopped => COLORREF(0x005050FF),
+            }
+        }
+
+        /// Status-line text shown when the agent is not the one in control.
+        fn status_text(&self) -> &'static str {
+            match self {
+                // Empty means "let the runner's status show through".
+                RunMode::Running => "",
+                RunMode::Paused => "人工接管中 · agent 已暂停",
+                RunMode::Stopped => "已停止 · 正在恢复现场",
+            }
+        }
     }
 
     enum Command {
@@ -69,7 +118,11 @@ mod imp {
     }
 
     impl WindowsOverlay {
-        pub fn start(task: &str, max_steps: usize) -> Option<Self> {
+        pub fn start(
+            task: &str,
+            max_steps: usize,
+            takeover: Option<Arc<super::super::takeover::TakeoverState>>,
+        ) -> Option<Self> {
             let (tx, rx) = channel::<Command>();
             let alive = Arc::new(AtomicBool::new(true));
             let alive_clone = alive.clone();
@@ -83,7 +136,14 @@ mod imp {
             let (init_tx, init_rx) = channel::<bool>();
 
             let handle = spawn(move || {
-                run_ui_loop(rx, init_tx, alive_clone, initial_status, max_steps);
+                run_ui_loop(
+                    rx,
+                    init_tx,
+                    alive_clone,
+                    initial_status,
+                    max_steps,
+                    takeover,
+                );
             });
 
             match init_rx.recv_timeout(Duration::from_millis(600)) {
@@ -129,6 +189,7 @@ mod imp {
         alive: Arc<AtomicBool>,
         initial_status: String,
         max_steps: usize,
+        takeover: Option<Arc<super::super::takeover::TakeoverState>>,
     ) {
         let state = Arc::new(Mutex::new(State {
             step: 1,
@@ -136,6 +197,7 @@ mod imp {
             status: initial_status,
             breath: 0,
             breath_dir: true,
+            takeover,
         }));
 
         unsafe {
@@ -298,16 +360,20 @@ mod imp {
             WM_PAINT => {
                 if !ptr.is_null() {
                     let arc = &*ptr;
-                    let (step, max_steps, status, breath) = if let Ok(s) = arc.lock() {
-                        (s.step, s.max_steps, s.status.clone(), s.breath)
+                    let (step, max_steps, status, breath, mode) = if let Ok(s) = arc.lock() {
+                        let mode = match s.takeover.as_ref() {
+                            Some(t) => RunMode::from_status(t.status()),
+                            None => RunMode::Running,
+                        };
+                        (s.step, s.max_steps, s.status.clone(), s.breath, mode)
                     } else {
-                        (0, 0, String::new(), 0)
+                        (0, 0, String::new(), 0, RunMode::Running)
                     };
 
                     let mut ps = PAINTSTRUCT::default();
                     let hdc = BeginPaint(hwnd, &mut ps);
                     if !hdc.0.is_null() {
-                        draw_overlay_pill(hdc, step, max_steps, &status, breath);
+                        draw_overlay_pill(hdc, step, max_steps, &status, breath, mode);
                         let _ = EndPaint(hwnd, &ps);
                     }
                 }
@@ -333,7 +399,14 @@ mod imp {
         }
     }
 
-    unsafe fn draw_overlay_pill(hdc: HDC, step: usize, max_steps: usize, status: &str, breath: u8) {
+    unsafe fn draw_overlay_pill(
+        hdc: HDC,
+        step: usize,
+        max_steps: usize,
+        status: &str,
+        breath: u8,
+        mode: RunMode,
+    ) {
         // Double-buffering in memory DC to guarantee flicker-free rendering
         let mem_dc = CreateCompatibleDC(Some(hdc));
         let mem_bmp = CreateCompatibleBitmap(hdc, PILL_WIDTH, PILL_HEIGHT);
@@ -351,9 +424,10 @@ mod imp {
         FillRect(mem_dc, &full_rect, black_brush);
         let _ = DeleteObject(HGDIOBJ(black_brush.0));
 
-        // 2. Draw modern dark pill capsule: background RGB(22, 24, 30), border RGB(0, 220, 150)
+        // 2. Draw modern dark pill capsule: background RGB(22, 24, 30), border
+        //    colored by run mode (green=running / amber=paused / red=stopped).
         let bg_brush = CreateSolidBrush(COLORREF(0x001E1816)); // BGR format: R=22, G=24, B=30
-        let border_pen = CreatePen(PS_SOLID, 1, COLORREF(0x0096DC00)); // BGR: R=0, G=220, B=150
+        let border_pen = CreatePen(PS_SOLID, 1, mode.accent());
         let old_brush = SelectObject(mem_dc, HGDIOBJ(bg_brush.0));
         let old_pen = SelectObject(mem_dc, HGDIOBJ(border_pen.0));
 
@@ -364,10 +438,19 @@ mod imp {
         let _ = DeleteObject(HGDIOBJ(bg_brush.0));
         let _ = DeleteObject(HGDIOBJ(border_pen.0));
 
-        // 3. Pulsing indicator dot: breathing green
-        let g_val = (120u32 + breath as u32).min(255) as u8;
-        let r_val = (breath as u32 / 4) as u8;
-        let dot_color = COLORREF(((g_val as u32) << 8) | (r_val as u32));
+        // 3. Pulsing indicator dot in the accent color. Running breathes; a
+        //    parked (paused) or stopped task holds a steady, non-breathing dot.
+        let accent = mode.accent().0; // 0x00BBGGRR
+        let base_g = (accent >> 8) & 0xFF;
+        let base_r = accent & 0xFF;
+        let pulse = if mode == RunMode::Running {
+            breath as u32
+        } else {
+            0
+        };
+        let g_val = (base_g + pulse).min(255);
+        let r_val = (base_r + pulse / 4).min(255);
+        let dot_color = COLORREF((g_val << 8) | r_val);
         let dot_brush = CreateSolidBrush(dot_color);
         let null_pen = CreatePen(PS_SOLID, 0, dot_color);
         let old_b = SelectObject(mem_dc, HGDIOBJ(dot_brush.0));
@@ -388,9 +471,13 @@ mod imp {
         let old_f = SelectObject(mem_dc, HGDIOBJ(font_title.0));
         SetTextColor(mem_dc, COLORREF(0x00FFFFFF)); // White
 
-        let title_text: Vec<u16> = format!("CUA-HUB 正在操控 · Step {}/{}", step, max_steps)
-            .encode_utf16()
-            .collect();
+        let title_text: Vec<u16> = match mode {
+            RunMode::Running => format!("CUA-HUB 正在操控 · Step {}/{}", step, max_steps),
+            RunMode::Paused => format!("CUA-HUB 人工接管 · Step {}/{}", step, max_steps),
+            RunMode::Stopped => format!("CUA-HUB 已停止 · Step {}/{}", step, max_steps),
+        }
+        .encode_utf16()
+        .collect();
         let mut title_rect = RECT {
             left: 38,
             top: 7,
@@ -407,12 +494,19 @@ mod imp {
         // Bottom line: Action status
         let font_sub = create_gdi_font(10, FW_NORMAL);
         SelectObject(mem_dc, HGDIOBJ(font_sub.0));
-        SetTextColor(mem_dc, COLORREF(0x0096DC00)); // Emerald green
+        SetTextColor(mem_dc, mode.accent());
 
-        let status_str = if status.is_empty() {
-            "正在规划下一步..."
-        } else {
-            status
+        // A paused/stopped task shows the takeover label instead of whatever
+        // action the runner last reported — the agent is no longer acting.
+        let status_str = match mode {
+            RunMode::Running => {
+                if status.is_empty() {
+                    "正在规划下一步..."
+                } else {
+                    status
+                }
+            }
+            _ => mode.status_text(),
         };
         let mut sub_text: Vec<u16> = status_str.encode_utf16().collect();
         let mut sub_rect = RECT {
@@ -515,7 +609,15 @@ impl OverlayGuard {
     ///
     /// Respects the `CUA_HUB_OVERLAY` environment variable (`0`/`false`/`off` disables).
     /// Returns a no-op guard when disabled or on unsupported platforms.
-    pub fn start(enabled: bool, task: &str, max_steps: usize) -> Self {
+    ///
+    /// `takeover` links the capsule to the human-takeover state machine so it
+    /// recolors as the operator seizes and releases control.
+    pub fn start(
+        enabled: bool,
+        task: &str,
+        max_steps: usize,
+        takeover: Option<Arc<crate::takeover::TakeoverState>>,
+    ) -> Self {
         let effective_enabled = enabled && overlay_env_enabled();
         if !effective_enabled {
             return Self {
@@ -527,7 +629,7 @@ impl OverlayGuard {
 
         #[cfg(windows)]
         {
-            let inner = imp::WindowsOverlay::start(task, max_steps);
+            let inner = imp::WindowsOverlay::start(task, max_steps, takeover);
             Self {
                 enabled: inner.is_some(),
                 inner,
@@ -535,6 +637,7 @@ impl OverlayGuard {
         }
         #[cfg(not(windows))]
         {
+            let _ = takeover;
             Self { enabled: false }
         }
     }
@@ -578,7 +681,7 @@ mod tests {
 
     #[test]
     fn disabled_overlay_constructs_safely_as_noop() {
-        let guard = OverlayGuard::start(false, "sample", 10);
+        let guard = OverlayGuard::start(false, "sample", 10, None);
         assert!(!guard.is_active());
         // update must not panic
         guard.update(1, 10, "doing something");
@@ -601,7 +704,7 @@ mod tests {
     #[cfg(windows)]
     #[ignore = "real-machine: opens a real Win32 overlay window on the desktop"]
     fn real_machine_overlay_lifecycle() {
-        let guard = OverlayGuard::start(true, "测试覆盖层指示器", 5);
+        let guard = OverlayGuard::start(true, "测试覆盖层指示器", 5, None);
         assert!(
             guard.is_active(),
             "overlay window should be active on Windows desktop"
@@ -609,5 +712,35 @@ mod tests {
         guard.update(2, 5, "正在执行物理验证...");
         std::thread::sleep(std::time::Duration::from_millis(600));
         drop(guard);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "real-machine: installs low-level hooks + global hotkeys; press Ctrl+Alt+H to pause, move the mouse to resume"]
+    fn real_machine_takeover_lifecycle() {
+        let takeover = crate::takeover::TakeoverGuard::start(true);
+        assert!(
+            takeover.is_enabled(),
+            "takeover hooks should install on desktop"
+        );
+        let st = takeover.state();
+        assert_eq!(st.status(), crate::takeover::RUNNING);
+
+        // The gate passes while running.
+        assert!(takeover.wait_gate());
+
+        // Simulate the takeover thread observing a human: pause, then confirm
+        // the gate blocks, then resume via the idle path.
+        st.note_human_input(crate::takeover::now_ms());
+        assert_eq!(st.status(), crate::takeover::PAUSED);
+        // wait_gate polls; auto-resume kicks in after the idle threshold, so
+        // this returns true within a few seconds rather than blocking forever.
+        assert!(takeover.wait_gate(), "agent should auto-resume after idle");
+        assert_eq!(st.status(), crate::takeover::RUNNING);
+
+        // Manual stop is one-way: the gate then reports false.
+        st.stop();
+        assert!(!takeover.wait_gate());
+        assert_eq!(st.status(), crate::takeover::STOPPED);
     }
 }

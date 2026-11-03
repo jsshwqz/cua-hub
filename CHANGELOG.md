@@ -22,6 +22,26 @@ RAII 管理生命周期，任务完成、失败或 panic 退出时 `Drop` 自动
 `run_task` / `start_task` MCP 工具的 `overlay` 布尔参数；`CUA_HUB_OVERLAY` 环境变量
 可强制关闭。`overlay_capture_proof` example 提供基线/悬浮双帧 A/B 截屏对账。
 
+### 人工接管（human takeover）
+
+任务运行中，人随时可无摩擦夺取键鼠控制权，agent 立刻让位，人走开后自动续跑——无需
+任何"记得去按"的手动开关。三条路径：
+
+- **自动判定（默认开）**：`WH_KEYBOARD_LL` / `WH_MOUSE_LL` 低级钩子检查每个输入事件的
+  `LLKHF_INJECTED` 标志位。cua-hub 自己用 `SendInput` 注入的输入带此标志，真人物理输入
+  不带——首次真实按键或点击即把共享状态翻到 `PAUSED`，runner 在下一步前闸门处阻塞。
+- **手动热键（明确意图兜底）**：`Ctrl+Alt+H` 暂停/继续切换，`Ctrl+Alt+X` 直接终止。
+- **空闲自动恢复**：人停止操作超过 2.5s，agent 自行续跑。
+
+共享状态机 `cua-io::takeover::TakeoverState`（`RUNNING` / `PAUSED` / `STOPPED`，原子量）
+被三方读写：钩子回调（自动夺取）、热键泵（手动覆盖）、runner 闸门与 overlay（消费）。
+回调只做"读标志位 + 写原子量 + 记时间戳"，远低于 `LowLevelHooksTimeout`，不会被系统摘钩。
+接手/停止时 overlay 胶囊同步变色：绿=agent 操控、黄=人工接管、红=已停止，标题与状态行
+随之切换，指示灯停止呼吸。`TakeoverGuard` RAII 管理钩子线程，`Drop` 时置 `SHUTDOWN`
+让钩子卸载、全局热键不残留。非 Windows 编译为 no-op。接入点：`cua-hub run --takeover`
+CLI 开关，`run_task` / `start_task` MCP 工具的 `takeover` 布尔参数；`CUA_HUB_TAKEOVER`
+环境变量可强制关闭。
+
 ## 0.1.7 — 2026-11-02
 
 视觉元素解析从短板到能力链的一版：统一元素注册表（无障碍树 + OCR 合并、按窗口分段、
