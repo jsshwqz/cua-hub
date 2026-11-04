@@ -119,17 +119,12 @@ enum Command {
         /// numbers) alongside each screenshot.
         #[arg(long)]
         ui_elements: bool,
-        /// Show the floating desktop running-state indicator while the task
-        /// executes. Click-through, never steals focus, and hidden from
-        /// screen captures so vision models cannot observe it.
+        /// Supervision mode: interactive control bar (clickable, draggable,
+        /// hidden from screen captures) + human takeover — real physical
+        /// input pauses the agent; Ctrl+Alt+O toggles the bar; ✕ ends the
+        /// process gracefully. Off = pure background.
         #[arg(long)]
-        overlay: bool,
-        /// Let a human seize the keyboard/mouse mid-run. Real physical input
-        /// pauses the agent (distinguished from cua-hub's own injected input);
-        /// Ctrl+Alt+H toggles pause, Ctrl+Alt+X stops; the agent resumes once
-        /// the human is idle.
-        #[arg(long)]
-        takeover: bool,
+        supervise: bool,
         /// Show the browser window for browser-routed tasks.
         #[arg(long)]
         browser_headed: bool,
@@ -235,6 +230,11 @@ enum Command {
         /// Bind an HTTP endpoint instead of stdio, e.g. 127.0.0.1:8765.
         #[arg(long)]
         http: Option<String>,
+        /// Mount the supervision control bar for the whole server lifetime:
+        /// it shows standby between tasks and every supervised task attaches
+        /// to it. Ctrl+Alt+O toggles it; ✕ ends the server gracefully.
+        #[arg(long)]
+        supervise: bool,
     },
 }
 
@@ -365,8 +365,7 @@ fn main() -> Result<()> {
             settle_ms,
             ui_tree,
             ui_elements,
-            overlay,
-            takeover,
+            supervise,
             browser_headed,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -384,8 +383,7 @@ fn main() -> Result<()> {
                 settle_ms,
                 ui_tree,
                 ui_elements,
-                overlay,
-                takeover,
+                supervise,
                 browser_headed,
                 approver: None,
             }))?;
@@ -511,7 +509,12 @@ fn main() -> Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(console::serve(&bind))
         }
-        Command::Serve { http } => {
+        Command::Serve { http, supervise } => {
+            // Mount the control bar for the whole server lifetime when asked:
+            // standby between tasks, every supervised task attaches to it.
+            if supervise {
+                let _bar = cua_io::supervise::ensure(true, "", 0);
+            }
             let runtime = tokio::runtime::Runtime::new()?;
             match http {
                 Some(bind) => runtime.block_on(mcp::serve_http(&bind)),

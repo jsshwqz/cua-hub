@@ -7,6 +7,7 @@ pub mod exec;
 pub mod hold;
 pub mod input;
 pub mod overlay;
+pub mod supervise;
 pub mod takeover;
 #[cfg(windows)]
 pub mod wgc;
@@ -20,4 +21,3 @@ pub use capture::{
 pub use clipboard::{get_text as clipboard_get, set_text as clipboard_set};
 pub use exec::{run_command, CommandOutput};
 pub use input::{apply, cursor_position, key_state, mouse_button};
-pub use overlay::OverlayGuard;
