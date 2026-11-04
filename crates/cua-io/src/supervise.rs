@@ -159,6 +159,8 @@ impl Supervision {
         if let Some(bar) = &self.bar {
             bar.begin_task(task, max_steps);
         }
+        #[cfg(not(windows))]
+        let _ = (task, max_steps);
     }
 
     /// Task over: the bar stays up in standby (it is not bound to the task),
@@ -171,6 +173,8 @@ impl Supervision {
             }
             bar.end_task(summary);
         }
+        #[cfg(not(windows))]
+        let _ = summary;
     }
 
     /// Feeds the current step into the bar display.

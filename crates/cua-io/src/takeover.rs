@@ -42,6 +42,7 @@ pub struct TakeoverState {
     /// `GetTickCount64()` of the last genuine human input, in ms.
     last_human: AtomicU64,
     /// Milliseconds without human input after which the agent auto-resumes.
+    #[cfg_attr(not(windows), allow(dead_code))]
     idle_auto_resume_ms: AtomicU64,
 }
 
@@ -121,7 +122,8 @@ impl TakeoverState {
 
     /// Resumes when the human has been idle past the threshold. Returns true
     /// if it transitioned `PAUSED -> RUNNING`.
-    fn auto_resume_if_idle(&self) -> bool {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn auto_resume_if_idle(&self) -> bool {
         if self.status() != PAUSED {
             return false;
         }
