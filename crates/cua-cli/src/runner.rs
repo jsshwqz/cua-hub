@@ -80,15 +80,11 @@ pub struct RunOptions {
     /// each vision step. Registry numbers are for reading only — actions
     /// still address controls via window_state element indexes or targets.
     pub ui_elements: bool,
-    /// Show the floating desktop overlay indicator during execution.
-    /// The indicator is click-through, never steals focus, and is excluded
-    /// from screen captures so vision models cannot observe it.
-    pub overlay: bool,
-    /// Let a human seize the keyboard/mouse mid-run. Real physical input
-    /// pauses the agent (low-level hooks distinguish it from cua-hub's own
-    /// injected input); Ctrl+Alt+H toggles pause, Ctrl+Alt+X stops; the agent
-    /// resumes once the human is idle.
-    pub takeover: bool,
+    /// Supervision mode: interactive control bar + human takeover, all on.
+    /// The bar is clickable/draggable, hidden from screen captures, and the
+    /// takeover hooks pause the agent on genuine human input. Off = pure
+    /// background: no window, no hooks.
+    pub supervise: bool,
     /// Show the browser window instead of headless mode.
     pub browser_headed: bool,
     /// Optional async approval hook used instead of `allow_high` when a
@@ -112,8 +108,7 @@ impl Default for RunOptions {
             settle_ms: 600,
             ui_tree: false,
             ui_elements: false,
-            overlay: false,
-            takeover: false,
+            supervise: false,
             browser_headed: false,
             approver: None,
         }
@@ -218,32 +213,45 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
     let mut log_file = std::fs::File::create(&log_path)?;
     let mut history: Vec<StepRecord> = Vec::new();
     let mut outcome = Outcome::StepLimit;
-    // Human-takeover guard: low-level hooks watch for genuine (non-injected)
-    // keyboard/mouse input and pause the agent the moment a human seizes the
-    // machine. Dropped at scope exit alongside the overlay.
-    let takeover = cua_io::takeover::TakeoverGuard::start(opts.takeover && !opts.dry_run);
-    // Desktop running-state indicator: dropped at scope exit so a completed,
-    // failed, or panicked run always tears the window down cleanly. Shares the
-    // takeover state so the capsule recolors as the human takes over.
-    let overlay = cua_io::OverlayGuard::start(
-        opts.overlay && !opts.dry_run,
-        &opts.task,
-        opts.max_steps as usize,
-        Some(takeover.state()),
-    );
+
+    // D1 bottom line: a previous run that was killed mid-hold can leave a key
+    // or mouse button logically down. Sweep leaked holds before this task
+    // touches anything — the 60ms leak window leaves live human taps alone.
+    let sweep = cua_io::hold::release_stuck();
+    if !sweep.is_clean() {
+        tracing::warn!(report = %sweep.summary(), "released leaked input holds from an earlier run");
+    }
+
+    // Supervision mode: one interactive control bar + human takeover. The bar
+    // is a process-level singleton (it persists across tasks in serve mode);
+    // each supervised task attaches via begin_task, unsupervised ones run
+    // pure-background with no gating at all.
+    let sup = if opts.supervise && !opts.dry_run {
+        cua_io::supervise::ensure(true, &opts.task, opts.max_steps as usize)
+    } else {
+        None
+    };
 
     for index in 0..opts.max_steps {
-        // A paused human holds the agent here before it touches anything; a
-        // Ctrl+Alt+X stop winds the run down instead of taking the next step.
-        if !takeover.wait_gate() {
-            outcome = Outcome::Failed("stopped by human takeover (Ctrl+Alt+X)".into());
-            break;
+        if let Some(sup) = &sup {
+            // ✕ pressed: the runner winds down gracefully (audit trail still
+            // written) instead of taking another step.
+            if sup.quit_requested() {
+                outcome = Outcome::Failed("ended by user (控制条 ✕)".into());
+                break;
+            }
+            // A paused human holds the agent here before it touches anything;
+            // a Ctrl+Alt+X stop winds the run down instead.
+            if !sup.wait_gate() {
+                outcome = Outcome::Failed("stopped by human takeover (Ctrl+Alt+X)".into());
+                break;
+            }
+            sup.update(
+                index as usize,
+                opts.max_steps as usize,
+                "感知屏幕 / 请求模型",
+            );
         }
-        overlay.update(
-            index as usize,
-            opts.max_steps as usize,
-            "感知屏幕 / 请求模型",
-        );
         let frame = if vision_engine {
             let frame = cua_io::observe(opts.max_edge, 80)?;
             let shot_path = run_dir.join(format!("step-{index:02}.png"));
@@ -295,7 +303,9 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             action.risk().as_str(),
             describe(&action)
         );
-        overlay.update(index as usize, opts.max_steps as usize, &describe(&action));
+        if let Some(sup) = &sup {
+            sup.update(index as usize, opts.max_steps as usize, &describe(&action));
+        }
 
         match action {
             Action::Done { summary } => {
@@ -355,6 +365,12 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             None
         };
 
+        // While the injected action executes, the control bar (if visible)
+        // turns click-through so a click aimed under it lands on the real
+        // target; the bar becomes interactive again right after.
+        if let Some(sup) = &sup {
+            sup.set_action_executing(true);
+        }
         let result = tokio::task::spawn_blocking({
             let action = action.clone();
             let scale = frame.as_ref().map(|f| f.input_scale).unwrap_or(1.0);
@@ -362,6 +378,9 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
         })
         .await
         .context("input task panicked")?;
+        if let Some(sup) = &sup {
+            sup.set_action_executing(false);
+        }
 
         record.input_scale = frame.as_ref().map(|f| f.input_scale);
         match &result {
@@ -399,6 +418,12 @@ pub async fn run_task(opts: RunOptions) -> Result<RunReport> {
             "steps": report.steps,
         }))?,
     )?;
+    // Task over: the supervision bar (if any) stays up in standby — it is not
+    // bound to this task — unless ✕ was pressed, in which case it hides while
+    // the process winds down.
+    if let Some(sup) = &sup {
+        sup.end_task(&report.summary());
+    }
     eprintln!("\n{}", report.summary());
     eprintln!("artifacts: {}", run_dir.display());
     Ok(report)

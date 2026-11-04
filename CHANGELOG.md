@@ -6,41 +6,35 @@
 
 ## 未发布
 
-### 桌面运行状态悬浮指示器（overlay indicator）
+### 监督模式（supervise）：交互式控制条 + 人工接管，一个开关
 
-任务运行时在屏幕顶部居中显示一枚深色胶囊指示器，实时显示「CUA-HUB 正在操控 · Step N/M」
-与当前动作描述，绿色呼吸灯表示活跃。三项硬保证：**点击完全穿透**（`WS_EX_TRANSPARENT`，
-用户点击其覆盖区域不受任何阻碍）；**不抢焦点**（`WS_EX_TOOLWINDOW`，不占任务栏、不进
-Alt+Tab、绝不抢占前台键盘焦点）；**对大模型截屏全免疫**（`SetWindowDisplayAffinity(
-WDA_EXCLUDEFROMCAPTURE)`，在 `cua_io::observe` 等主屏截取画面中完全隐形，杜绝 VLM 把
-悬浮窗自身识别为操作目标的视觉污染）。
+把运行态显示与人工接管合成一个概念、一个开关（`--supervise` / MCP `supervise` 参数 /
+`CUA_HUB_SUPERVISE` 环境变量，默认关）：开 = 屏幕上出现一条**交互式控制条**，低级钩子
+同时上岗；关 = 纯后台，无窗口、钩子不拦、agent 不受任何干扰。
 
-实现为 `cua-io::overlay` 原生 Win32 分层透明窗口（零新增依赖，复用现有 `windows` crate），
-在独立 UI 线程以 `PeekMessageW` 轮询循环驱动 GDI 双缓冲绘制与呼吸动画；`OverlayGuard`
-RAII 管理生命周期，任务完成、失败或 panic 退出时 `Drop` 自动销毁窗口、干净恢复现场。
-非 Windows 平台编译为无副作用 no-op。接入点：`cua-hub run --overlay` CLI 开关，
-`run_task` / `start_task` MCP 工具的 `overlay` 布尔参数；`CUA_HUB_OVERLAY` 环境变量
-可强制关闭。`overlay_capture_proof` example 提供基线/悬浮双帧 A/B 截屏对账。
+控制条特性（按 design review 五点返工）：
 
-### 人工接管（human takeover）
+- **交互式**：右侧 ⏻（监督关→纯后台）与 ✕（优雅结束：runner 完成当前步、写完
+  审计后退出）两个图标按钮；空白区即拖动把手（`HTCAPTION` 系统拖拽），拖完位置
+  持久化到 `%APPDATA%\cua-hub\bar_position.txt`，重启恢复。
+- **常驻不绑任务**：进程级单例——serve 模式下跨任务存续，任务结束进入"监督待机"，
+  下个任务经 `begin_task` 重挂；`Ctrl+Alt+O` 全局热键随时显隐/开关兜底。
+- **截屏隐形保留**：`WDA_EXCLUDEFROMCAPTURE` 与可点击不冲突——人眼可见可点，模型
+  截屏依旧零痕迹。agent 执行输入动作的瞬间控制条临时恢复 `WS_EX_TRANSPARENT` 点击
+  穿透，注入点击落在真实目标上而非控制条；动作结束立即恢复交互。
+- **人工接管**：`WH_KEYBOARD_LL`/`WH_MOUSE_LL` 钩子查 `LLKHF_INJECTED` 标志位区分
+  注入与真人物理输入，首次真实按键/点击即暂停 agent；`Ctrl+Alt+H` 暂停/继续、
+  `Ctrl+Alt+X` 终止；人停手 2.5s 自动续跑。胶囊随状态变色：绿=agent 操控、
+  黄=人工接管、红=已停止。
+- **崩溃安全（D1）**：钩子只观察不吞事件（恒 `CallNextHookEx`），进程死亡由系统
+  自动摘钩，不存在"锁死键鼠"的路径；panic 时 `InputGuard` RAII 解锁；被杀/关机
+  残留的泄漏保持由 `hold::release_stuck` 在**每次任务起点**清扫（60ms 泄漏窗采样，
+  不误伤正在打字的用户）。
 
-任务运行中，人随时可无摩擦夺取键鼠控制权，agent 立刻让位，人走开后自动续跑——无需
-任何"记得去按"的手动开关。三条路径：
-
-- **自动判定（默认开）**：`WH_KEYBOARD_LL` / `WH_MOUSE_LL` 低级钩子检查每个输入事件的
-  `LLKHF_INJECTED` 标志位。cua-hub 自己用 `SendInput` 注入的输入带此标志，真人物理输入
-  不带——首次真实按键或点击即把共享状态翻到 `PAUSED`，runner 在下一步前闸门处阻塞。
-- **手动热键（明确意图兜底）**：`Ctrl+Alt+H` 暂停/继续切换，`Ctrl+Alt+X` 直接终止。
-- **空闲自动恢复**：人停止操作超过 2.5s，agent 自行续跑。
-
-共享状态机 `cua-io::takeover::TakeoverState`（`RUNNING` / `PAUSED` / `STOPPED`，原子量）
-被三方读写：钩子回调（自动夺取）、热键泵（手动覆盖）、runner 闸门与 overlay（消费）。
-回调只做"读标志位 + 写原子量 + 记时间戳"，远低于 `LowLevelHooksTimeout`，不会被系统摘钩。
-接手/停止时 overlay 胶囊同步变色：绿=agent 操控、黄=人工接管、红=已停止，标题与状态行
-随之切换，指示灯停止呼吸。`TakeoverGuard` RAII 管理钩子线程，`Drop` 时置 `SHUTDOWN`
-让钩子卸载、全局热键不残留。非 Windows 编译为 no-op。接入点：`cua-hub run --takeover`
-CLI 开关，`run_task` / `start_task` MCP 工具的 `takeover` 布尔参数；`CUA_HUB_TAKEOVER`
-环境变量可强制关闭。
+实现 `cua-io::supervise`（枢纽单例 + 位置持久化）、`cua-io::overlay`（控制条窗口：
+按钮命中测试、拖拽、显隐/穿透动态切换、GDI 矢量图标）、`cua-io::takeover`（钩子 +
+热键 + 状态机）。非 Windows 编译 no-op。`overlay_capture_proof` example 沿用基线/
+悬浮双帧 A/B 对账（交互态控制条对截屏隐形）。
 
 ## 0.1.7 — 2026-11-02
 

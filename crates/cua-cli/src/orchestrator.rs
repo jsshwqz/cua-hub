@@ -339,8 +339,7 @@ async fn execute_step(
                 settle_ms: 600,
                 ui_tree: false,
                 ui_elements: false,
-                overlay: false,
-                takeover: false,
+                supervise: false,
                 browser_headed: opts.headed,
                 approver: opts.approver.clone(),
             })

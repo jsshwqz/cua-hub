@@ -467,61 +467,54 @@ UI widget), `cua-hub` employs active effect verification:
 * `type_text` validates whether the focused control actually contains the intended characters rather
   than simply counting synthetic key strokes dispatched.
 
-## Overlay running-state indicator (`cua-io::overlay`)
+## Supervision mode (`cua-io::supervise` + `overlay` + `takeover`)
 
-A long task can silently take over the desktop, so the runner can mount a small
-capsule at the top-centre of the screen showing the goal, the current step
-(`Step N/M`) and the action under way. Three properties are load-bearing:
+A long task can silently take over the desktop, so supervision mode gives the
+operator one interactive control bar and one switch (`--supervise` / `supervise`
+MCP argument / `CUA_HUB_SUPERVISE`, default **off**). On: the bar is visible and
+the takeover hooks are live. Off: pure background — no window, no hooks, the
+agent is never interrupted.
 
-* **Click-through.** The window carries `WS_EX_TRANSPARENT`, so mouse input
-  passes straight to whatever is underneath. A user can click, drag or
-  marquee-select through the capsule without interference.
-* **Never steals focus.** `WS_EX_TOOLWINDOW` keeps it off the taskbar, out of
-  Alt+Tab and from taking the foreground window or keyboard focus.
-* **Invisible to vision models.** `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`
-  makes the window hardware-excluded from screen capture, so the same
-  `cua_io::observe` frames the model sees contain no capsule at all.
+**The bar is interactive, not a passive indicator.**
 
-The window is a native Win32 layered window driven by a dedicated UI thread that
-polls commands with `PeekMessageW` (never `GetMessageW`, so the runner can feed
-it step updates without blocking) and renders with double-buffered GDI plus a
-breathing status dot. `OverlayGuard` is the RAII handle: constructed with
-`start`, `.update(step, max, status)` per step, and torn down on `Drop` so a
-completed, failed, or panicked run always leaves the screen clean. Non-Windows
-targets compile it to a no-op. `OverlayGuard::start` respects `CUA_HUB_OVERLAY`
-as a master kill-switch and the `--overlay` flag / `overlay` MCP argument as the
-per-run opt-in.
+* **Buttons.** The right edge carries ⏻ (supervision off: the bar hides and the
+  hooks stand down — pure background) and ✕ (graceful end: the runner finishes
+  its current step, writes the audit trail and the process exits).
+* **Drag.** The blank area is a caption handle (`HTCAPTION` from
+  `WM_NCHITTEST`), so the OS drags it; `WM_EXITSIZEMOVE` persists the position
+  to `%APPDATA%\cua-hub\bar_position.txt`, restored (and clamped on-screen) at
+  the next start.
+* **Capture immunity without conflict.** `SetWindowDisplayAffinity(
+  WDA_EXCLUDEFROMCAPTURE)` keeps the bar out of every screenshot even while it
+  is clickable — humans see and click it, vision models receive clean pixels.
+* **Action transparency.** While the agent executes an input action the bar
+  temporarily re-enables `WS_EX_TRANSPARENT`, so an injected click aimed under
+  the bar lands on the real target instead of the bar; the moment the action
+  finishes the bar turns interactive again.
+* **Not bound to one task.** The bar is a process-level singleton: in serve
+  mode it persists across tasks and shows a standby face between them; each
+  supervised task attaches via `begin_task`. `Ctrl+Alt+O` toggles it from
+  anywhere at any time.
 
-## Human takeover (`cua-io::takeover`)
+**Human takeover** still works without touching the bar. Low-level hooks
+(`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) inspect every input event: cua-hub's own
+`SendInput` carries `LLKHF_INJECTED`, genuine physical input never does — the
+first real keystroke or click flips `TakeoverState` to `PAUSED` and the runner
+blocks at its per-step gate. `Ctrl+Alt+H` toggles pause, `Ctrl+Alt+X` stops,
+and ~2.5s of human idle auto-resumes the agent. The bar recolors green (agent
+driving) / amber (human paused) / red (stopped) — visible to the operator,
+absent from the model's screenshots.
 
-While the agent drives the desktop it owns the keyboard and mouse. Human takeover
-lets an operator seize control at any moment — without a manual switch they have
-to remember to flip. Three paths feed one shared state machine:
+**Crash safety (unconditional keyboard/mouse release).** The hooks only
+observe — every callback ends in `CallNextHookEx` and never swallows input, and
+Windows removes a dead process's hooks by itself, so no cua-hub code path can
+hold the machine hostage. Panic paths are covered by `InputGuard`'s RAII
+release; holds leaked by a killed task or a shutdown are swept by
+`hold::release_stuck` at every task start (its 60ms leak window samples the
+key, so a key the user is physically tapping is left alone and only a
+persisting programmatic hold is forced up).
 
-* **Automatic seizure (default on).** Low-level hooks (`WH_KEYBOARD_LL` /
-  `WH_MOUSE_LL`) inspect every input event. cua-hub injects its own input
-  through `SendInput`, which the OS tags `LLKHF_INJECTED`; genuine physical
-  input never carries that tag. The first real keystroke or mouse click flips
-  the shared state to `PAUSED`, and the runner blocks at its per-step gate.
-* **Manual hotkeys.** `Ctrl+Alt+H` toggles pause/resume, `Ctrl+Alt+X` stops the
-  task outright — an explicit override of the automatic path.
-* **Idle auto-resume.** Once the human stops touching the machine for ~2.5s the
-  agent picks back up on its own.
-
-`TakeoverState` is the shared machine (`RUNNING` / `PAUSED` / `STOPPED`, atomics)
-read by the runner (step gate), the overlay (recolor), and written by the hook
-callbacks and the hotkey pump. The callbacks do almost no work — read a flag,
-bump a timestamp, touch one atomic — because Windows silently unhooks a
-low-level hook whose callback blocks longer than `LowLevelHooksTimeout`. The
-injected-vs-genuine distinction is the load-bearing insight: it is what lets the
-agent's own actions pass through unimpeded while a human's real input pauses it.
-`TakeoverGuard` is the RAII handle; dropping it raises a `SHUTDOWN` flag so the
-pump unhooks and the global hotkeys do not linger. Non-Windows targets compile
-it to a no-op. `TakeoverGuard::start` respects `CUA_HUB_TAKEOVER` as a master
-kill-switch and the `--takeover` flag / `takeover` MCP argument as the per-run
-opt-in. When takeover is active the overlay capsule recolors green (agent
-driving) / amber (human paused) / red (stopped), so the state is visible at a
-glance without ever reaching the model's screenshots.
+Non-Windows targets compile all three modules to no-ops.
 
 ## Safety
 

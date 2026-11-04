@@ -1,15 +1,17 @@
-//! Real-machine A/B proof that the overlay indicator is invisible to screen
-//! captures. Captures a baseline frame, mounts the overlay, captures a second
-//! frame seconds later over the same (unchanged) desktop, then diffs the
-//! capsule band. Identical bands prove `WDA_EXCLUDEFROMCAPTURE` holds; a leaked
-//! capsule would show up as a distinct dark pill only in the second frame.
+//! Real-machine A/B proof that the supervision control bar is invisible to
+//! screen captures. Mounts the bar through the production supervision hub,
+//! grabs baseline and overlay frames back-to-back through the same
+//! `cua_io::observe` pipeline the vision engine feeds to the model, and saves
+//! them so a reviewer can diff the bar band: identical bands prove
+//! `WDA_EXCLUDEFROMCAPTURE` holds even though the bar is interactive
+//! (clickable buttons + drag handle).
 //!
 //! ```text
 //! cargo run -p cua-io --example overlay_capture_proof <out_prefix>
 //! ```
 //!
-//! Writes `<prefix>_baseline.png` and `<prefix>_overlay.png`. The overlay
-//! lifecycle itself is covered by `real_machine_overlay_lifecycle`.
+//! Writes `<prefix>_baseline.png` and `<prefix>_overlay.png`. The bar is on
+//! screen during the second capture; it must NOT appear in the pixels.
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,21 +21,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "overlay_proof".into());
 
-    // Baseline: identical desktop, no overlay.
+    // Baseline: identical desktop, no bar.
     let base = cua_io::observe(1568, 80)?;
     let base_path = format!("{prefix}_baseline.png");
     std::fs::write(&base_path, &base.png)?;
 
-    // Mount the capsule exactly as the runner does.
-    let overlay = cua_io::OverlayGuard::start(true, "截屏隐形验证", 8, None);
-    if !overlay.is_active() {
-        eprintln!("overlay did not mount (non-desktop or disabled by CUA_HUB_OVERLAY)");
-        return Ok(());
-    }
-    overlay.update(3, 8, "正在执行物理验证...");
+    // Mount the interactive control bar exactly as a supervised run does.
+    let sup = cua_io::supervise::ensure(true, "截屏隐形验证", 8)
+        .ok_or("control bar did not mount (non-desktop or CUA_HUB_SUPERVISE off)")?;
+    sup.update(3, 8, "正在执行物理验证...");
 
-    // Capture the second frame seconds later over the same screen. The capsule
-    // is on screen during this call; only its presence differs from baseline.
+    // Capture the second frame seconds later over the same screen. The bar is
+    // interactive (buttons live, drag live) during this call; only its
+    // presence differs from baseline.
     std::thread::sleep(Duration::from_millis(900));
     let ov = cua_io::observe(1568, 80)?;
     let ov_path = format!("{prefix}_overlay.png");
@@ -41,10 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("baseline: {base_path}");
     println!("overlay : {ov_path}");
-    println!("capsule was on screen during the second capture; it must NOT appear there.");
+    println!("interactive bar was on screen during the second capture; it must NOT appear there.");
+    println!("now click its buttons / drag it / press Ctrl+Alt+O to verify interactively.");
 
-    std::thread::sleep(Duration::from_millis(1200));
-    drop(overlay);
+    std::thread::sleep(Duration::from_millis(1500));
+    sup.end_task("验证完成 · 待机");
     Ok(())
 }
 
