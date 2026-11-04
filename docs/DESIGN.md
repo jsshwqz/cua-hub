@@ -470,10 +470,10 @@ UI widget), `cua-hub` employs active effect verification:
 ## Supervision mode (`cua-io::supervise` + `overlay` + `takeover`)
 
 A long task can silently take over the desktop, so supervision mode gives the
-operator one interactive control bar and one switch (`--supervise` / `supervise`
-MCP argument / `CUA_HUB_SUPERVISE`, default **off**). On: the bar is visible and
-the takeover hooks are live. Off: pure background — no window, no hooks, the
-agent is never interrupted.
+operator one interactive control bar and one switch (`--no-supervise` / `supervise`
+MCP argument / `CUA_HUB_SUPERVISE`, default **on** on desktop). On: the bar is
+visible and the takeover hooks are live. Off: pure background — no window, no
+hooks, the agent is never interrupted.
 
 **The bar is interactive, not a passive indicator.**
 

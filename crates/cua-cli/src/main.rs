@@ -122,9 +122,12 @@ enum Command {
         /// Supervision mode: interactive control bar (clickable, draggable,
         /// hidden from screen captures) + human takeover — real physical
         /// input pauses the agent; Ctrl+Alt+O toggles the bar; ✕ ends the
-        /// process gracefully. Off = pure background.
-        #[arg(long)]
+        /// process gracefully. Defaults to true on desktop.
+        #[arg(long, conflicts_with = "no_supervise")]
         supervise: bool,
+        /// Run in pure background without the supervision control bar.
+        #[arg(long)]
+        no_supervise: bool,
         /// Show the browser window for browser-routed tasks.
         #[arg(long)]
         browser_headed: bool,
@@ -365,7 +368,8 @@ fn main() -> Result<()> {
             settle_ms,
             ui_tree,
             ui_elements,
-            supervise,
+            supervise: _,
+            no_supervise,
             browser_headed,
         } => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -383,7 +387,7 @@ fn main() -> Result<()> {
                 settle_ms,
                 ui_tree,
                 ui_elements,
-                supervise,
+                supervise: !no_supervise,
                 browser_headed,
                 approver: None,
             }))?;

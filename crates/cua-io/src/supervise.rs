@@ -228,8 +228,8 @@ impl Supervision {
     }
 }
 
-/// Parse `CUA_HUB_SUPERVISE`. Unlike the old overlay switch this defaults to
-/// **off** — hooks and an interactive window are opt-in per run/serve.
+/// Parse `CUA_HUB_SUPERVISE`. Defaults to `true` on desktop environments.
+/// Setting `0`/`false`/`off`/`no` acts as an absolute kill-switch.
 pub fn supervise_env_enabled() -> bool {
     parse_supervise_env(std::env::var("CUA_HUB_SUPERVISE").ok().as_deref())
 }
@@ -239,9 +239,9 @@ pub fn parse_supervise_env(raw: Option<&str>) -> bool {
     match raw {
         Some(v) => {
             let s = v.trim().to_ascii_lowercase();
-            matches!(s.as_str(), "1" | "true" | "on" | "yes")
+            !matches!(s.as_str(), "0" | "false" | "off" | "no")
         }
-        None => false,
+        None => true,
     }
 }
 
@@ -305,11 +305,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_supervise_env_is_opt_in() {
-        assert!(!parse_supervise_env(None), "default is off");
+    fn parse_supervise_env_defaults_to_enabled() {
+        assert!(parse_supervise_env(None), "default is enabled");
         assert!(!parse_supervise_env(Some("0")));
         assert!(!parse_supervise_env(Some("false")));
-        assert!(!parse_supervise_env(Some("")));
+        assert!(!parse_supervise_env(Some("off")));
+        assert!(!parse_supervise_env(Some("no")));
         assert!(parse_supervise_env(Some("1")));
         assert!(parse_supervise_env(Some(" true ")));
         assert!(parse_supervise_env(Some("ON")));

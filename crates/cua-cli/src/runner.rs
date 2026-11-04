@@ -108,7 +108,7 @@ impl Default for RunOptions {
             settle_ms: 600,
             ui_tree: false,
             ui_elements: false,
-            supervise: false,
+            supervise: true,
             browser_headed: false,
             approver: None,
         }

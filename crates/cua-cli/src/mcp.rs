@@ -131,7 +131,7 @@ pub(crate) fn run_options_from_args(args: &Value) -> std::result::Result<RunOpti
         settle_ms: args["settle_ms"].as_u64().unwrap_or(600),
         ui_tree: args["ui_tree"].as_bool().unwrap_or(false),
         ui_elements: args["ui_elements"].as_bool().unwrap_or(false),
-        supervise: args["supervise"].as_bool().unwrap_or(false),
+        supervise: args["supervise"].as_bool().unwrap_or(true),
         browser_headed: args["browser_headed"].as_bool().unwrap_or(false),
         approver: approver_from_elicitor(),
     })
@@ -3979,7 +3979,7 @@ fn tool_defs() -> Value {
                     "allow_high": { "type": "boolean", "default": false },
                     "ui_tree": { "type": "boolean", "default": false },
                     "ui_elements": { "type": "boolean", "default": false },
-                    "supervise": { "type": "boolean", "default": false, "description": "Supervision mode: interactive control bar (clickable/draggable, hidden from screen captures) + human takeover. Real physical input pauses the agent; Ctrl+Alt+O toggles the bar; the bar's X ends the task gracefully" },
+                    "supervise": { "type": "boolean", "default": true, "description": "Supervision mode: interactive control bar (clickable/draggable, hidden from screen captures) + human takeover. Defaults to true on desktop. Pass false or set CUA_HUB_SUPERVISE=0 for pure background" },
                     "settle_ms": { "type": "integer", "default": 600 }
                 },
                 "required": ["task"]
