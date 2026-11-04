@@ -3409,7 +3409,8 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 Ok(target) => target,
                 Err(e) => return e,
             };
-            match cua_engine_access::find_target(&target, 400, 8) {
+            let (max_nodes, max_depth) = action_limits(args);
+            match cua_engine_access::find_target(&target, max_nodes, max_depth) {
                 Ok(node) => tool_ok(json!({
                     "name": node.name,
                     "control_type": node.control_type,
@@ -3453,11 +3454,8 @@ async fn call_tool_single_inner(name: &str, args: &Value) -> Value {
                 Ok(target) => target,
                 Err(e) => return e,
             };
-            match cua_engine_access::state_target(
-                &target,
-                cua_engine_access::DEFAULT_ACTION_NODES,
-                cua_engine_access::DEFAULT_ACTION_DEPTH,
-            ) {
+            let (max_nodes, max_depth) = action_limits(args);
+            match cua_engine_access::state_target(&target, max_nodes, max_depth) {
                 Ok(state) => tool_ok(json!(state)),
                 Err(e) => tool_err(e),
             }
@@ -4258,7 +4256,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "find_control",
-            "description": "Find the one control a target names and return its rectangle and center. A target is name (case-insensitive substring, `re:` pattern, or `id:<AutomationId>`) plus optional role, container and nth (0-based). Two matches without nth is an error that lists the candidates, never a pick; the old name-only form still works through the `name` shorthand.",
+            "description": "Find the one control a target names and return its rectangle and center. A target is name (case-insensitive substring, `re:` pattern, or `id:<AutomationId>`) plus optional role, container and nth (0-based). Two matches without nth is an error that lists the candidates, never a pick; a walk that stopped early reports \"did not reach\"; widen with max_nodes. The `name` shorthand still works.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4274,7 +4272,9 @@ fn tool_defs() -> Value {
                         "required": ["name"],
                         "additionalProperties": false
                     },
-                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" }
+                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" },
+                    "max_nodes": { "type": "integer", "minimum": 1 },
+                    "max_depth": { "type": "integer", "minimum": 1 }
                 },
                 "anyOf": [{ "required": ["target"] }, { "required": ["name"] }]
             }
@@ -4308,7 +4308,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "control_state",
-            "description": "Read a control's enabled/offscreen flags plus toggle, value, expanded and range values when available. A target that is ambiguous is an error that lists the candidates; the `name` shorthand still works.",
+            "description": "Read a control's enabled/offscreen flags plus toggle, value, expanded and range values when available. A target that is ambiguous is an error that lists the candidates; a walk that runs out of nodes says it did not reach the control; widen with max_nodes. The `name` shorthand still works.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4324,7 +4324,9 @@ fn tool_defs() -> Value {
                         "required": ["name"],
                         "additionalProperties": false
                     },
-                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" }
+                    "name": { "type": "string", "description": "Shorthand for target {\"name\": ...}; not together with target" },
+                    "max_nodes": { "type": "integer", "minimum": 1 },
+                    "max_depth": { "type": "integer", "minimum": 1 }
                 },
                 "anyOf": [{ "required": ["target"] }, { "required": ["name"] }]
             }
@@ -4864,6 +4866,61 @@ mod tests {
         assert!(names.contains(&"list_apps".to_string()));
         assert!(names.contains(&"launch_app".to_string()));
         assert!(names.contains(&"perform_secondary_action".to_string()));
+    }
+
+    #[test]
+    fn find_control_and_control_state_schemas_expose_traversal_budget_limits() {
+        let tools = tool_defs();
+        let find_ctrl = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "find_control")
+            .expect("find_control defined");
+        let props = &find_ctrl["inputSchema"]["properties"];
+        assert!(props.get("max_nodes").is_some());
+        assert!(props.get("max_depth").is_some());
+
+        let ctrl_state = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "control_state")
+            .expect("control_state defined");
+        let props = &ctrl_state["inputSchema"]["properties"];
+        assert!(props.get("max_nodes").is_some());
+        assert!(props.get("max_depth").is_some());
+    }
+
+    #[test]
+    fn action_limits_parses_explicit_and_default_budgets() {
+        // Defaults when arguments are omitted:
+        let (nodes, depth) = action_limits(&json!({}));
+        assert_eq!(nodes, cua_engine_access::DEFAULT_ACTION_NODES);
+        assert_eq!(depth, cua_engine_access::DEFAULT_ACTION_DEPTH);
+
+        // Explicit values clamped within bounds:
+        let (nodes, depth) = action_limits(&json!({
+            "max_nodes": 1500,
+            "max_depth": 14
+        }));
+        assert_eq!(nodes, 1500);
+        assert_eq!(depth, 14);
+
+        // Clamping lower and upper bounds:
+        let (nodes, depth) = action_limits(&json!({
+            "max_nodes": 0,
+            "max_depth": 0
+        }));
+        assert_eq!(nodes, 1);
+        assert_eq!(depth, 1);
+
+        let (nodes, depth) = action_limits(&json!({
+            "max_nodes": 200_000,
+            "max_depth": 100
+        }));
+        assert_eq!(nodes, 100_000);
+        assert_eq!(depth, 64);
     }
 
     #[test]

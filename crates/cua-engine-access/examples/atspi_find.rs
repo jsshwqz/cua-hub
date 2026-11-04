@@ -4,7 +4,11 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "Click Me".to_string());
     let target = cua_engine_access::target::Target::by_name(&name);
-    match cua_engine_access::find_target(&target, 400, 8) {
+    match cua_engine_access::find_target(
+        &target,
+        cua_engine_access::DEFAULT_ACTION_NODES,
+        cua_engine_access::DEFAULT_ACTION_DEPTH,
+    ) {
         Ok(node) => {
             let (x, y, w, h) = node.rect;
             println!(

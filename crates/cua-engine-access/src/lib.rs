@@ -541,8 +541,7 @@ pub fn invoke_target(
 ) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
-        let _ = (max_nodes, max_depth);
-        imp::invoke_target(target)
+        imp::invoke_target(target, max_nodes, max_depth)
     }
     #[cfg(not(windows))]
     {
@@ -566,8 +565,7 @@ pub fn set_value_target(
 ) -> Result<Option<ActionReport>> {
     #[cfg(windows)]
     {
-        let _ = (max_nodes, max_depth);
-        imp::set_value_target(target, text)
+        imp::set_value_target(target, text, max_nodes, max_depth)
     }
     #[cfg(not(windows))]
     {
@@ -588,8 +586,7 @@ pub fn state_target(
 ) -> Result<Option<ControlState>> {
     #[cfg(windows)]
     {
-        let _ = (max_nodes, max_depth);
-        imp::state_target(target)
+        imp::state_target(target, max_nodes, max_depth)
     }
     #[cfg(not(windows))]
     {
@@ -605,8 +602,7 @@ pub fn find_target(
 ) -> Result<UiNode> {
     #[cfg(windows)]
     {
-        let _ = (max_nodes, max_depth);
-        imp::find_target(target)
+        imp::find_target(target, max_nodes, max_depth)
     }
     #[cfg(not(windows))]
     {
@@ -1163,21 +1159,19 @@ mod imp {
     /// which same-named control the caller meant. Ambiguity is an error.
     fn with_hit<T>(
         target: &crate::target::Target,
+        max_nodes: usize,
+        max_depth: usize,
         act: impl FnOnce(&Hit) -> Result<T>,
     ) -> Result<T> {
         let mut hits: Vec<Hit> = Vec::new();
-        let (walked, truncated) = walk_raw(
-            FIND_MAX_NODES,
-            FIND_MAX_DEPTH,
-            |node, element, ancestors| {
-                hits.push(Hit {
-                    node: node.clone(),
-                    element: element.clone(),
-                    ancestors: ancestors.to_vec(),
-                });
-                false
-            },
-        )?;
+        let (walked, truncated) = walk_raw(max_nodes, max_depth, |node, element, ancestors| {
+            hits.push(Hit {
+                node: node.clone(),
+                element: element.clone(),
+                ancestors: ancestors.to_vec(),
+            });
+            false
+        })?;
         let facts: Vec<crate::target::Facts<'_>> = hits
             .iter()
             .map(|hit| crate::target::Facts {
@@ -1192,14 +1186,22 @@ mod imp {
         act(&hits[chosen])
     }
 
-    pub fn find_target(target: &crate::target::Target) -> Result<UiNode> {
-        with_hit(target, |hit| Ok(hit.node.clone()))
+    pub fn find_target(
+        target: &crate::target::Target,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> Result<UiNode> {
+        with_hit(target, max_nodes, max_depth, |hit| Ok(hit.node.clone()))
     }
 
-    pub fn invoke_target(target: &crate::target::Target) -> Result<Option<ActionReport>> {
+    pub fn invoke_target(
+        target: &crate::target::Target,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> Result<Option<ActionReport>> {
         use windows::Win32::UI::Accessibility::{IUIAutomationInvokePattern, UIA_InvokePatternId};
 
-        with_hit(target, |hit| {
+        with_hit(target, max_nodes, max_depth, |hit| {
             let element = &hit.element;
             let pattern: windows::core::Result<IUIAutomationInvokePattern> =
                 unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) };
@@ -1236,11 +1238,13 @@ mod imp {
     pub fn set_value_target(
         target: &crate::target::Target,
         text: &str,
+        max_nodes: usize,
+        max_depth: usize,
     ) -> Result<Option<ActionReport>> {
         use windows::core::BSTR;
         use windows::Win32::UI::Accessibility::{IUIAutomationValuePattern, UIA_ValuePatternId};
 
-        with_hit(target, |hit| {
+        with_hit(target, max_nodes, max_depth, |hit| {
             let element = &hit.element;
             let pattern: windows::core::Result<IUIAutomationValuePattern> =
                 unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) };
@@ -1260,8 +1264,14 @@ mod imp {
         })
     }
 
-    pub fn state_target(target: &crate::target::Target) -> Result<Option<ControlState>> {
-        with_hit(target, |hit| Ok(Some(state_of(&hit.element))))
+    pub fn state_target(
+        target: &crate::target::Target,
+        max_nodes: usize,
+        max_depth: usize,
+    ) -> Result<Option<ControlState>> {
+        with_hit(target, max_nodes, max_depth, |hit| {
+            Ok(Some(state_of(&hit.element)))
+        })
     }
 
     /// Every state read for an element the caller already holds.

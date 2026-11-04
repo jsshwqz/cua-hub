@@ -36,6 +36,16 @@
 热键 + 状态机）。非 Windows 编译 no-op。`overlay_capture_proof` example 沿用基线/
 悬浮双帧 A/B 对账（交互态控制条对截屏隐形）。
 
+### find_control / control_state 遍历限额与截断诊断闭环
+
+修复此前遗留的遍历预算硬编码（400/8）：
+- `mcp.rs` 中 `find_control` 与 `control_state` 统一接入 `action_limits`，入参支持可选的
+  `max_nodes` 与 `max_depth`（默认 600/10，收敛至 `DEFAULT_ACTION_*` 常量），并在 MCP Tool
+  Schema 中完整暴露参数定义与诊断说明。
+- 解决遍历截断的二义性：Windows 与 Linux 统一透传遍历限额至底层 UIA/AT-SPI 树遍历；
+  在节点预算耗尽且未匹配到目标时，如实抛出带截断说明的 `did not reach the control` 诊断，
+  消除“树截断没走到”被误判为“控件不存在”的假阴性风险。
+
 ## 0.1.7 — 2026-11-02
 
 视觉元素解析从短板到能力链的一版：统一元素注册表（无障碍树 + OCR 合并、按窗口分段、
