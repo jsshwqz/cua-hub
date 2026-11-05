@@ -91,7 +91,11 @@ jobs:
           files: ${{ env.PKG_NAME }}
 
   build-macos-x64:
-    runs-on: macos-13
+    # Cross-compile the Intel binary on an Apple Silicon runner: the macos-13
+    # (Intel) fleet is capacity-starved — both the v0.1.7 and v0.1.8 release
+    # runs sat in queue for 6-16 hours and never started. The arm64 fleet is
+    # minutes-fast, and Apple's toolchain targets x86_64 from arm64 natively.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
